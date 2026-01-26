@@ -39,15 +39,30 @@ class DataProcessor:
     
     @staticmethod
     def create_summary_table(uniprot_data: Dict, tissue_df: pd.DataFrame, 
-                            subcellular_df: pd.DataFrame) -> pd.DataFrame:
+                            subcellular_df: pd.DataFrame, alphafold_data: Dict = None, 
+                            pdb_data: Dict = None, kegg_data: Dict = None) -> pd.DataFrame:
         """
         Create comprehensive summary table with key metrics
         """
+        # Structure availability
+        structure_status = "None available"
+        if pdb_data and pdb_data.get('available'):
+            structure_status = f"Experimental ({pdb_data.get('count')} PDB entries)"
+        elif alphafold_data and alphafold_data.get('available'):
+            structure_status = "AlphaFold prediction"
+        
+        # Pathway count
+        pathway_count = 0
+        if kegg_data and kegg_data.get('available'):
+            pathway_count = len(kegg_data.get('pathways', []))
+        
         summary = {
             "Metric": [
                 "UniProt ID",
                 "Sequence Length",
                 "Molecular Weight (Da)",
+                "3D Structure",
+                "KEGG Pathways",
                 "Tissues with Expression",
                 "High Expression Tissues",
                 "Subcellular Locations",
@@ -57,6 +72,8 @@ class DataProcessor:
                 uniprot_data.get("uniprot_id", "N/A"),
                 f"{uniprot_data.get('sequence_length', 0):,}",
                 f"{uniprot_data.get('mass', 0):,.0f}",
+                structure_status,
+                pathway_count if pathway_count > 0 else "Not found",
                 len(tissue_df[tissue_df["level_numeric"] > 0]) if not tissue_df.empty else 0,
                 len(tissue_df[tissue_df["level"] == "High"]) if not tissue_df.empty else 0,
                 len(subcellular_df) if not subcellular_df.empty else 0,

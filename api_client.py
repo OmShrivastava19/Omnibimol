@@ -292,18 +292,321 @@ class ProteinAPIClient:
     
     async def fetch_all_data(self, uniprot_id: str, gene_name: str) -> Dict:
         """
-        Fetch all data - UniProt from API, HPA from local TSV files
+        Fetch all data - UniProt from API, HPA from local TSV files, structures and KEGG from APIs
         Returns combined dictionary with all protein information
         """
-        # Fetch UniProt data asynchronously
-        uniprot_data = await self.fetch_uniprot_data(uniprot_id)
+        # Run all API calls concurrently
+        results = await asyncio.gather(
+            self.fetch_uniprot_data(uniprot_id),
+            self.fetch_alphafold_structure(uniprot_id),
+            self.fetch_pdb_structure(uniprot_id),
+            self.fetch_kegg_pathways(gene_name, uniprot_id),
+            return_exceptions=True
+        )
         
         # Get HPA data synchronously from local files
         tissue_expression = self.get_tissue_expression(gene_name)
         subcellular = self.get_subcellular_location(gene_name)
         
         return {
-            "uniprot_data": uniprot_data if not isinstance(uniprot_data, Exception) else {},
+            "uniprot_data": results[0] if not isinstance(results[0], Exception) else {},
             "tissue_expression": tissue_expression,
-            "subcellular": subcellular
+            "subcellular": subcellular,
+            "alphafold_structure": results[1] if not isinstance(results[1], Exception) else {"available": False},
+            "pdb_structure": results[2] if not isinstance(results[2], Exception) else {"available": False, "structures": []},
+            "kegg_pathways": results[3] if not isinstance(results[3], Exception) else {"available": False, "pathways": []}
         }
+    
+    async def fetch_alphafold_structure(self, uniprot_id: str) -> Dict:
+        """
+        Fetch AlphaFold predicted structure for a protein
+        Uses the correct AlphaFold EBI API v1
+        """
+        cache_key = f"alphafold_{uniprot_id}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Correct AlphaFold API endpoint
+                api_url = f"https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id}"
+                
+                response = await client.get(api_url)
+                response.raise_for_status()
+                data = response.json()
+                
+                # AlphaFold returns a list with one entry
+                if data and len(data) > 0:
+                    entry = data[0]
+                    
+                    # Extract the entry ID (e.g., AF-P38398-F1)
+                    entry_id = entry.get("entryId", f"AF-{uniprot_id}-F1")
+                    
+                    result = {
+                        "available": True,
+                        "uniprot_id": uniprot_id,
+                        "entry_id": entry_id,
+                        "pdb_url": f"https://alphafold.ebi.ac.uk/files/{entry_id}-model_v4.pdb",
+                        "cif_url": f"https://alphafold.ebi.ac.uk/files/{entry_id}-model_v4.cif",
+                        "pae_url": f"https://alphafold.ebi.ac.uk/files/{entry_id}-predicted_aligned_error_v4.json",
+                        "alphafold_page": f"https://alphafold.ebi.ac.uk/entry/{uniprot_id}",
+                        "model_version": entry.get("latestVersion", 4),
+                        "gene_name": entry.get("gene", ""),
+                        "organism": entry.get("uniprotDescription", "")
+                    }
+                    
+                    self.cache.set(cache_key, result)
+                    return result
+                else:
+                    result = {"available": False, "uniprot_id": uniprot_id}
+                    self.cache.set(cache_key, result)
+                    return result
+                    
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                st.warning(f"No AlphaFold prediction available for {uniprot_id}")
+                result = {"available": False, "uniprot_id": uniprot_id}
+                self.cache.set(cache_key, result)
+                return result
+            else:
+                st.error(f"AlphaFold API error: {str(e)}")
+                return {"available": False, "uniprot_id": uniprot_id}
+        except Exception as e:
+            st.error(f"AlphaFold fetch error: {str(e)}")
+            return {"available": False, "uniprot_id": uniprot_id}
+
+    async def fetch_pdb_structure(self, uniprot_id: str) -> Dict:
+        """
+        Check if experimental structure exists in RCSB PDB
+        Uses RCSB REST API for UniProt mapping
+        """
+        cache_key = f"pdb_{uniprot_id}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Correct RCSB PDB API endpoint for UniProt mapping
+                api_url = "https://search.rcsb.org/rcsbsearch/v2/query"
+                
+                # Query JSON for searching by UniProt accession
+                query = {
+                    "query": {
+                        "type": "terminal",
+                        "service": "text",
+                        "parameters": {
+                            "attribute": "rcsb_polymer_entity_container_identifiers.reference_sequence_identifiers.database_accession",
+                            "operator": "exact_match",
+                            "value": uniprot_id
+                        }
+                    },
+                    "return_type": "entry",
+                    "request_options": {
+                        "return_all_hits": True
+                    }
+                }
+                
+                response = await client.post(api_url, json=query)
+                response.raise_for_status()
+                data = response.json()
+                
+                pdb_structures = []
+                
+                # Extract PDB IDs from results
+                if "result_set" in data:
+                    for result in data["result_set"]:
+                        pdb_id = result.get("identifier", "").upper()
+                        if pdb_id:
+                            # Fetch detailed info for each PDB entry
+                            try:
+                                detail_url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id}"
+                                detail_response = await client.get(detail_url)
+                                detail_data = detail_response.json()
+                                
+                                # Extract method and resolution
+                                exptl = detail_data.get("exptl", [{}])[0]
+                                method = exptl.get("method", "Unknown")
+                                
+                                refine = detail_data.get("refine", [{}])[0] if detail_data.get("refine") else {}
+                                resolution = refine.get("ls_d_res_high", "N/A")
+                                
+                                pdb_structures.append({
+                                    "pdb_id": pdb_id,
+                                    "pdb_url": f"https://files.rcsb.org/download/{pdb_id}.pdb",
+                                    "rcsb_page": f"https://www.rcsb.org/structure/{pdb_id}",
+                                    "method": method,
+                                    "resolution": f"{resolution} Å" if resolution != "N/A" else "N/A"
+                                })
+                            except:
+                                # If detail fetch fails, add basic info
+                                pdb_structures.append({
+                                    "pdb_id": pdb_id,
+                                    "pdb_url": f"https://files.rcsb.org/download/{pdb_id}.pdb",
+                                    "rcsb_page": f"https://www.rcsb.org/structure/{pdb_id}",
+                                    "method": "Unknown",
+                                    "resolution": "N/A"
+                                })
+                
+                result = {
+                    "available": len(pdb_structures) > 0,
+                    "structures": pdb_structures,
+                    "count": len(pdb_structures)
+                }
+                
+                self.cache.set(cache_key, result)
+                return result
+                
+        except Exception as e:
+            # Don't show error for PDB - it's optional
+            # st.warning(f"PDB fetch error: {str(e)}")
+            return {"available": False, "structures": [], "count": 0}
+
+    async def fetch_kegg_pathways(self, gene_name: str, uniprot_id: str) -> Dict:
+        """
+        Fetch KEGG pathways for a protein
+        Returns pathway information and links
+        """
+        cache_key = f"kegg_pathways_{uniprot_id}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Step 1: Convert gene name to KEGG gene ID (hsa:XXXXX format)
+                # First try to find the gene in KEGG using gene name
+                find_url = f"https://rest.kegg.jp/find/genes/{gene_name}+human"
+                response = await client.get(find_url)
+                response.raise_for_status()
+                gene_data = response.text.strip()
+                # If not found, try using UniProt ID
+                if not gene_data:
+                    find_url_uniprot = f"https://rest.kegg.jp/conv/genes/uniprot:{uniprot_id}"
+                    response_uniprot = await client.get(find_url_uniprot)
+                    response_uniprot.raise_for_status()
+                    gene_data = response_uniprot.text.strip()
+                if not gene_data:
+                    return {
+                        "available": False,
+                        "gene_name": gene_name,
+                        "pathways": []
+                    }
+                # Extract the first matching KEGG gene ID
+                lines = gene_data.split('\n')
+                kegg_gene_id = None
+                for line in lines:
+                    if line.strip():
+                        parts = line.split('\t')
+                        if len(parts) >= 2:
+                            # For gene name search, KEGG gene ID is in parts[0]
+                            # For UniProt search, KEGG gene ID is in parts[1]
+                            kegg_gene_id = parts[-1].strip()
+                            break
+                if not kegg_gene_id:
+                    return {
+                        "available": False,
+                        "gene_name": gene_name,
+                        "pathways": []
+                    }
+                
+                # Step 2: Get pathways for this gene
+                pathway_url = f"https://rest.kegg.jp/link/pathway/{kegg_gene_id}"
+                
+                pathway_response = await client.get(pathway_url)
+                pathway_response.raise_for_status()
+                
+                pathway_data = pathway_response.text.strip()
+                
+                if not pathway_data:
+                    return {
+                        "available": False,
+                        "gene_name": gene_name,
+                        "kegg_gene_id": kegg_gene_id,
+                        "pathways": []
+                    }
+                
+                # Step 3: Parse pathway IDs and fetch details
+                pathways = []
+                pathway_lines = pathway_data.split('\n')
+                
+                for line in pathway_lines:
+                    if line.strip():
+                        parts = line.split('\t')
+                        if len(parts) >= 2:
+                            pathway_id = parts[1].replace('path:', '')
+                            
+                            # Fetch pathway details
+                            try:
+                                detail_url = f"https://rest.kegg.jp/get/{pathway_id}"
+                                detail_response = await client.get(detail_url)
+                                detail_response.raise_for_status()
+                                
+                                detail_text = detail_response.text
+                                
+                                # Parse pathway name from the response
+                                pathway_name = "Unknown Pathway"
+                                pathway_class = ""
+                                
+                                for detail_line in detail_text.split('\n'):
+                                    if detail_line.startswith('NAME'):
+                                        pathway_name = detail_line.replace('NAME', '').strip()
+                                        # Remove species suffix if present
+                                        if ' - Homo sapiens' in pathway_name:
+                                            pathway_name = pathway_name.replace(' - Homo sapiens', '')
+                                    elif detail_line.startswith('CLASS'):
+                                        pathway_class = detail_line.replace('CLASS', '').strip()
+                                
+                                pathways.append({
+                                    "pathway_id": pathway_id,
+                                    "pathway_name": pathway_name,
+                                    "pathway_class": pathway_class,
+                                    "kegg_url": f"https://www.kegg.jp/pathway/{pathway_id}",
+                                    "kegg_image": f"https://www.kegg.jp/kegg/pathway/hsa/{pathway_id}.png",
+                                    "highlight_url": f"https://www.kegg.jp/pathway/{pathway_id}+{kegg_gene_id}"
+                                })
+                                
+                            except Exception as e:
+                                # If detail fetch fails, add basic info
+                                pathways.append({
+                                    "pathway_id": pathway_id,
+                                    "pathway_name": pathway_id.replace('hsa', 'Human pathway '),
+                                    "pathway_class": "",
+                                    "kegg_url": f"https://www.kegg.jp/pathway/{pathway_id}",
+                                    "kegg_image": f"https://www.kegg.jp/kegg/pathway/hsa/{pathway_id}.png",
+                                    "highlight_url": f"https://www.kegg.jp/pathway/{pathway_id}+{kegg_gene_id}"
+                                })
+                
+                result = {
+                    "available": len(pathways) > 0,
+                    "gene_name": gene_name,
+                    "kegg_gene_id": kegg_gene_id,
+                    "pathways": pathways,
+                    "pathway_count": len(pathways)
+                }
+                
+                self.cache.set(cache_key, result)
+                return result
+                
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return {
+                    "available": False,
+                    "gene_name": gene_name,
+                    "pathways": []
+                }
+            else:
+                st.warning(f"KEGG API error: {str(e)}")
+                return {
+                    "available": False,
+                    "gene_name": gene_name,
+                    "pathways": []
+                }
+        except Exception as e:
+            st.warning(f"KEGG fetch error: {str(e)}")
+            return {
+                "available": False,
+                "gene_name": gene_name,
+                "pathways": []
+            }
