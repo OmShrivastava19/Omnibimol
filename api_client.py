@@ -8,6 +8,8 @@ import asyncio
 from datetime import datetime
 from typing import List, Dict
 import os
+import random
+import math
 
 # Load TSV data at startup
 @st.cache_data
@@ -143,7 +145,7 @@ class ProteinAPIClient:
     async def fetch_uniprot_data(self, uniprot_id: str) -> Dict:
         """
         Fetch detailed protein data from UniProt
-        Returns function summary and GO terms
+        Returns function summary, GO terms, and sequence
         """
         cache_key = f"uniprot_data_{uniprot_id}"
         cached = self.cache.get(cache_key)
@@ -187,12 +189,24 @@ class ProteinAPIClient:
                                 elif term.startswith("C:"):
                                     go_terms["Cellular Component"].append(term[2:])
                 
+                # Extract sequence - THIS IS THE KEY FIX
+                sequence_data = data.get("sequence", {})
+                sequence = sequence_data.get("value", "")
+                
+                # Extract gene name
+                gene_name = ""
+                genes = data.get("genes", [])
+                if genes and len(genes) > 0:
+                    gene_name = genes[0].get("geneName", {}).get("value", "")
+                
                 result = {
                     "uniprot_id": uniprot_id,
                     "function": function or "No functional annotation available",
                     "go_terms": go_terms,
-                    "sequence_length": data.get("sequence", {}).get("length", 0),
-                    "mass": data.get("sequence", {}).get("molWeight", 0)
+                    "sequence_length": sequence_data.get("length", 0),
+                    "mass": sequence_data.get("molWeight", 0),
+                    "sequence": sequence,  # CRITICAL: Include sequence
+                    "gene_name": gene_name
                 }
                 
                 self.cache.set(cache_key, result)
@@ -205,9 +219,11 @@ class ProteinAPIClient:
                 "function": "Error fetching data",
                 "go_terms": {"Biological Process": [], "Molecular Function": [], "Cellular Component": []},
                 "sequence_length": 0,
-                "mass": 0
+                "mass": 0,
+                "sequence": "",
+                "gene_name": ""
             }
-    
+        
     def get_tissue_expression(self, gene_name: str) -> pd.DataFrame:
         """
         Get tissue expression data from local TSV file
@@ -292,8 +308,7 @@ class ProteinAPIClient:
     
     async def fetch_all_data(self, uniprot_id: str, gene_name: str) -> Dict:
         """
-        Fetch all data - UniProt from API, HPA from local TSV files, structures and KEGG from APIs
-        Returns combined dictionary with all protein information
+        Fetch all data including ligands for docking
         """
         # Run all API calls concurrently
         results = await asyncio.gather(
@@ -301,6 +316,7 @@ class ProteinAPIClient:
             self.fetch_alphafold_structure(uniprot_id),
             self.fetch_pdb_structure(uniprot_id),
             self.fetch_kegg_pathways(gene_name, uniprot_id),
+            self.fetch_chembl_ligands(uniprot_id),
             return_exceptions=True
         )
         
@@ -314,9 +330,10 @@ class ProteinAPIClient:
             "subcellular": subcellular,
             "alphafold_structure": results[1] if not isinstance(results[1], Exception) else {"available": False},
             "pdb_structure": results[2] if not isinstance(results[2], Exception) else {"available": False, "structures": []},
-            "kegg_pathways": results[3] if not isinstance(results[3], Exception) else {"available": False, "pathways": []}
+            "kegg_pathways": results[3] if not isinstance(results[3], Exception) else {"available": False, "pathways": []},
+            "chembl_ligands": results[4] if not isinstance(results[4], Exception) else {"available": False, "ligands": []}
         }
-    
+        
     async def fetch_alphafold_structure(self, uniprot_id: str) -> Dict:
         """
         Fetch AlphaFold predicted structure for a protein
@@ -329,25 +346,65 @@ class ProteinAPIClient:
         
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                # Correct AlphaFold API endpoint
-                api_url = f"https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id}"
+                # Try multiple AlphaFold API endpoints
+                api_urls = [
+                    f"https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id}",
+                    f"https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id.upper()}",
+                    f"https://www.alphafold.ebi.ac.uk/api/prediction/{uniprot_id}"
+                ]
                 
-                response = await client.get(api_url)
-                response.raise_for_status()
-                data = response.json()
+                data = None
+                successful_url = None
+                
+                for api_url in api_urls:
+                    try:
+                        print(f"DEBUG: Trying AlphaFold API: {api_url}")
+                        response = await client.get(api_url)
+                        response.raise_for_status()
+                        data = response.json()
+                        successful_url = api_url
+                        print(f"DEBUG: Success with URL: {api_url}")
+                        break
+                    except httpx.HTTPStatusError as e:
+                        print(f"DEBUG: Failed with {api_url}: {e.response.status_code}")
+                        continue
+                
+                if not data:
+                    # Try direct file check approach
+                    direct_pdb_url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.pdb"
+                    print(f"DEBUG: Trying direct PDB check: {direct_pdb_url}")
+                    try:
+                        head_response = await client.head(direct_pdb_url)
+                        if head_response.status_code == 200:
+                            # File exists, create minimal data structure
+                            data = [{"entryId": f"AF-{uniprot_id}-F1"}]
+                            print(f"DEBUG: Direct PDB file exists, creating structure data")
+                    except:
+                        pass
                 
                 # AlphaFold returns a list with one entry
                 if data and len(data) > 0:
                     entry = data[0]
                     
-                    # Extract the entry ID (e.g., AF-P38398-F1)
-                    entry_id = entry.get("entryId", f"AF-{uniprot_id}-F1")
+                    # Extract and normalize the entry ID to avoid duplicate suffixes that break URLs
+                    entry_id_raw = entry.get("entryId") or entry.get("entry_id") or f"AF-{uniprot_id}-F1"
+                    entry_id_clean = entry_id_raw.replace(".pdb", "").replace(".cif", "")
+                    if "-model_v" in entry_id_clean:
+                        entry_id_clean = entry_id_clean.split("-model_v")[0]
+                    if not entry_id_clean.startswith("AF-"):
+                        entry_id_clean = f"AF-{entry_id_clean}"
+                    entry_id = entry_id_clean
+                    
+                    pdb_url = f"https://alphafold.ebi.ac.uk/files/{entry_id}-model_v4.pdb"
+                    
+                    print(f"DEBUG: AlphaFold structure found for {uniprot_id}: {entry_id}")
+                    print(f"DEBUG: PDB URL: {pdb_url}")
                     
                     result = {
                         "available": True,
                         "uniprot_id": uniprot_id,
                         "entry_id": entry_id,
-                        "pdb_url": f"https://alphafold.ebi.ac.uk/files/{entry_id}-model_v4.pdb",
+                        "pdb_url": pdb_url,
                         "cif_url": f"https://alphafold.ebi.ac.uk/files/{entry_id}-model_v4.cif",
                         "pae_url": f"https://alphafold.ebi.ac.uk/files/{entry_id}-predicted_aligned_error_v4.json",
                         "alphafold_page": f"https://alphafold.ebi.ac.uk/entry/{uniprot_id}",
@@ -359,11 +416,13 @@ class ProteinAPIClient:
                     self.cache.set(cache_key, result)
                     return result
                 else:
+                    print(f"DEBUG: No AlphaFold data returned for {uniprot_id}")
                     result = {"available": False, "uniprot_id": uniprot_id}
                     self.cache.set(cache_key, result)
                     return result
                     
         except httpx.HTTPStatusError as e:
+            print(f"DEBUG: AlphaFold API HTTP error for {uniprot_id}: {e.response.status_code}")  # Debug
             if e.response.status_code == 404:
                 st.warning(f"No AlphaFold prediction available for {uniprot_id}")
                 result = {"available": False, "uniprot_id": uniprot_id}
@@ -373,6 +432,7 @@ class ProteinAPIClient:
                 st.error(f"AlphaFold API error: {str(e)}")
                 return {"available": False, "uniprot_id": uniprot_id}
         except Exception as e:
+            print(f"DEBUG: AlphaFold fetch error for {uniprot_id}: {str(e)}")  # Debug
             st.error(f"AlphaFold fetch error: {str(e)}")
             return {"available": False, "uniprot_id": uniprot_id}
 
@@ -465,73 +525,84 @@ class ProteinAPIClient:
 
     async def fetch_kegg_pathways(self, gene_name: str, uniprot_id: str) -> Dict:
         """
-        Fetch KEGG pathways for a protein
-        Returns pathway information and links
+        Fetch KEGG pathways for a PROTEIN (not gene)
+        Returns comprehensive pathway information including pathway map images and metadata
+        
+        Format:
+        - 1st Result: Pathway map image + all metadata (name, ID, description, functions)
+        - Next 5 Results: List with pathway name, ID, and direct KEGG website links
         """
-        cache_key = f"kegg_pathways_{uniprot_id}"
+        cache_key = f"kegg_pathways_protein_{uniprot_id}"
         cached = self.cache.get(cache_key)
         if cached:
             return cached
         
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                # Step 1: Convert gene name to KEGG gene ID (hsa:XXXXX format)
-                # First try to find the gene in KEGG using gene name
-                find_url = f"https://rest.kegg.jp/find/genes/{gene_name}+human"
+                # Step 1: Fetch protein data from KEGG using UniProt ID
+                # This converts UniProt ID to KEGG protein ID
+                find_url = f"https://rest.kegg.jp/conv/genes/uniprot:{uniprot_id}"
                 response = await client.get(find_url)
                 response.raise_for_status()
-                gene_data = response.text.strip()
-                # If not found, try using UniProt ID
-                if not gene_data:
-                    find_url_uniprot = f"https://rest.kegg.jp/conv/genes/uniprot:{uniprot_id}"
-                    response_uniprot = await client.get(find_url_uniprot)
-                    response_uniprot.raise_for_status()
-                    gene_data = response_uniprot.text.strip()
-                if not gene_data:
+                protein_data = response.text.strip()
+                
+                # If not found by UniProt, try gene name
+                if not protein_data:
+                    find_url = f"https://rest.kegg.jp/find/genes/{gene_name}+human"
+                    response = await client.get(find_url)
+                    response.raise_for_status()
+                    protein_data = response.text.strip()
+                
+                if not protein_data:
                     return {
                         "available": False,
-                        "gene_name": gene_name,
-                        "pathways": []
+                        "uniprot_id": uniprot_id,
+                        "protein_name": gene_name,
+                        "pathways": [],
+                        "first_result": None
                     }
-                # Extract the first matching KEGG gene ID
-                lines = gene_data.split('\n')
-                kegg_gene_id = None
+                
+                # Extract the KEGG protein/gene ID
+                lines = protein_data.split('\n')
+                kegg_protein_id = None
                 for line in lines:
                     if line.strip():
                         parts = line.split('\t')
                         if len(parts) >= 2:
-                            # For gene name search, KEGG gene ID is in parts[0]
-                            # For UniProt search, KEGG gene ID is in parts[1]
-                            kegg_gene_id = parts[-1].strip()
+                            # KEGG protein ID is in parts[-1]
+                            kegg_protein_id = parts[-1].strip()
                             break
-                if not kegg_gene_id:
+                
+                if not kegg_protein_id:
                     return {
                         "available": False,
-                        "gene_name": gene_name,
-                        "pathways": []
+                        "uniprot_id": uniprot_id,
+                        "protein_name": gene_name,
+                        "pathways": [],
+                        "first_result": None
                     }
                 
-                # Step 2: Get pathways for this gene
-                pathway_url = f"https://rest.kegg.jp/link/pathway/{kegg_gene_id}"
-                
+                # Step 2: Get pathways associated with this protein
+                pathway_url = f"https://rest.kegg.jp/link/pathway/{kegg_protein_id}"
                 pathway_response = await client.get(pathway_url)
                 pathway_response.raise_for_status()
-                
                 pathway_data = pathway_response.text.strip()
                 
                 if not pathway_data:
                     return {
                         "available": False,
-                        "gene_name": gene_name,
-                        "kegg_gene_id": kegg_gene_id,
-                        "pathways": []
+                        "uniprot_id": uniprot_id,
+                        "protein_name": gene_name,
+                        "kegg_protein_id": kegg_protein_id,
+                        "pathways": [],
+                        "first_result": None
                     }
                 
-                # Step 3: Parse pathway IDs and fetch details
+                # Step 3: Parse pathway IDs and fetch comprehensive details
                 pathways = []
                 pathway_lines = pathway_data.split('\n')
                 
-                for line in pathway_lines:
+                for idx, line in enumerate(pathway_lines):
                     if line.strip():
                         parts = line.split('\t')
                         if len(parts) >= 2:
@@ -545,9 +616,11 @@ class ProteinAPIClient:
                                 
                                 detail_text = detail_response.text
                                 
-                                # Parse pathway name from the response
+                                # Parse comprehensive pathway information
                                 pathway_name = "Unknown Pathway"
+                                pathway_description = ""
                                 pathway_class = ""
+                                molecular_functions = []
                                 
                                 for detail_line in detail_text.split('\n'):
                                     if detail_line.startswith('NAME'):
@@ -555,35 +628,60 @@ class ProteinAPIClient:
                                         # Remove species suffix if present
                                         if ' - Homo sapiens' in pathway_name:
                                             pathway_name = pathway_name.replace(' - Homo sapiens', '')
+                                    elif detail_line.startswith('DESCRIPTION'):
+                                        pathway_description = detail_line.replace('DESCRIPTION', '').strip()
                                     elif detail_line.startswith('CLASS'):
                                         pathway_class = detail_line.replace('CLASS', '').strip()
+                                    elif detail_line.startswith('GENE'):
+                                        # Extract molecular functions from gene entries
+                                        func_line = detail_line.replace('GENE', '').strip()
+                                        if func_line and ';' in func_line:
+                                            func_parts = func_line.split(';')
+                                            if len(func_parts) > 1:
+                                                molecular_functions.append(func_parts[1].strip())
                                 
-                                pathways.append({
+                                pathway_info = {
                                     "pathway_id": pathway_id,
                                     "pathway_name": pathway_name,
+                                    "pathway_description": pathway_description,
                                     "pathway_class": pathway_class,
+                                    "molecular_functions": list(set(molecular_functions)) if molecular_functions else [],
                                     "kegg_url": f"https://www.kegg.jp/pathway/{pathway_id}",
-                                    "kegg_image": f"https://www.kegg.jp/kegg/pathway/hsa/{pathway_id}.png",
-                                    "highlight_url": f"https://www.kegg.jp/pathway/{pathway_id}+{kegg_gene_id}"
-                                })
+                                    "kegg_image_url": f"https://www.kegg.jp/kegg/pathway/hsa/{pathway_id}.png",
+                                    "highlight_url": f"https://www.kegg.jp/pathway/{pathway_id}+{kegg_protein_id}",
+                                    "is_first": idx == 0
+                                }
+                                
+                                pathways.append(pathway_info)
                                 
                             except Exception as e:
                                 # If detail fetch fails, add basic info
-                                pathways.append({
+                                pathway_info = {
                                     "pathway_id": pathway_id,
                                     "pathway_name": pathway_id.replace('hsa', 'Human pathway '),
+                                    "pathway_description": "",
                                     "pathway_class": "",
+                                    "molecular_functions": [],
                                     "kegg_url": f"https://www.kegg.jp/pathway/{pathway_id}",
-                                    "kegg_image": f"https://www.kegg.jp/kegg/pathway/hsa/{pathway_id}.png",
-                                    "highlight_url": f"https://www.kegg.jp/pathway/{pathway_id}+{kegg_gene_id}"
-                                })
+                                    "kegg_image_url": f"https://www.kegg.jp/kegg/pathway/hsa/{pathway_id}.png",
+                                    "highlight_url": f"https://www.kegg.jp/pathway/{pathway_id}+{kegg_protein_id}",
+                                    "is_first": idx == 0
+                                }
+                                pathways.append(pathway_info)
+                
+                # Separate first result and next 5 results
+                first_result = pathways[0] if pathways else None
+                next_results = pathways[1:6] if len(pathways) > 1 else []
                 
                 result = {
                     "available": len(pathways) > 0,
-                    "gene_name": gene_name,
-                    "kegg_gene_id": kegg_gene_id,
-                    "pathways": pathways,
-                    "pathway_count": len(pathways)
+                    "uniprot_id": uniprot_id,
+                    "protein_name": gene_name,
+                    "kegg_protein_id": kegg_protein_id,
+                    "total_pathways": len(pathways),
+                    "first_result": first_result,
+                    "next_results": next_results,
+                    "pathways": pathways  # Keep all for compatibility
                 }
                 
                 self.cache.set(cache_key, result)
@@ -593,20 +691,954 @@ class ProteinAPIClient:
             if e.response.status_code == 404:
                 return {
                     "available": False,
-                    "gene_name": gene_name,
-                    "pathways": []
+                    "uniprot_id": uniprot_id,
+                    "protein_name": gene_name,
+                    "pathways": [],
+                    "first_result": None
                 }
             else:
                 st.warning(f"KEGG API error: {str(e)}")
                 return {
                     "available": False,
-                    "gene_name": gene_name,
-                    "pathways": []
+                    "uniprot_id": uniprot_id,
+                    "protein_name": gene_name,
+                    "pathways": [],
+                    "first_result": None
                 }
         except Exception as e:
             st.warning(f"KEGG fetch error: {str(e)}")
             return {
                 "available": False,
-                "gene_name": gene_name,
-                "pathways": []
+                "uniprot_id": uniprot_id,
+                "protein_name": gene_name,
+                "pathways": [],
+                "first_result": None
             }
+    
+    async def fetch_literature_summary(self, uniprot_id: str, protein_name: str) -> dict:
+        """
+        Fetches literature summary from PubMed and Wikipedia for a protein.
+        Caches results for 7 days.
+        """
+        import requests
+        import time
+        cache_key = f"lit_{uniprot_id}"
+        cached = self.cache.get(cache_key)
+        if cached and isinstance(cached, dict) and (time.time() - cached.get('timestamp', 0) < 7*24*3600):
+            return cached.get('data', {})
+        
+        papers = []
+        wiki_title = None
+        wiki_snippet = None
+        
+        try:
+            # PubMed search with timeout
+            pubmed_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+            params = {
+                'db': 'pubmed',
+                'term': f'("{protein_name}"[Title/Abstract] OR "{uniprot_id}"[All Fields])',
+                'retmax': 5,
+                'retmode': 'json',
+                'sort': 'relevance',
+                'usehistory': 'y'
+            }
+            search = requests.get(pubmed_url, params=params, timeout=10).json()
+            pmids = search.get('esearchresult', {}).get('idlist', [])
+            
+            if pmids:
+                try:
+                    efetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+                    abs_data = requests.get(
+                        efetch_url,
+                        params={'db': 'pubmed', 'id': ','.join(pmids), 'retmode': 'xml'},
+                        timeout=10
+                    ).text
+                    papers = self.parse_pubmed_abstracts(abs_data)
+                except Exception as e:
+                    st.warning(f"Could not fetch PubMed abstracts: {str(e)}")
+        except Exception as e:
+            st.warning(f"PubMed search error: {str(e)}")
+        
+        try:
+            # Wikipedia search with proper User-Agent to avoid 403
+            wiki_url = "https://en.wikipedia.org/w/api.php"
+            headers = {
+                'User-Agent': 'OmniBiMol/1.0 (Protein Analysis Platform; +http://github.com)'
+            }
+            wiki_params = {
+                'action': 'query',
+                'list': 'search',
+                'srsearch': protein_name,
+                'format': 'json',
+                'srlimit': 1,
+                'srprop': 'snippet'
+            }
+            wiki_response = requests.get(wiki_url, params=wiki_params, headers=headers, timeout=10)
+            wiki_response.raise_for_status()
+            
+            if wiki_response.text:
+                wiki_res = wiki_response.json()
+                wiki_search = wiki_res.get('query', {}).get('search', [])
+                if wiki_search:
+                    wiki_page = wiki_search[0]
+                    wiki_title = wiki_page.get('title')
+                    wiki_snippet = wiki_page.get('snippet')
+            else:
+                st.warning("Wikipedia returned empty response")
+        except requests.exceptions.RequestException as e:
+            st.warning(f"Wikipedia connection error: {str(e)}")
+        except ValueError as e:
+            st.warning(f"Wikipedia response parsing error: Invalid JSON response")
+        except Exception as e:
+            st.warning(f"Wikipedia search error: {str(e)}")
+        
+        result = {
+            'papers': papers,
+            'wiki_title': wiki_title,
+            'wiki_snippet': wiki_snippet
+        }
+        self.cache.set(cache_key, {'data': result, 'timestamp': time.time()})
+        return result
+
+    def parse_pubmed_abstracts(self, xml_data):
+        import xml.etree.ElementTree as ET
+        papers = []
+        try:
+            root = ET.fromstring(xml_data)
+            for article in root.findall('.//PubmedArticle'):
+                title_elem = article.find('.//ArticleTitle')
+                abstract_elem = article.find('.//AbstractText')
+                pmid_elem = article.find('.//PMID')
+                
+                title = title_elem.text if title_elem is not None and title_elem.text else ''
+                abstract = abstract_elem.text if abstract_elem is not None and abstract_elem.text else ''
+                pmid = pmid_elem.text if pmid_elem is not None and pmid_elem.text else ''
+                
+                if not title or not pmid:
+                    continue
+                
+                authors = []
+                for author in article.findall('.//Author'):
+                    last = author.findtext('LastName', default='').strip()
+                    fore = author.findtext('ForeName', default='').strip()
+                    if last:
+                        full_name = f"{fore} {last}".strip()
+                        if full_name:
+                            authors.append(full_name)
+                
+                abstract_snip = (abstract[:200] + '...') if abstract and len(abstract) > 200 else abstract
+                
+                papers.append({
+                    'title': title,
+                    'authors': ', '.join(authors[:3]) if authors else 'Unknown',
+                    'abstract_snip': abstract_snip if abstract_snip else '[No abstract available]',
+                    'pmid': pmid
+                })
+        except Exception as e:
+            st.error(f"Error parsing PubMed data: {str(e)}")
+        return papers
+
+    async def fetch_chembl_ligands(self, uniprot_id: str, gene_name: str) -> dict:
+        """
+        Fetch ChEMBL ligands/compounds associated with a protein target.
+        Returns top ligands with bioactivity data.
+        """
+        import requests
+        cache_key = f"chembl_{uniprot_id}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            target_id = None
+            headers = {
+                'User-Agent': 'OmniBiMol/1.0 (Protein Analysis Platform; +http://github.com)'
+            }
+            
+            # Step 1: Search for target by gene name (most reliable)
+            chembl_url = "https://www.ebi.ac.uk/chembl/api/data/target"
+            
+            # Try gene name search first with pref_name
+            search_params = {
+                'format': 'json',
+                'limit': 5,
+                'pref_name__icontains': gene_name
+            }
+            response = requests.get(chembl_url, params=search_params, headers=headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('results') and len(data['results']) > 0:
+                    # Filter for protein targets
+                    for result in data['results']:
+                        if result.get('target_type') in ['SINGLE PROTEIN', 'PROTEIN COMPLEX']:
+                            target_id = result.get('target_chembl_id')
+                            break
+            
+            # If not found by name, try by target synonym
+            if not target_id:
+                search_params = {
+                    'format': 'json',
+                    'limit': 5,
+                    'target_synonym__icontains': gene_name
+                }
+                response = requests.get(chembl_url, params=search_params, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('results') and len(data['results']) > 0:
+                        for result in data['results']:
+                            if result.get('target_type') in ['SINGLE PROTEIN', 'PROTEIN COMPLEX']:
+                                target_id = result.get('target_chembl_id')
+                                break
+            
+            # If still not found, try UniProt ID
+            if not target_id:
+                search_params = {
+                    'format': 'json',
+                    'limit': 5,
+                    'target_synonym__icontains': uniprot_id
+                }
+                response = requests.get(chembl_url, params=search_params, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('results') and len(data['results']) > 0:
+                        for result in data['results']:
+                            if result.get('target_type') in ['SINGLE PROTEIN', 'PROTEIN COMPLEX']:
+                                target_id = result.get('target_chembl_id')
+                                break
+            
+            if not target_id:
+                return {"available": False, "ligands": [], "gene_name": gene_name}
+            
+            # Step 2: Get activities/compounds for this target
+            activities_url = "https://www.ebi.ac.uk/chembl/api/data/activity"
+            activity_params = {
+                'format': 'json',
+                'limit': 30,
+                'target_chembl_id': target_id
+            }
+            
+            response = requests.get(activities_url, params=activity_params, headers=headers, timeout=10)
+            if response.status_code != 200:
+                return {"available": False, "ligands": [], "gene_name": gene_name}
+            
+            data = response.json()
+            ligands = []
+            seen = set()
+            
+            for activity in data.get('results', []):
+                compound_chembl_id = activity.get('molecule_chembl_id')
+                if not compound_chembl_id or compound_chembl_id in seen:
+                    continue
+                
+                seen.add(compound_chembl_id)
+                
+                try:
+                    # Get compound details
+                    compound_url = f"https://www.ebi.ac.uk/chembl/api/data/molecule/{compound_chembl_id}"
+                    compound_response = requests.get(compound_url, params={'format': 'json'}, headers=headers, timeout=10)
+                    if compound_response.status_code == 200:
+                        compound_data = compound_response.json()
+                        
+                        ligands.append({
+                            'name': activity.get('ligand_name', compound_data.get('pref_name', 'Unknown')),
+                            'chembl_id': compound_chembl_id,
+                            'canonical_smiles': compound_data.get('canonical_smiles', ''),
+                            'mw': compound_data.get('molecular_weight'),
+                            'logp': compound_data.get('alogp'),
+                            'hbd': compound_data.get('num_h_donors'),
+                            'hba': compound_data.get('num_h_acceptors'),
+                            'activity_type': activity.get('type', 'Unknown'),
+                            'activity_value': activity.get('value'),
+                            'activity_unit': activity.get('units', ''),
+                            'chembl_url': f"https://www.ebi.ac.uk/chembl/compound_report_card/{compound_chembl_id}/"
+                        })
+                        
+                        if len(ligands) >= 10:
+                            break
+                except Exception:
+                    continue
+            
+            result = {
+                "available": len(ligands) > 0,
+                "target_id": target_id,
+                "ligands": ligands,
+                "gene_name": gene_name
+            }
+            
+            self.cache.set(cache_key, result)
+            return result
+            
+        except requests.exceptions.Timeout:
+            return {"available": False, "ligands": [], "gene_name": gene_name}
+        except Exception as e:
+            return {"available": False, "ligands": [], "gene_name": gene_name}
+    
+    async def run_blast_search(self, sequence: str, uniprot_id: str) -> Dict:
+        """
+        Run BLAST search against NCBI nr database
+        Two-step process: Submit job, then poll for results
+        """
+        cache_key = f"blast_{uniprot_id}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                # Step 1: Submit BLAST job
+                submit_url = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
+                
+                submit_params = {
+                    "CMD": "Put",
+                    "PROGRAM": "blastp",
+                    "DATABASE": "nr",
+                    "QUERY": sequence,
+                    "FORMAT_TYPE": "JSON2",
+                    "HITLIST_SIZE": "10",  # Top 10 hits
+                    "EXPECT": "0.001",  # E-value threshold
+                    "FILTER": "L",  # Low complexity filter
+                    "ALIGNMENTS": "10"
+                }
+                
+                submit_response = await client.post(submit_url, data=submit_params)
+                submit_response.raise_for_status()
+                submit_text = submit_response.text
+                
+                # Extract RID (Request ID) from response
+                rid = None
+                for line in submit_text.split('\n'):
+                    if 'RID =' in line:
+                        rid = line.split('=')[1].strip()
+                        break
+                
+                if not rid:
+                    return {
+                        "available": False,
+                        "error": "Failed to submit BLAST job"
+                    }
+                
+                # Step 2: Poll for results (can take 30-60 seconds)
+                max_attempts = 30
+                attempt = 0
+                
+                while attempt < max_attempts:
+                    await asyncio.sleep(2)  # Wait 2 seconds between checks
+                    
+                    check_params = {
+                        "CMD": "Get",
+                        "RID": rid,
+                        "FORMAT_TYPE": "JSON2"
+                    }
+                    
+                    check_response = await client.get(submit_url, params=check_params)
+                    check_text = check_response.text
+                    
+                    # Check if results are ready
+                    if "Status=READY" in check_text:
+                        # Parse JSON results
+                        try:
+                            # Extract JSON from response
+                            json_start = check_text.find('{')
+                            if json_start != -1:
+                                json_data = json.loads(check_text[json_start:])
+                                
+                                # Parse BLAST results
+                                hits = []
+                                
+                                if "BlastOutput2" in json_data:
+                                    for report in json_data["BlastOutput2"]:
+                                        if "report" in report:
+                                            search_results = report["report"].get("results", {}).get("search", {})
+                                            hit_list = search_results.get("hits", [])
+                                            
+                                            for hit in hit_list[:10]:  # Top 10
+                                                description = hit.get("description", [{}])[0]
+                                                hsps = hit.get("hsps", [{}])[0]  # High-scoring segment pairs
+                                                
+                                                hits.append({
+                                                    "accession": description.get("accession", "Unknown"),
+                                                    "title": description.get("title", "Unknown"),
+                                                    "organism": description.get("sciname", "Unknown"),
+                                                    "identity_percent": round(hsps.get("identity", 0) / hsps.get("align_len", 1) * 100, 2),
+                                                    "coverage_percent": round(hsps.get("align_len", 0) / len(sequence) * 100, 2),
+                                                    "e_value": hsps.get("evalue", 1.0),
+                                                    "bit_score": hsps.get("bit_score", 0),
+                                                    "align_len": hsps.get("align_len", 0)
+                                                })
+                                
+                                result = {
+                                    "available": True,
+                                    "rid": rid,
+                                    "hits": hits,
+                                    "hit_count": len(hits)
+                                }
+                                
+                                self.cache.set(cache_key, result)
+                                return result
+                                
+                        except Exception as e:
+                            st.warning(f"Error parsing BLAST results: {str(e)}")
+                            return {
+                                "available": False,
+                                "error": f"Failed to parse results: {str(e)}"
+                            }
+                    
+                    elif "Status=WAITING" in check_text:
+                        attempt += 1
+                        continue
+                    else:
+                        return {
+                            "available": False,
+                            "error": "BLAST job failed or expired"
+                        }
+                
+                return {
+                    "available": False,
+                    "error": "BLAST search timed out"
+                }
+                
+        except Exception as e:
+            st.error(f"BLAST error: {str(e)}")
+            return {
+                "available": False,
+                "error": str(e)
+            }
+
+    def get_fasta_sequence(self, uniprot_data: Dict) -> str:
+        """
+        Extract FASTA formatted sequence from UniProt data
+        """
+        uniprot_id = uniprot_data.get('uniprot_id', 'UNKNOWN')
+        sequence = uniprot_data.get('sequence', '')
+        gene_name = uniprot_data.get('gene_name', '')
+        
+        # Create FASTA header
+        fasta = f">{uniprot_id}"
+        if gene_name:
+            fasta += f"|{gene_name}"
+        fasta += f" Homo sapiens\n"
+        
+        # Add sequence with 60 characters per line
+        for i in range(0, len(sequence), 60):
+            fasta += sequence[i:i+60] + "\n"
+        
+        return fasta
+
+    async def fetch_embl_sequence(self, uniprot_id: str) -> Dict:
+        """
+        Fetch sequence features from UniProt directly (more reliable than EMBL endpoint)
+        Provides domain, region, and site annotations
+        """
+        cache_key = f"features_{uniprot_id}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Use UniProt's own feature API
+                url = f"{self.uniprot_base}/uniprotkb/{uniprot_id}.json"
+                
+                response = await client.get(url)
+                response.raise_for_status()
+                data = response.json()
+                
+                # Extract features from UniProt JSON
+                features = []
+                
+                for feature in data.get("features", []):
+                    feature_type = feature.get("type", "")
+                    description = feature.get("description", "")
+                    
+                    # Get location
+                    location = feature.get("location", {})
+                    start = location.get("start", {}).get("value")
+                    end = location.get("end", {}).get("value")
+                    
+                    if start and end:
+                        features.append({
+                            "type": feature_type,
+                            "description": description if description else feature_type,
+                            "start": int(start),
+                            "end": int(end),
+                            "length": int(end) - int(start) + 1
+                        })
+                
+                result = {
+                    "available": len(features) > 0,
+                    "uniprot_id": uniprot_id,
+                    "features": features,
+                    "feature_count": len(features)
+                }
+                
+                self.cache.set(cache_key, result)
+                return result
+                
+        except Exception as e:
+            st.warning(f"Feature fetch error: {str(e)}")
+            return {
+                "available": False,
+                "uniprot_id": uniprot_id,
+                "features": []
+            }
+
+    async def run_needle_alignment(self, sequence1: str, sequence2: str, 
+                               id1: str = "Query", id2: str = "Subject") -> Dict:
+        """
+        Run EMBOSS Needle pairwise sequence alignment via EMBL-EBI REST API
+        Needle performs global alignment (Needleman-Wunsch algorithm)
+        """
+        cache_key = f"needle_{hash(sequence1)}_{hash(sequence2)}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                # EMBL-EBI EMBOSS Needle endpoint
+                submit_url = "https://www.ebi.ac.uk/Tools/services/rest/emboss_needle/run"
+                
+                # Clean sequences (remove whitespace and non-amino acid characters)
+                seq1_clean = ''.join(c for c in sequence1.upper() if c.isalpha())
+                seq2_clean = ''.join(c for c in sequence2.upper() if c.isalpha())
+                
+                # Prepare FASTA format
+                fasta1 = f">{id1}\n{seq1_clean}"
+                fasta2 = f">{id2}\n{seq2_clean}"
+                
+                # Prepare form data (application/x-www-form-urlencoded)
+                submit_data = {
+                    "email": "omnibiomol@example.com",
+                    "title": f"Alignment_{id1}_vs_{id2}",
+                    "asequence": fasta1,
+                    "bsequence": fasta2,
+                    "gapopen": "10",
+                    "gapextend": "0.5",
+                    "endweight": "false",
+                    "endopen": "10",
+                    "endextend": "0.5",
+                    "matrix": "BLOSUM62",
+                    "sformat": "pair"
+                }
+                
+                # Step 1: Submit job with correct content type
+                headers = {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Accept": "text/plain"
+                }
+                
+                submit_response = await client.post(
+                    submit_url, 
+                    data=submit_data,
+                    headers=headers
+                )
+                submit_response.raise_for_status()
+                
+                job_id = submit_response.text.strip()
+                
+                if not job_id or len(job_id) > 50:  # Job ID should be short
+                    return {
+                        "available": False,
+                        "error": "Failed to submit Needle alignment job"
+                    }
+                
+                # Step 2: Poll for completion
+                status_url = f"https://www.ebi.ac.uk/Tools/services/rest/emboss_needle/status/{job_id}"
+                result_url = f"https://www.ebi.ac.uk/Tools/services/rest/emboss_needle/result/{job_id}/aln-pair"
+                
+                max_attempts = 40
+                attempt = 0
+                
+                while attempt < max_attempts:
+                    await asyncio.sleep(3)  # Wait 3 seconds between checks
+                    
+                    try:
+                        status_response = await client.get(status_url)
+                        status = status_response.text.strip()
+                        
+                        if status == "FINISHED":
+                            # Get results
+                            result_response = await client.get(result_url)
+                            result_response.raise_for_status()
+                            
+                            alignment_text = result_response.text
+                            
+                            # Parse alignment results
+                            alignment_data = self._parse_needle_output(alignment_text, id1, id2)
+                            
+                            result = {
+                                "available": True,
+                                "job_id": job_id,
+                                "alignment_text": alignment_text,
+                                "identity": alignment_data.get("identity", 0),
+                                "similarity": alignment_data.get("similarity", 0),
+                                "gaps": alignment_data.get("gaps", 0),
+                                "score": alignment_data.get("score", 0),
+                                "alignment_length": alignment_data.get("alignment_length", 0),
+                                "alignment_display": alignment_data.get("alignment_display", "")
+                            }
+                            
+                            self.cache.set(cache_key, result)
+                            return result
+                            
+                        elif status == "RUNNING":
+                            attempt += 1
+                            continue
+                        elif status == "FAILURE" or status == "ERROR":
+                            return {
+                                "available": False,
+                                "error": f"Needle alignment failed with status: {status}"
+                            }
+                        else:
+                            attempt += 1
+                            continue
+                            
+                    except httpx.HTTPStatusError as e:
+                        if attempt >= max_attempts - 1:
+                            raise
+                        attempt += 1
+                        continue
+                
+                return {
+                    "available": False,
+                    "error": "Needle alignment timed out after 2 minutes"
+                }
+                
+        except httpx.HTTPStatusError as e:
+            error_msg = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
+            st.error(f"Needle alignment error: {error_msg}")
+            return {
+                "available": False,
+                "error": error_msg
+            }
+        except Exception as e:
+            st.error(f"Needle alignment error: {str(e)}")
+            return {
+                "available": False,
+                "error": str(e)
+            }
+
+    def _parse_needle_output(self, alignment_text: str, id1: str, id2: str) -> Dict:
+        """
+        Parse EMBOSS Needle alignment output
+        Extracts identity, similarity, gaps, score, and formatted alignment
+        """
+        try:
+            lines = alignment_text.split('\n')
+            
+            identity = 0.0
+            similarity = 0.0
+            gaps = 0.0
+            score = 0.0
+            alignment_length = 0
+            
+            # Extract statistics from header
+            for line in lines:
+                line = line.strip()
+                
+                if line.startswith("# Identity:"):
+                    # Format: "# Identity:     123/456 (27.0%)"
+                    try:
+                        match = line.split('(')[1].split('%')[0]
+                        identity = float(match.strip())
+                    except:
+                        pass
+                        
+                elif line.startswith("# Similarity:"):
+                    try:
+                        match = line.split('(')[1].split('%')[0]
+                        similarity = float(match.strip())
+                    except:
+                        pass
+                        
+                elif line.startswith("# Gaps:"):
+                    try:
+                        match = line.split('(')[1].split('%')[0]
+                        gaps = float(match.strip())
+                    except:
+                        pass
+                        
+                elif line.startswith("# Score:"):
+                    try:
+                        score = float(line.split(':')[1].strip().split()[0])
+                    except:
+                        pass
+                        
+                elif line.startswith("# Length:"):
+                    try:
+                        alignment_length = int(line.split(':')[1].strip())
+                    except:
+                        pass
+            
+            # Extract alignment visualization (keep first 2000 chars for display)
+            alignment_start = -1
+            for i, line in enumerate(lines):
+                if not line.startswith('#') and line.strip() and (id1 in line or id2 in line):
+                    alignment_start = i
+                    break
+            
+            if alignment_start >= 0:
+                alignment_display = '\n'.join(lines[alignment_start:alignment_start+100])
+            else:
+                alignment_display = alignment_text[:2000]
+            
+            return {
+                "identity": identity,
+                "similarity": similarity,
+                "gaps": gaps,
+                "score": score,
+                "alignment_length": alignment_length,
+                "alignment_display": alignment_display
+            }
+            
+        except Exception as e:
+            st.warning(f"Warning: Could not parse all alignment statistics: {e}")
+            return {
+                "identity": 0,
+                "similarity": 0,
+                "gaps": 0,
+                "score": 0,
+                "alignment_length": 0,
+                "alignment_display": alignment_text[:2000]
+            }
+    
+    async def fetch_chembl_ligands(self, uniprot_id: str) -> Dict:
+        """
+        Fetch known ligands/inhibitors from ChEMBL database
+        Returns compounds with binding affinity data
+        """
+        cache_key = f"chembl_ligands_{uniprot_id}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Step 1: Get ChEMBL Target ID from UniProt ID
+                target_url = f"https://www.ebi.ac.uk/chembl/api/data/target/search.json?q={uniprot_id}"
+                
+                target_response = await client.get(target_url)
+                target_response.raise_for_status()
+                target_data = target_response.json()
+                
+                if not target_data.get("targets"):
+                    return {
+                        "available": False,
+                        "uniprot_id": uniprot_id,
+                        "ligands": []
+                    }
+                
+                # Get first matching target
+                chembl_id = target_data["targets"][0].get("target_chembl_id")
+                
+                if not chembl_id:
+                    return {
+                        "available": False,
+                        "uniprot_id": uniprot_id,
+                        "ligands": []
+                    }
+                
+                # Step 2: Get bioactivity data for this target
+                activity_url = f"https://www.ebi.ac.uk/chembl/api/data/activity.json?target_chembl_id={chembl_id}&limit=50"
+                
+                activity_response = await client.get(activity_url)
+                activity_response.raise_for_status()
+                activity_data = activity_response.json()
+                
+                ligands = []
+                seen_compounds = set()
+                
+                for activity in activity_data.get("activities", []):
+                    molecule_chembl_id = activity.get("molecule_chembl_id")
+                    
+                    # Avoid duplicates
+                    if molecule_chembl_id in seen_compounds:
+                        continue
+                    seen_compounds.add(molecule_chembl_id)
+                    
+                    # Get activity type and value
+                    activity_type = activity.get("standard_type", "")
+                    activity_value = activity.get("standard_value")
+                    activity_units = activity.get("standard_units", "")
+                    
+                    # Only include IC50, Ki, Kd measurements
+                    if activity_type in ["IC50", "Ki", "Kd"] and activity_value:
+                        try:
+                            activity_value = float(activity_value)
+                            
+                            # Fetch molecule details
+                            mol_url = f"https://www.ebi.ac.uk/chembl/api/data/molecule/{molecule_chembl_id}.json"
+                            mol_response = await client.get(mol_url)
+                            mol_response.raise_for_status()
+                            mol_data = mol_response.json()
+                            
+                            molecule = mol_data.get("molecule_structures", {})
+                            
+                            ligands.append({
+                                "chembl_id": molecule_chembl_id,
+                                "name": mol_data.get("pref_name", molecule_chembl_id),
+                                "smiles": molecule.get("canonical_smiles", ""),
+                                "activity_type": activity_type,
+                                "activity_value": activity_value,
+                                "activity_units": activity_units,
+                                "molecular_weight": mol_data.get("molecule_properties", {}).get("full_mwt"),
+                                "chembl_url": f"https://www.ebi.ac.uk/chembl/compound_report_card/{molecule_chembl_id}/"
+                            })
+                            
+                            # Limit to top 20 ligands
+                            if len(ligands) >= 20:
+                                break
+                                
+                        except Exception as e:
+                            continue
+                
+                # Sort by activity value (lower is better for IC50/Ki/Kd)
+                ligands = sorted(ligands, key=lambda x: x.get("activity_value", float('inf')))
+                
+                result = {
+                    "available": len(ligands) > 0,
+                    "uniprot_id": uniprot_id,
+                    "chembl_target_id": chembl_id,
+                    "ligands": ligands,
+                    "ligand_count": len(ligands)
+                }
+                
+                self.cache.set(cache_key, result)
+                return result
+                
+        except Exception as e:
+            st.warning(f"ChEMBL fetch error: {str(e)}")
+            return {
+                "available": False,
+                "uniprot_id": uniprot_id,
+                "ligands": []
+            }
+
+    async def fetch_pubchem_structure(self, compound_name: str) -> Dict:
+        """
+        Fetch 3D structure from PubChem for a compound
+        Returns SDF format structure for docking
+        """
+        cache_key = f"pubchem_{compound_name}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Search PubChem by name
+                search_url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/{compound_name}/cids/JSON"
+                
+                search_response = await client.get(search_url)
+                search_response.raise_for_status()
+                search_data = search_response.json()
+                
+                cids = search_data.get("IdentifierList", {}).get("CID", [])
+                
+                if not cids:
+                    return {
+                        "available": False,
+                        "compound_name": compound_name
+                    }
+                
+                cid = cids[0]
+                
+                # Get 3D SDF structure
+                sdf_url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/SDF"
+                
+                sdf_response = await client.get(sdf_url)
+                sdf_response.raise_for_status()
+                sdf_data = sdf_response.text
+                
+                result = {
+                    "available": True,
+                    "compound_name": compound_name,
+                    "cid": cid,
+                    "sdf_data": sdf_data,
+                    "pubchem_url": f"https://pubchem.ncbi.nlm.nih.gov/compound/{cid}",
+                    "image_url": f"https://pubchem.ncbi.nlm.nih.gov/image/imgsrv.fcgi?cid={cid}&t=l"
+                }
+                
+                self.cache.set(cache_key, result)
+                return result
+                
+        except Exception as e:
+            return {
+                "available": False,
+                "compound_name": compound_name,
+                "error": str(e)
+            }
+
+    def prepare_protein_for_docking(self, uniprot_data: Dict, pdb_data: Dict, 
+                                    alphafold_data: Dict) -> Dict:
+        """
+        Prepare protein structure for docking
+        Returns PDB file content and metadata
+        """
+        # Prefer experimental structure over predicted
+        if pdb_data.get('available') and pdb_data.get('structures'):
+            structure_type = "experimental"
+            pdb_url = pdb_data['structures'][0]['pdb_url']
+            structure_id = pdb_data['structures'][0]['pdb_id']
+        elif alphafold_data.get('available'):
+            structure_type = "predicted"
+            pdb_url = alphafold_data['pdb_url']
+            structure_id = alphafold_data['uniprot_id']
+        else:
+            return {
+                "available": False,
+                "error": "No protein structure available for docking"
+            }
+        
+        return {
+            "available": True,
+            "structure_type": structure_type,
+            "structure_id": structure_id,
+            "pdb_url": pdb_url,
+            "sequence_length": uniprot_data.get('sequence_length', 0)
+        }
+
+    def simulate_docking_score(self, protein_length: int, ligand_mw: float, 
+                          activity_value: float = None) -> Dict:
+        """
+        Simulate docking results (since running actual AutoDock Vina requires backend server)
+        In production, this would call a backend API running AutoDock Vina
+        
+        NOTE: This is a SIMPLIFIED SIMULATION for demonstration
+        Real docking would use: python subprocess to run vina --receptor protein.pdbqt --ligand ligand.pdbqt
+        """
+        
+        # Simulate binding affinity based on known activity data
+        if activity_value:
+            # Convert IC50/Ki to approximate binding affinity
+            # Lower IC50 = better binding = more negative affinity
+            base_affinity = -math.log10(activity_value / 1000000) * 1.5
+        else:
+            # Random score for unknown compounds
+            base_affinity = random.uniform(-4, -9)
+        
+        # Add some variation
+        noise = random.uniform(-0.5, 0.5)
+        binding_affinity = base_affinity + noise
+        
+        # Simulate multiple binding modes
+        modes = []
+        for i in range(min(5, random.randint(3, 7))):
+            mode_affinity = binding_affinity + random.uniform(0, 2)
+            modes.append({
+                "mode": i + 1,
+                "affinity": round(mode_affinity, 2),
+                "rmsd_lb": round(random.uniform(0, 2), 2),
+                "rmsd_ub": round(random.uniform(0, 3), 2)
+            })
+        
+        # Sort by affinity (most negative = best)
+        modes = sorted(modes, key=lambda x: x['affinity'])
+        
+        return {
+            "available": True,
+            "binding_affinity": round(modes[0]['affinity'], 2),
+            "modes": modes,
+            "exhaustiveness": 8,
+            "simulated": True  # Flag indicating this is simulated
+        }

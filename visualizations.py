@@ -173,6 +173,10 @@ class ProteinVisualizer:
             color_scheme = "chainindex"  # Color by chain
         else:
             return "<p style='text-align:center; color:gray;'>No structure available</p>"
+
+        if not pdb_url:
+            debug_info = f"Debug: structure_type={structure_type}, available={structure_data.get('available')}, data={str(structure_data)[:200]}..."
+            return f"<p style='text-align:center; color:red;'>No structure URL available<br><small style='color:gray;'>{debug_info}</small></p>"
         
         html = f"""
         <!DOCTYPE html>
@@ -294,8 +298,9 @@ class ProteinVisualizer:
                             }})
                             .catch(function(error) {{
                                 console.error('Error loading structure:', error);
+                                var message = (error && error.message) ? error.message : (error ? error.toString() : 'Unknown error');
                                 document.getElementById('loading').innerHTML = 
-                                    '<span class="error">Error loading structure: ' + error.message + '</span>';
+                                    '<span class="error">Error loading structure: ' + message + '</span>';
                             }});
                             
                     }} catch (error) {{
@@ -321,7 +326,13 @@ class ProteinVisualizer:
         try:
             if not entry_id:
                 entry_id = f"AF-{uniprot_id}-F1"
+            entry_id = entry_id.replace(".pdb", "").replace(".cif", "")
+            if "-model_v" in entry_id:
+                entry_id = entry_id.split("-model_v")[0]
+            if not entry_id.startswith("AF-"):
+                entry_id = f"AF-{entry_id}"
             pdb_url = f"https://alphafold.ebi.ac.uk/files/{entry_id}-model_v4.pdb"
+            
             response = httpx.get(pdb_url, timeout=30.0)
             response.raise_for_status()
             pdb_content = response.text
@@ -375,8 +386,11 @@ class ProteinVisualizer:
             return fig
         except Exception as e:
             fig = go.Figure()
+            error_msg = f"Could not load confidence data from AlphaFold: {str(e)}"
+            if "404" in str(e):
+                error_msg += f"\nURL attempted: https://alphafold.ebi.ac.uk/files/{entry_id if 'entry_id' in locals() else f'AF-{uniprot_id}-F1'}-model_v4.pdb"
             fig.add_annotation(
-                text=f"Could not load confidence data: {str(e)}",
+                text=error_msg,
                 xref="paper", yref="paper",
                 x=0.5, y=0.5, showarrow=False,
                 font=dict(size=14, color="gray")
@@ -550,3 +564,621 @@ class ProteinVisualizer:
         """
         
         return html
+    
+    @staticmethod
+    def analyze_sequence_composition(sequence: str) -> Dict:
+        """
+        Analyze amino acid composition of the sequence
+        """
+        if not sequence:
+            return {}
+        
+        # Count amino acids
+        aa_counts = {}
+        for aa in sequence:
+            aa_counts[aa] = aa_counts.get(aa, 0) + 1
+        
+        total = len(sequence)
+        
+        # Calculate percentages
+        aa_composition = {aa: (count / total) * 100 for aa, count in aa_counts.items()}
+        
+        # Group by properties
+        hydrophobic = ['A', 'V', 'I', 'L', 'M', 'F', 'W', 'P']
+        polar = ['S', 'T', 'Y', 'N', 'Q', 'C']
+        charged = ['K', 'R', 'H', 'D', 'E']
+        
+        hydrophobic_percent = sum(aa_composition.get(aa, 0) for aa in hydrophobic)
+        polar_percent = sum(aa_composition.get(aa, 0) for aa in polar)
+        charged_percent = sum(aa_composition.get(aa, 0) for aa in charged)
+        
+        return {
+            "aa_composition": aa_composition,
+            "hydrophobic_percent": hydrophobic_percent,
+            "polar_percent": polar_percent,
+            "charged_percent": charged_percent,
+            "length": total
+        }
+
+    @staticmethod
+    def create_sequence_composition_chart(composition_data: Dict) -> go.Figure:
+        """
+        Create bar chart showing amino acid composition
+        """
+        if not composition_data:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No sequence data available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16, color="gray")
+            )
+            fig.update_layout(height=400)
+            return fig
+        
+        aa_comp = composition_data.get('aa_composition', {})
+        
+        # Sort by percentage
+        sorted_aa = sorted(aa_comp.items(), key=lambda x: x[1], reverse=True)
+        amino_acids = [aa for aa, _ in sorted_aa]
+        percentages = [pct for _, pct in sorted_aa]
+        
+        # Color by property
+        colors = []
+        for aa in amino_acids:
+            if aa in ['A', 'V', 'I', 'L', 'M', 'F', 'W', 'P']:
+                colors.append('#ff7f0e')  # Hydrophobic - orange
+            elif aa in ['S', 'T', 'Y', 'N', 'Q', 'C']:
+                colors.append('#2ca02c')  # Polar - green
+            elif aa in ['K', 'R', 'H', 'D', 'E']:
+                colors.append('#d62728')  # Charged - red
+            else:
+                colors.append('#7f7f7f')  # Other - gray
+        
+        fig = go.Figure(go.Bar(
+            x=amino_acids,
+            y=percentages,
+            marker=dict(color=colors, line=dict(color='rgb(8,48,107)', width=1)),
+            text=[f"{p:.1f}%" for p in percentages],
+            textposition='outside',
+            hovertemplate='<b>%{x}</b><br>Percentage: %{y:.2f}%<extra></extra>'
+        ))
+        
+        fig.update_layout(
+            title="Amino Acid Composition",
+            xaxis_title="Amino Acid",
+            yaxis_title="Percentage (%)",
+            height=400,
+            template="plotly_white",
+            showlegend=False
+        )
+        
+        return fig
+
+    @staticmethod
+    def create_blast_results_table_html(blast_hits: list) -> str:
+        """
+        Create formatted HTML table for BLAST results
+        """
+        if not blast_hits:
+            return "<p style='text-align:center; color:gray;'>No BLAST results available</p>"
+        
+        html = """
+        <style>
+            .blast-table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 20px 0;
+                font-size: 13px;
+            }
+            .blast-table th {
+                background-color: #2ca02c;
+                color: white;
+                padding: 10px;
+                text-align: left;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            .blast-table td {
+                padding: 8px 10px;
+                border-bottom: 1px solid #ddd;
+            }
+            .blast-table tr:hover {
+                background-color: #f5f5f5;
+            }
+            .accession-link {
+                color: #1f77b4;
+                text-decoration: none;
+                font-family: monospace;
+                font-weight: 500;
+            }
+            .accession-link:hover {
+                text-decoration: underline;
+            }
+            .organism {
+                font-style: italic;
+                color: #666;
+            }
+            .identity-high {
+                background-color: #d4edda;
+                color: #155724;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-weight: bold;
+            }
+            .identity-medium {
+                background-color: #fff3cd;
+                color: #856404;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-weight: bold;
+            }
+            .identity-low {
+                background-color: #f8d7da;
+                color: #721c24;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-weight: bold;
+            }
+            .e-value {
+                font-family: monospace;
+                font-size: 11px;
+            }
+        </style>
+        
+        <table class="blast-table">
+            <thead>
+                <tr>
+                    <th style="width: 12%">Accession</th>
+                    <th style="width: 35%">Description</th>
+                    <th style="width: 18%">Organism</th>
+                    <th style="width: 10%">Identity</th>
+                    <th style="width: 10%">Coverage</th>
+                    <th style="width: 15%">E-value</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        
+        for hit in blast_hits:
+            accession = hit.get('accession', 'N/A')
+            title = hit.get('title', 'Unknown')[:60] + ('...' if len(hit.get('title', '')) > 60 else '')
+            organism = hit.get('organism', 'Unknown')
+            identity = hit.get('identity_percent', 0)
+            coverage = hit.get('coverage_percent', 0)
+            e_value = hit.get('e_value', 1.0)
+            
+            # Color code identity
+            if identity >= 80:
+                identity_class = "identity-high"
+            elif identity >= 50:
+                identity_class = "identity-medium"
+            else:
+                identity_class = "identity-low"
+            
+            # Format e-value
+            if e_value < 0.0001:
+                e_value_str = f"{e_value:.2e}"
+            else:
+                e_value_str = f"{e_value:.4f}"
+            
+            html += f"""
+            <tr>
+                <td>
+                    <a href="https://www.ncbi.nlm.nih.gov/protein/{accession}" 
+                    target="_blank" class="accession-link">{accession}</a>
+                </td>
+                <td>{title}</td>
+                <td class="organism">{organism}</td>
+                <td><span class="{identity_class}">{identity:.1f}%</span></td>
+                <td>{coverage:.1f}%</td>
+                <td class="e-value">{e_value_str}</td>
+            </tr>
+            """
+        
+        html += """
+            </tbody>
+        </table>
+        """
+        
+        return html
+    
+    @staticmethod
+    def create_feature_map(features: list, sequence_length: int) -> go.Figure:
+        """
+        Create visual map of protein features (domains, regions, sites)
+        """
+        if not features:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No feature annotations available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16, color="gray")
+            )
+            fig.update_layout(height=300)
+            return fig
+        
+        # Group features by type
+        feature_types = {}
+        for feature in features:
+            ftype = feature.get('type', 'Other')
+            if ftype not in feature_types:
+                feature_types[ftype] = []
+            feature_types[ftype].append(feature)
+        
+        # Create figure
+        fig = go.Figure()
+        
+        # Color palette for different feature types
+        colors = {
+            'DOMAIN': '#1f77b4',
+            'REGION': '#ff7f0e',
+            'BINDING': '#2ca02c',
+            'SITE': '#d62728',
+            'MOTIF': '#9467bd',
+            'TRANSMEM': '#8c564b',
+            'SIGNAL': '#e377c2',
+            'Other': '#7f7f7f'
+        }
+        
+        y_position = 0
+        
+        for ftype, feats in feature_types.items():
+            for feat in feats:
+                start = feat.get('start', 0)
+                end = feat.get('end', 0)
+                description = feat.get('description', ftype)
+                
+                color = colors.get(ftype, colors['Other'])
+                
+                # Add rectangle for feature
+                fig.add_trace(go.Scatter(
+                    x=[start, end, end, start, start],
+                    y=[y_position, y_position, y_position + 0.8, y_position + 0.8, y_position],
+                    fill='toself',
+                    fillcolor=color,
+                    line=dict(color=color, width=2),
+                    hovertemplate=f'<b>{ftype}</b><br>{description}<br>Position: {start}-{end}<br>Length: {end-start+1} aa<extra></extra>',
+                    name=ftype,
+                    showlegend=True,
+                    legendgroup=ftype
+                ))
+                
+                y_position += 1
+        
+        # Add full-length protein bar at bottom
+        fig.add_trace(go.Scatter(
+            x=[1, sequence_length],
+            y=[-1, -1],
+            mode='lines',
+            line=dict(color='black', width=3),
+            showlegend=False,
+            hoverinfo='skip'
+        ))
+        
+        fig.update_layout(
+            title="Protein Feature Map",
+            xaxis_title="Amino Acid Position",
+            yaxis=dict(
+                showticklabels=False,
+                range=[-2, y_position + 1]
+            ),
+            height=max(300, y_position * 30 + 100),
+            template="plotly_white",
+            hovermode='closest'
+        )
+        
+        return fig
+
+    @staticmethod
+    def create_alignment_visualization(alignment_data: Dict) -> str:
+        """
+        Create HTML visualization for pairwise alignment
+        """
+        if not alignment_data.get('available'):
+            return "<p style='text-align:center; color:gray;'>No alignment data available</p>"
+        
+        identity = alignment_data.get('identity', 0)
+        similarity = alignment_data.get('similarity', 0)
+        gaps = alignment_data.get('gaps', 0)
+        score = alignment_data.get('score', 0)
+        alignment_text = alignment_data.get('alignment_display', '')
+        
+        # Determine quality color
+        if identity >= 70:
+            quality_color = "#28a745"
+            quality_text = "High"
+        elif identity >= 40:
+            quality_color = "#ffc107"
+            quality_text = "Moderate"
+        else:
+            quality_color = "#dc3545"
+            quality_text = "Low"
+        
+        html = f"""
+        <style>
+            .alignment-container {{
+                border: 2px solid #ddd;
+                border-radius: 8px;
+                padding: 20px;
+                margin: 20px 0;
+                background-color: #f9f9f9;
+            }}
+            .alignment-stats {{
+                display: grid;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 15px;
+                margin-bottom: 20px;
+            }}
+            .stat-box {{
+                background-color: white;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                padding: 15px;
+                text-align: center;
+            }}
+            .stat-value {{
+                font-size: 24px;
+                font-weight: bold;
+                color: {quality_color};
+            }}
+            .stat-label {{
+                font-size: 12px;
+                color: #666;
+                margin-top: 5px;
+            }}
+            .alignment-text {{
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                font-family: 'Courier New', monospace;
+                font-size: 13px;
+                padding: 20px;
+                border-radius: 4px;
+                overflow-x: auto;
+                white-space: pre;
+                line-height: 1.6;
+            }}
+            .quality-badge {{
+                display: inline-block;
+                background-color: {quality_color};
+                color: white;
+                padding: 5px 15px;
+                border-radius: 20px;
+                font-weight: bold;
+                margin-bottom: 15px;
+            }}
+        </style>
+        
+        <div class="alignment-container">
+            <div class="quality-badge">Alignment Quality: {quality_text}</div>
+            
+            <div class="alignment-stats">
+                <div class="stat-box">
+                    <div class="stat-value">{identity:.1f}%</div>
+                    <div class="stat-label">Identity</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value">{similarity:.1f}%</div>
+                    <div class="stat-label">Similarity</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value">{gaps:.1f}%</div>
+                    <div class="stat-label">Gaps</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value">{score:.1f}</div>
+                    <div class="stat-label">Alignment Score</div>
+                </div>
+            </div>
+            
+            <h4 style="margin-top: 20px; margin-bottom: 10px;">Alignment Details:</h4>
+            <div class="alignment-text">{alignment_text}</div>
+        </div>
+        """
+        
+        return html
+
+    @staticmethod
+    def create_ligand_table_html(ligands: list) -> str:
+        """
+        Create formatted HTML table for known ligands
+        """
+        if not ligands:
+            return "<p style='text-align:center; color:gray;'>No known ligands found</p>"
+        
+        html = """
+        <style>
+            .ligand-table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 20px 0;
+                font-size: 13px;
+            }
+            .ligand-table th {
+                background-color: #2ca02c;
+                color: white;
+                padding: 10px;
+                text-align: left;
+                font-weight: bold;
+            }
+            .ligand-table td {
+                padding: 8px 10px;
+                border-bottom: 1px solid #ddd;
+            }
+            .ligand-table tr:hover {
+                background-color: #f5f5f5;
+            }
+            .chembl-link {
+                color: #1f77b4;
+                text-decoration: none;
+                font-family: monospace;
+                font-weight: 500;
+            }
+            .chembl-link:hover {
+                text-decoration: underline;
+            }
+            .activity-strong {
+                background-color: #d4edda;
+                color: #155724;
+                padding: 2px 8px;
+                border-radius: 3px;
+                font-weight: bold;
+            }
+            .activity-moderate {
+                background-color: #fff3cd;
+                color: #856404;
+                padding: 2px 8px;
+                border-radius: 3px;
+                font-weight: bold;
+            }
+            .activity-weak {
+                background-color: #f8d7da;
+                color: #721c24;
+                padding: 2px 8px;
+                border-radius: 3px;
+                font-weight: bold;
+            }
+            .mol-structure {
+                width: 80px;
+                height: 80px;
+                object-fit: contain;
+            }
+        </style>
+        
+        <table class="ligand-table">
+            <thead>
+                <tr>
+                    <th style="width: 10%">Structure</th>
+                    <th style="width: 25%">Compound Name</th>
+                    <th style="width: 15%">ChEMBL ID</th>
+                    <th style="width: 15%">Activity Type</th>
+                    <th style="width: 15%">Value</th>
+                    <th style="width: 10%">MW (Da)</th>
+                    <th style="width: 10%">Action</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        
+        for ligand in ligands:
+            chembl_id = ligand.get('chembl_id', 'N/A')
+            name = ligand.get('name')
+            # Use ChEMBL ID if name is None or empty
+            if not name:
+                name = chembl_id
+            activity_type = ligand.get('activity_type', 'N/A')
+            activity_value = ligand.get('activity_value', 0)
+            activity_units = ligand.get('activity_units', 'nM')
+            mw = ligand.get('molecular_weight', 'N/A')
+            chembl_url = ligand.get('chembl_url', '#')
+            
+            # Format activity value
+            if activity_value < 100:
+                activity_class = "activity-strong"
+                activity_label = "Strong"
+            elif activity_value < 1000:
+                activity_class = "activity-moderate"
+                activity_label = "Moderate"
+            else:
+                activity_class = "activity-weak"
+                activity_label = "Weak"
+            
+            # Structure image from ChEMBL
+            img_url = f"https://www.ebi.ac.uk/chembl/api/data/image/{chembl_id}.svg"
+            
+            # Escape single quotes in name for JavaScript
+            name_escaped = name.replace("'", "\\'")
+            
+            html += f"""
+            <tr>
+                <td><img src="{img_url}" class="mol-structure" alt="{name}"></td>
+                <td><strong>{name}</strong></td>
+                <td>
+                    <a href="{chembl_url}" target="_blank" class="chembl-link">{chembl_id}</a>
+                </td>
+                <td>{activity_type}</td>
+                <td>
+                    <span class="{activity_class}">{activity_value:.1f} {activity_units}</span>
+                    <br><small>{activity_label}</small>
+                </td>
+                <td>{mw if isinstance(mw, str) else f"{mw:.1f}"}</td>
+                <td>
+                    <button onclick="selectForDocking('{chembl_id}', '{name_escaped}')" 
+                            style="padding:4px 8px; background:#1f77b4; color:white; border:none; border-radius:3px; cursor:pointer;">
+                        Dock
+                    </button>
+                </td>
+            </tr>
+            """
+        
+        html += """
+            </tbody>
+        </table>
+        
+        <script>
+            function selectForDocking(chemblId, name) {
+                alert('Docking simulation for ' + name + ' (' + chemblId + ')');
+                // In production, this would trigger docking calculation
+            }
+        </script>
+        """
+        
+        return html
+
+    @staticmethod
+    def create_docking_results_chart(docking_results: Dict) -> go.Figure:
+        """
+        Create bar chart showing binding affinities for different binding modes
+        """
+        if not docking_results.get('available'):
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No docking results available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16, color="gray")
+            )
+            fig.update_layout(height=400)
+            return fig
+        
+        modes = docking_results.get('modes', [])
+        
+        mode_numbers = [m['mode'] for m in modes]
+        affinities = [m['affinity'] for m in modes]
+        
+        # Color code by affinity strength
+        colors = []
+        for aff in affinities:
+            if aff < -7:
+                colors.append('#2ca02c')  # Strong - green
+            elif aff < -5:
+                colors.append('#ff7f0e')  # Moderate - orange
+            else:
+                colors.append('#d62728')  # Weak - red
+        
+        fig = go.Figure(go.Bar(
+            x=mode_numbers,
+            y=affinities,
+            marker=dict(color=colors, line=dict(color='black', width=1)),
+            text=[f"{a:.1f}" for a in affinities],
+            textposition='outside',
+            hovertemplate='<b>Mode %{x}</b><br>Affinity: %{y:.2f} kcal/mol<extra></extra>'
+        ))
+        
+        fig.update_layout(
+            title="Predicted Binding Modes",
+            xaxis_title="Binding Mode",
+            yaxis_title="Binding Affinity (kcal/mol)",
+            height=400,
+            template="plotly_white",
+            showlegend=False
+        )
+        
+        # Add reference lines
+        fig.add_hline(y=-7, line_dash="dash", line_color="green", 
+                    annotation_text="Strong binding", annotation_position="right")
+        fig.add_hline(y=-5, line_dash="dash", line_color="orange", 
+                    annotation_text="Moderate binding", annotation_position="right")
+        
+        return fig

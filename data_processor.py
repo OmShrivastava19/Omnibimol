@@ -38,9 +38,11 @@ class DataProcessor:
         return df_pivot
     
     @staticmethod
+    @staticmethod
     def create_summary_table(uniprot_data: Dict, tissue_df: pd.DataFrame, 
                             subcellular_df: pd.DataFrame, alphafold_data: Dict = None, 
-                            pdb_data: Dict = None, kegg_data: Dict = None) -> pd.DataFrame:
+                            pdb_data: Dict = None, kegg_data: Dict = None,
+                            chembl_data: Dict = None) -> pd.DataFrame:
         """
         Create comprehensive summary table with key metrics
         """
@@ -74,6 +76,38 @@ class DataProcessor:
                 f"{uniprot_data.get('mass', 0):,.0f}",
                 structure_status,
                 pathway_count if pathway_count > 0 else "Not found",
+                len(tissue_df[tissue_df["level_numeric"] > 0]) if not tissue_df.empty else 0,
+                len(tissue_df[tissue_df["level"] == "High"]) if not tissue_df.empty else 0,
+                len(subcellular_df) if not subcellular_df.empty else 0,
+                sum(len(v) for v in uniprot_data.get("go_terms", {}).values())
+            ]
+        }
+
+        # Ligand count
+        ligand_count = 0
+        if chembl_data and chembl_data.get('available'):
+            ligand_count = len(chembl_data.get('ligands', []))
+        
+        summary = {
+            "Metric": [
+                "UniProt ID",
+                "Sequence Length",
+                "Molecular Weight (Da)",
+                "3D Structure",
+                "KEGG Pathways",
+                "Known Ligands",  # Add this
+                "Tissues with Expression",
+                "High Expression Tissues",
+                "Subcellular Locations",
+                "GO Terms (Total)"
+            ],
+            "Value": [
+                uniprot_data.get("uniprot_id", "N/A"),
+                f"{uniprot_data.get('sequence_length', 0):,}",
+                f"{uniprot_data.get('mass', 0):,.0f}",
+                structure_status,
+                pathway_count if pathway_count > 0 else "Not found",
+                ligand_count if ligand_count > 0 else "Not found",  # Add this
                 len(tissue_df[tissue_df["level_numeric"] > 0]) if not tissue_df.empty else 0,
                 len(tissue_df[tissue_df["level"] == "High"]) if not tissue_df.empty else 0,
                 len(subcellular_df) if not subcellular_df.empty else 0,

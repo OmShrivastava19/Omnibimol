@@ -75,3 +75,11 @@ class CacheManager:
         
         conn.commit()
         conn.close()
+    
+    def clear_all(self):
+        """Clear all cache entries"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM cache")
+        conn.commit()
+        conn.close()

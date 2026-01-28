@@ -175,7 +175,6 @@ The application will open in your default web browser at `http://localhost:8501`
 - [ ] Additional protein databases (NCBI, ENSEMBL)
 - [ ] Multiple organism support
 - [ ] Advanced filtering options
-- [ ] Export functionality (PDF, CSV)
 - [ ] Protein interaction networks
 - [ ] Disease association data
 - [ ] Literature mining integration
@@ -214,5 +213,5 @@ For issues or questions, please check the deployment_instructions.txt file or re
 
 ---
 
-**Last Updated**: January 24, 2026  
+**Last Updated**: January 27, 2026  
 **Version**: 1.0 (Phase 1 MVP)
