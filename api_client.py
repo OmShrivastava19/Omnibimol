@@ -622,7 +622,7 @@ class ProteinAPIClient:
                                     "molecular_functions": list(set(molecular_functions)) if molecular_functions else [],
                                     "kegg_url": f"https://www.kegg.jp/pathway/{pathway_id}",
                                     "kegg_image_url": f"https://www.kegg.jp/kegg/pathway/hsa/{pathway_id}.png",
-                                    "highlight_url": f"https://www.kegg.jp/pathway/{pathway_id}+{kegg_protein_id}",
+                                    "highlight_url": f"https://www.kegg.jp/entry/{kegg_protein_id}",
                                     "is_first": idx == 0
                                 }
                                 
@@ -638,7 +638,7 @@ class ProteinAPIClient:
                                     "molecular_functions": [],
                                     "kegg_url": f"https://www.kegg.jp/pathway/{pathway_id}",
                                     "kegg_image_url": f"https://www.kegg.jp/kegg/pathway/hsa/{pathway_id}.png",
-                                    "highlight_url": f"https://www.kegg.jp/pathway/{pathway_id}+{kegg_protein_id}",
+                                    "highlight_url": f"https://www.kegg.jp/entry/{kegg_protein_id}",
                                     "is_first": idx == 0
                                 }
                                 pathways.append(pathway_info)

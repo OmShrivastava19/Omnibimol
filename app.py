@@ -991,7 +991,7 @@ def main():
                     with col_link1:
                         st.markdown(f"**[📌 View on KEGG Website]({first_result.get('kegg_url', '#')})**")
                     with col_link2:
-                        st.markdown(f"**[🔗 Pathway with Protein Highlighted]({first_result.get('highlight_url', '#')})**")
+                        st.markdown(f"**[🔗 KEGG Gene Entry Page]({first_result.get('highlight_url', '#')})**")
                 else:
                     st.info("No primary pathway data available")
             
