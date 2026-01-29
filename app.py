@@ -77,7 +77,7 @@ def main():
     """, unsafe_allow_html=True)
     
     # Header with banner
-    st.image("icons/Omnibimol_banner.png", width='stretch')
+    st.image("icons/Omnibimol_banner.png", use_container_width=True)
     
     # Initialize cache and API client
     if 'cache_manager' not in st.session_state:
