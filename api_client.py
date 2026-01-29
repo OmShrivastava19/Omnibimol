@@ -313,10 +313,11 @@ class ProteinAPIClient:
         # Run all API calls concurrently
         results = await asyncio.gather(
             self.fetch_uniprot_data(uniprot_id),
-            self.fetch_alphafold_structure(uniprot_id),
+            self.fetch_alphafold_structure(uniprot_id, gene_name),
             self.fetch_pdb_structure(uniprot_id),
             self.fetch_kegg_pathways(gene_name, uniprot_id),
             self.fetch_chembl_ligands(uniprot_id),
+            self.fetch_literature_summary(uniprot_id, gene_name),
             return_exceptions=True
         )
         
@@ -331,13 +332,14 @@ class ProteinAPIClient:
             "alphafold_structure": results[1] if not isinstance(results[1], Exception) else {"available": False},
             "pdb_structure": results[2] if not isinstance(results[2], Exception) else {"available": False, "structures": []},
             "kegg_pathways": results[3] if not isinstance(results[3], Exception) else {"available": False, "pathways": []},
-            "chembl_ligands": results[4] if not isinstance(results[4], Exception) else {"available": False, "ligands": []}
+            "chembl_ligands": results[4] if not isinstance(results[4], Exception) else {"available": False, "ligands": []},
+            "literature": results[5] if not isinstance(results[5], Exception) else {"papers": [], "wiki_title": None, "wiki_snippet": None}
         }
-        
-    async def fetch_alphafold_structure(self, uniprot_id: str) -> Dict:
+            
+    async def fetch_alphafold_structure(self, uniprot_id: str, gene_name: str = None) -> Dict:
         """
         Fetch AlphaFold predicted structure for a protein
-        Uses the correct AlphaFold EBI API v1
+        AlphaFold v6 is the latest version
         """
         cache_key = f"alphafold_{uniprot_id}"
         cached = self.cache.get(cache_key)
@@ -345,97 +347,69 @@ class ProteinAPIClient:
             return cached
         
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                # Try multiple AlphaFold API endpoints
-                api_urls = [
-                    f"https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id}",
-                    f"https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id.upper()}",
-                    f"https://www.alphafold.ebi.ac.uk/api/prediction/{uniprot_id}"
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                # AlphaFold DB URL pattern - try latest versions first
+                # Try multiple URL formats
+                urls_to_try = [
+                    f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v6.pdb",
+                    f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.pdb",
+                    f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v2.pdb",
                 ]
                 
-                data = None
-                successful_url = None
+                pdb_url = None
+                entry_id = None
                 
-                for api_url in api_urls:
+                # Test which URL works
+                for url in urls_to_try:
                     try:
-                        print(f"DEBUG: Trying AlphaFold API: {api_url}")
-                        response = await client.get(api_url)
-                        response.raise_for_status()
-                        data = response.json()
-                        successful_url = api_url
-                        print(f"DEBUG: Success with URL: {api_url}")
-                        break
-                    except httpx.HTTPStatusError as e:
-                        print(f"DEBUG: Failed with {api_url}: {e.response.status_code}")
+                        test_response = await client.head(url, timeout=10.0)
+                        if test_response.status_code == 200:
+                            pdb_url = url
+                            # Extract version from URL
+                            if 'v6' in url:
+                                version = 6
+                                entry_id = f"AF-{uniprot_id}-F1"
+                            elif 'v4' in url:
+                                version = 4
+                                entry_id = f"AF-{uniprot_id}-F1"
+                            else:
+                                version = 2
+                                entry_id = f"AF-{uniprot_id}-F1"
+                            break
+                    except:
                         continue
                 
-                if not data:
-                    # Try direct file check approach
-                    direct_pdb_url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.pdb"
-                    print(f"DEBUG: Trying direct PDB check: {direct_pdb_url}")
-                    try:
-                        head_response = await client.head(direct_pdb_url)
-                        if head_response.status_code == 200:
-                            # File exists, create minimal data structure
-                            data = [{"entryId": f"AF-{uniprot_id}-F1"}]
-                            print(f"DEBUG: Direct PDB file exists, creating structure data")
-                    except:
-                        pass
-                
-                # AlphaFold returns a list with one entry
-                if data and len(data) > 0:
-                    entry = data[0]
-                    
-                    # Extract and normalize the entry ID to avoid duplicate suffixes that break URLs
-                    entry_id_raw = entry.get("entryId") or entry.get("entry_id") or f"AF-{uniprot_id}-F1"
-                    entry_id_clean = entry_id_raw.replace(".pdb", "").replace(".cif", "")
-                    if "-model_v" in entry_id_clean:
-                        entry_id_clean = entry_id_clean.split("-model_v")[0]
-                    if not entry_id_clean.startswith("AF-"):
-                        entry_id_clean = f"AF-{entry_id_clean}"
-                    entry_id = entry_id_clean
-                    
-                    pdb_url = f"https://alphafold.ebi.ac.uk/files/{entry_id}-model_v4.pdb"
-                    
-                    print(f"DEBUG: AlphaFold structure found for {uniprot_id}: {entry_id}")
-                    print(f"DEBUG: PDB URL: {pdb_url}")
-                    
-                    result = {
-                        "available": True,
+                if not pdb_url:
+                    # Structure doesn't exist
+                    return {
+                        "available": False,
                         "uniprot_id": uniprot_id,
-                        "entry_id": entry_id,
-                        "pdb_url": pdb_url,
-                        "cif_url": f"https://alphafold.ebi.ac.uk/files/{entry_id}-model_v4.cif",
-                        "pae_url": f"https://alphafold.ebi.ac.uk/files/{entry_id}-predicted_aligned_error_v4.json",
-                        "alphafold_page": f"https://alphafold.ebi.ac.uk/entry/{uniprot_id}",
-                        "model_version": entry.get("latestVersion", 4),
-                        "gene_name": entry.get("gene", ""),
-                        "organism": entry.get("uniprotDescription", "")
+                        "error": "No AlphaFold prediction available for this protein"
                     }
-                    
-                    self.cache.set(cache_key, result)
-                    return result
-                else:
-                    print(f"DEBUG: No AlphaFold data returned for {uniprot_id}")
-                    result = {"available": False, "uniprot_id": uniprot_id}
-                    self.cache.set(cache_key, result)
-                    return result
-                    
-        except httpx.HTTPStatusError as e:
-            print(f"DEBUG: AlphaFold API HTTP error for {uniprot_id}: {e.response.status_code}")  # Debug
-            if e.response.status_code == 404:
-                st.warning(f"No AlphaFold prediction available for {uniprot_id}")
-                result = {"available": False, "uniprot_id": uniprot_id}
+                
+                result = {
+                    "available": True,
+                    "uniprot_id": uniprot_id,
+                    "entry_id": entry_id,
+                    "pdb_url": pdb_url,
+                    "cif_url": pdb_url.replace('.pdb', '.cif'),
+                    "pae_url": pdb_url.replace('model_v', 'predicted_aligned_error_v').replace('.pdb', '.json'),
+                    "alphafold_page": f"https://alphafold.ebi.ac.uk/entry/{uniprot_id}",
+                    "model_version": version,
+                    "gene_name": gene_name or ""
+                }
+                
                 self.cache.set(cache_key, result)
                 return result
-            else:
-                st.error(f"AlphaFold API error: {str(e)}")
-                return {"available": False, "uniprot_id": uniprot_id}
+                
         except Exception as e:
-            print(f"DEBUG: AlphaFold fetch error for {uniprot_id}: {str(e)}")  # Debug
-            st.error(f"AlphaFold fetch error: {str(e)}")
-            return {"available": False, "uniprot_id": uniprot_id}
-
+            st.warning(f"AlphaFold structure check failed: {str(e)}")
+            return {
+                "available": False,
+                "uniprot_id": uniprot_id,
+                "error": str(e)
+            }
+            
     async def fetch_pdb_structure(self, uniprot_id: str) -> Dict:
         """
         Check if experimental structure exists in RCSB PDB
@@ -977,32 +951,50 @@ class ProteinAPIClient:
         """
         Run BLAST search against NCBI nr database
         Two-step process: Submit job, then poll for results
+        Includes retry logic and improved error handling
         """
         cache_key = f"blast_{uniprot_id}"
         cached = self.cache.get(cache_key)
         if cached:
             return cached
         
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                # Step 1: Submit BLAST job
-                submit_url = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
-                
-                submit_params = {
-                    "CMD": "Put",
-                    "PROGRAM": "blastp",
-                    "DATABASE": "nr",
-                    "QUERY": sequence,
-                    "FORMAT_TYPE": "JSON2",
-                    "HITLIST_SIZE": "10",  # Top 10 hits
-                    "EXPECT": "0.001",  # E-value threshold
-                    "FILTER": "L",  # Low complexity filter
-                    "ALIGNMENTS": "10"
-                }
-                
-                submit_response = await client.post(submit_url, data=submit_params)
-                submit_response.raise_for_status()
-                submit_text = submit_response.text
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                # Use longer timeout for initial submission, shorter for polling
+                async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
+                    # Step 1: Submit BLAST job
+                    submit_url = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
+                    
+                    submit_params = {
+                        "CMD": "Put",
+                        "PROGRAM": "blastp",
+                        "DATABASE": "nr",
+                        "QUERY": sequence,
+                        "FORMAT_TYPE": "JSON2",
+                        "HITLIST_SIZE": "10",  # Top 10 hits
+                        "EXPECT": "0.001",  # E-value threshold
+                        "FILTER": "L",  # Low complexity filter
+                        "ALIGNMENTS": "10"
+                    }
+                    
+                    try:
+                        submit_response = await client.post(submit_url, data=submit_params)
+                        submit_response.raise_for_status()
+                        submit_text = submit_response.text
+                    except (httpx.ReadError, httpx.ConnectError, httpx.TimeoutException) as conn_error:
+                        retry_count += 1
+                        if retry_count < max_retries:
+                            await asyncio.sleep(2 ** retry_count)  # Exponential backoff
+                            continue
+                        else:
+                            return {
+                                "available": False,
+                                "error": "Server disconnected: Could not connect to NCBI BLAST service. Please try again later.",
+                                "retry_available": True
+                            }
                 
                 # Extract RID (Request ID) from response
                 rid = None
@@ -1030,8 +1022,12 @@ class ProteinAPIClient:
                         "FORMAT_TYPE": "JSON2"
                     }
                     
-                    check_response = await client.get(submit_url, params=check_params)
-                    check_text = check_response.text
+                    try:
+                        check_response = await client.get(submit_url, params=check_params, timeout=15.0)
+                        check_text = check_response.text
+                    except (httpx.ReadError, httpx.ConnectError, httpx.TimeoutException):
+                        attempt += 1
+                        continue  # Retry polling
                     
                     # Check if results are ready
                     if "Status=READY" in check_text:
@@ -1077,10 +1073,9 @@ class ProteinAPIClient:
                                 return result
                                 
                         except Exception as e:
-                            st.warning(f"Error parsing BLAST results: {str(e)}")
                             return {
                                 "available": False,
-                                "error": f"Failed to parse results: {str(e)}"
+                                "error": f"Failed to parse BLAST results: {str(e)}"
                             }
                     
                     elif "Status=WAITING" in check_text:
@@ -1094,15 +1089,32 @@ class ProteinAPIClient:
                 
                 return {
                     "available": False,
-                    "error": "BLAST search timed out"
+                    "error": "BLAST search timed out after 60 seconds. Results may still be processing. Please try again.",
+                    "retry_available": True
                 }
                 
-        except Exception as e:
-            st.error(f"BLAST error: {str(e)}")
-            return {
-                "available": False,
-                "error": str(e)
-            }
+            except (httpx.ReadError, httpx.ConnectError, httpx.TimeoutException) as e:
+                retry_count += 1
+                if retry_count < max_retries:
+                    await asyncio.sleep(2 ** retry_count)  # Exponential backoff
+                    continue
+                else:
+                    return {
+                        "available": False,
+                        "error": "Server disconnected: NCBI BLAST service is temporarily unavailable. Please try again.",
+                        "retry_available": True
+                    }
+            except Exception as e:
+                return {
+                    "available": False,
+                    "error": f"Unexpected error: {str(e)}. Please try again or contact support.",
+                    "retry_available": True
+                }
+        
+        return {
+            "available": False,
+            "error": "BLAST search failed after multiple retries. Please try again later."
+        }
 
     def get_fasta_sequence(self, uniprot_data: Dict) -> str:
         """

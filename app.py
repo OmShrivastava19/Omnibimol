@@ -20,7 +20,7 @@ import requests
 
 # app.py - Main Streamlit application
 def main():
-    """Main OmniBiMol Phase 1 MVP Application"""
+    """Main OmniBiMol (MVP)"""
     
     # Page configuration
     st.set_page_config(
@@ -90,42 +90,31 @@ def main():
     with st.sidebar:
         st.header("📋 About")
         st.markdown("""
-        **OmniBiMol Phase 1 MVP**
+        **OmniBiMol (MVP)**
         
         Integrated protein analysis platform combining:
         - UniProt: Protein function & annotations
         - Human Protein Atlas: Expression data
+        - AlphaFold & PDB: Structural information
+        - KEGG: Pathway mapping
+        - GO: Gene ontology annotations
+        - EMBL-EBI: Sequence analysis
+        - NCBI BLAST: Homology search
+        - EMBOSS Needle: Sequence alignment
+        - And more...
         
         **Features:**
         - Real-time data retrieval
         - Interactive visualizations
         - 24-hour caching
         - Mobile-responsive design
-        """)
-        
-        st.divider()
-        
-        st.header("🧪 Example Proteins")
-        example_proteins = {
-            "TP53 (Tumor suppressor)": "TP53",
-            "BRCA1 (DNA repair)": "BRCA1",
-            "INS (Insulin)": "INS",
-            "EGFR (Growth factor receptor)": "EGFR",
-            "ALB (Albumin)": "ALB"
-        }
-        
-        selected_example = st.selectbox(
-            "Quick load:",
-            [""] + list(example_proteins.keys())
-        )
-        
-        if selected_example and st.button("Load Example"):
-            st.session_state.protein_input = example_proteins[selected_example]
-            st.rerun()
-        
-        st.divider()
+        - User-friendly interface
+        - Extensible architecture
+        - Open-source & free to use
 
-        # In the sidebar section, add:
+        **Developed by:** Team BhUOm
+        """)
+
         st.divider()
 
         if st.button("🔄 Clear All Cache & Reload"):
@@ -138,15 +127,7 @@ def main():
                     del st.session_state[key]
     
             st.success("Cache cleared! Please search for your protein again.")
-            st.rerun()        
-
-        # if st.button("🗑️ Clear Cache"):
-        #     try:
-        #         # Use the existing cache manager instance
-        #         st.session_state.cache_manager.clear()
-        #         st.success("✅ Cache cleared successfully!")
-        #     except Exception as e:
-        #         st.error(f"Error clearing cache: {str(e)}")
+            st.rerun()
     
     # Main input section
     st.header("🔍 Protein Search")
@@ -309,354 +290,8 @@ def main():
             st.plotly_chart(fig_go, use_container_width=True)
         
         st.divider()
-        
-        # Section 2: 3D Protein Structure
-        st.header("🧊 3D Protein Structure")
-        
-        alphafold_data = data.get('alphafold_structure', {})
-        pdb_data = data.get('pdb_structure', {})
-        
-        # Create tabs for different structure types
-        if pdb_data.get('available') and alphafold_data.get('available'):
-            structure_tabs = st.tabs(["📊 Experimental (PDB)", "🤖 Predicted (AlphaFold)"])
-        elif pdb_data.get('available'):
-            structure_tabs = st.tabs(["📊 Experimental (PDB)"])
-        elif alphafold_data.get('available'):
-            structure_tabs = st.tabs(["🤖 Predicted (AlphaFold)"])
-        else:
-            st.warning("⚠️ No 3D structure available for this protein")
-            structure_tabs = None
-        
-        if structure_tabs:
-            tab_index = 0
-            
-            # Experimental structure tab
-            if pdb_data.get('available'):
-                with structure_tabs[tab_index]:
-                    st.markdown("**Available Experimental Structures:**")
-                    
-                    # Show all available PDB structures
-                    pdb_structures = pdb_data.get('structures', [])
-                    
-                    for idx, struct in enumerate(pdb_structures[:5]):  # Show first 5
-                        col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
-                        with col1:
-                            st.markdown(f"**PDB ID:** [{struct['pdb_id']}]({struct['rcsb_page']})")
-                        with col2:
-                            st.markdown(f"**Method:** {struct['method']}")
-                        with col3:
-                            st.markdown(f"**Resolution:** {struct['resolution']}")
-                        with col4:
-                            if idx == 0:
-                                st.markdown("✅ **Displayed below**")
-                    
-                    if len(pdb_structures) > 5:
-                        st.info(f"+ {len(pdb_structures) - 5} more structures available on RCSB PDB")
-                    
-                    st.markdown("---")
-                    
-                    # Display 3D viewer for PDB
-                    viewer_html = ProteinVisualizer.create_structure_viewer(pdb_data, "pdb")
-                    st.components.v1.html(viewer_html, height=600, scrolling=False)
-                    
-                    # Download option
-                    pdb_file_content = None
-                    try:
-                        pdb_url = pdb_structures[0]['pdb_url']
-                        response = requests.get(pdb_url)
-                        if response.status_code == 200:
-                            pdb_file_content = response.text
-                        else:
-                            pdb_file_content = f"Could not fetch PDB file. Status code: {response.status_code}"
-                    except Exception as e:
-                        pdb_file_content = f"Error fetching PDB file: {str(e)}"
 
-                    st.download_button(
-                        "📥 Download PDB File",
-                        data=pdb_file_content,
-                        file_name=f"{pdb_structures[0]['pdb_id']}.pdb",
-                        mime="text/plain"
-                    )
-                
-                tab_index += 1
-            
-            # AlphaFold structure tab
-            if alphafold_data.get('available'):
-                with structure_tabs[tab_index]:
-                    col1, col2 = st.columns([1, 1])
-                    
-                    with col1:
-                        st.markdown(f"""
-                        **AlphaFold Database Entry**
-                        - **UniProt ID:** {alphafold_data.get('uniprot_id')}
-                        - **Gene:** {alphafold_data.get('gene_name', 'N/A')}
-                        - **Organism:** {alphafold_data.get('organism', 'N/A')}
-                        - **Model Version:** v{alphafold_data.get('model_version', 4)}
-                        - **[View on AlphaFold DB]({alphafold_data.get('alphafold_page')})**
-                        """)
-                    
-                    with col2:
-                        st.info("""
-                        **Confidence Color Code:**
-                        - 🔵 **Dark Blue** (>90): Very high confidence
-                        - 🔵 **Light Blue** (70-90): Confident
-                        - 🟡 **Yellow** (50-70): Low confidence
-                        - 🟠 **Orange** (<50): Very low confidence
-                        """)
-                    
-                    st.markdown("---")
-                    
-                    # Display 3D viewer
-                    viewer_html = ProteinVisualizer.create_structure_viewer(alphafold_data, "alphafold")
-                    st.components.v1.html(viewer_html, height=600, scrolling=False)
-
-                    # Confidence plot
-                    st.subheader("📈 Prediction Confidence")
-                    fig_confidence = ProteinVisualizer.create_confidence_plot(
-                        alphafold_data.get('uniprot_id'),
-                        alphafold_data.get('entry_id')
-                    )
-                    st.plotly_chart(fig_confidence, use_container_width=True)
-                    
-                    # Download options
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.markdown(f"[📥 Download PDB File]({alphafold_data.get('pdb_url')})")
-                    with col2:
-                        st.markdown(f"[📥 Download PAE Data]({alphafold_data.get('pae_url')})")
-        
-        st.divider()
-        
-        # Section 2: Tissue Expression
-        st.header("🧫 Tissue Expression Analysis")
-        
-        if not tissue_df.empty:
-            # Prepare data
-            chart_data = DataProcessor.prepare_tissue_chart_data(tissue_df, top_n=20)
-            
-            # Create and display chart
-            fig_tissue = ProteinVisualizer.create_tissue_expression_chart(chart_data)
-            st.plotly_chart(fig_tissue, use_container_width=True)
-            
-            # Expression summary
-            high_tissues = tissue_df[tissue_df["level"] == "High"]["tissue"].tolist()
-            if high_tissues:
-                st.info(f"**High expression detected in:** {', '.join(high_tissues[:5])}" + 
-                    (f" and {len(high_tissues)-5} more tissues" if len(high_tissues) > 5 else ""))
-        else:
-            st.warning("⚠️ No tissue expression data available from Human Protein Atlas")
-        
-        st.divider()
-        
-        # Section 3: Subcellular Localization
-        st.header("📍 Subcellular Localization")
-        
-        if not subcellular_df.empty:
-            # Create and display heatmap
-            fig_subcellular = ProteinVisualizer.create_subcellular_heatmap(subcellular_df)
-            st.plotly_chart(fig_subcellular, use_container_width=True)
-            
-            # Location list
-            st.markdown("**Detected Locations:**")
-            for idx, row in subcellular_df.iterrows():
-                st.markdown(f"- **{row['location']}** ({row['reliability']} confidence)")
-        else:
-            st.warning("⚠️ No subcellular localization data available from Human Protein Atlas")
-
-        st.divider()
-        
-        # Section 4: KEGG Pathways for Proteins
-        st.header("🧬 KEGG Pathways for Proteins")
-        
-        kegg_data = data.get('kegg_pathways', {})
-        
-        if kegg_data.get('available'):
-            # Summary metrics
-            total_pathways = kegg_data.get('total_pathways', 0)
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.markdown(f"""
-                    <div class="metric-card">
-                        <h3 style="margin:0; color:#1f77b4;">{total_pathways}</h3>
-                        <p style="margin:0; color:#666;">Total Pathways Found</p>
-                    </div>
-                """, unsafe_allow_html=True)
-            
-            with col2:
-                st.markdown(f"""
-                    <div class="metric-card">
-                        <h3 style="margin:0; color:#1f77b4;">{kegg_data.get('kegg_protein_id', 'N/A')}</h3>
-                        <p style="margin:0; color:#666;">KEGG Protein ID</p>
-                    </div>
-                """, unsafe_allow_html=True)
-            
-            with col3:
-                st.markdown(f"""
-                    <div class="metric-card">
-                        <h3 style="margin:0; color:#1f77b4;">{kegg_data.get('protein_name', 'N/A')}</h3>
-                        <p style="margin:0; color:#666;">Protein Name</p>
-                    </div>
-                """, unsafe_allow_html=True)
-            
-            st.markdown("---")
-            
-            # Create tabs for different display formats
-            pathway_tabs = st.tabs(["🖼️ Primary Pathway Map", "📋 Next 5 Pathways", "🔗 All Pathways Links"])
-            
-            # Tab 1: First Result with Full Details & Pathway Map
-            first_result = kegg_data.get('first_result')
-            with pathway_tabs[0]:
-                if first_result:
-                    st.subheader(f"🏆 Primary Pathway: {first_result.get('pathway_name', 'Unknown')}")
-                    
-                    # Display all metadata
-                    col1, col2 = st.columns([1, 1])
-                    with col1:
-                        st.markdown("**Pathway Details:**")
-                        st.markdown(f"- **ID:** `{first_result.get('pathway_id', 'N/A')}`")
-                        st.markdown(f"- **Name:** {first_result.get('pathway_name', 'N/A')}")
-                        
-                        if first_result.get('pathway_description'):
-                            st.markdown(f"- **Description:** {first_result.get('pathway_description', 'N/A')}")
-                        
-                        if first_result.get('pathway_class'):
-                            st.markdown(f"- **Classification:** {first_result.get('pathway_class', 'N/A')}")
-                    
-                    with col2:
-                        st.markdown("**Molecular Functions:**")
-                        functions = first_result.get('molecular_functions', [])
-                        if functions:
-                            for func in functions[:10]:  # Limit to 10 functions
-                                st.markdown(f"• {func}")
-                        else:
-                            st.markdown("*No specific molecular functions listed*")
-                    
-                    st.markdown("---")
-                    
-                    # Display pathway map image
-                    st.markdown("**Pathway Map:**")
-                    try:
-                        st.image(first_result.get('kegg_image_url', ''), 
-                                use_container_width=True,
-                                caption=f"{first_result.get('pathway_name')} - Visual representation from KEGG")
-                    except Exception as e:
-                        st.warning(f"Could not load pathway map image. [View on KEGG Website]({first_result.get('kegg_url', '#')})")
-                    
-                    st.markdown("---")
-                    
-                    # Direct links
-                    col_link1, col_link2 = st.columns(2)
-                    with col_link1:
-                        st.markdown(f"**[📌 View on KEGG Website]({first_result.get('kegg_url', '#')})**")
-                    with col_link2:
-                        st.markdown(f"**[🔗 Pathway with Protein Highlighted]({first_result.get('highlight_url', '#')})**")
-                else:
-                    st.info("No primary pathway data available")
-            
-            # Tab 2: Next 5 Results
-            next_results = kegg_data.get('next_results', [])
-            with pathway_tabs[1]:
-                if next_results:
-                    st.subheader("📊 Next 5 Pathways Associated with Protein")
-                    
-                    for idx, pathway in enumerate(next_results, 1):
-                        with st.container():
-                            col1, col2, col3 = st.columns([2, 1, 1])
-                            
-                            with col1:
-                                st.markdown(f"**{idx}. {pathway.get('pathway_name', 'Unknown')}**")
-                                if pathway.get('pathway_class'):
-                                    st.caption(f"Class: {pathway.get('pathway_class', '')}")
-                            
-                            with col2:
-                                st.markdown(f"`{pathway.get('pathway_id', 'N/A')}`")
-                            
-                            with col3:
-                                st.markdown(f"**[View →]({pathway.get('kegg_url', '#')})**")
-                            
-                            st.divider()
-                else:
-                    st.info("Less than 6 pathways found for this protein")
-            
-            # Tab 3: All Pathways Links
-            all_pathways = kegg_data.get('pathways', [])
-            with pathway_tabs[2]:
-                st.subheader(f"🔗 All {len(all_pathways)} Associated Pathways")
-                
-                # Add filter and sort options
-                col1, col2 = st.columns([3, 1])
-                with col1:
-                    search_term = st.text_input("🔍 Search pathways:", placeholder="e.g., cancer, metabolism, signaling")
-                with col2:
-                    sort_option = st.selectbox("Sort by:", ["Name", "ID"])
-                
-                # Filter pathways
-                filtered_pathways = all_pathways
-                if search_term:
-                    search_term = search_term.lower()
-                    filtered_pathways = [
-                        p for p in all_pathways 
-                        if search_term in p.get('pathway_name', '').lower() or 
-                           search_term in p.get('pathway_id', '').lower()
-                    ]
-                
-                # Sort pathways
-                if sort_option == "Name":
-                    filtered_pathways = sorted(filtered_pathways, key=lambda x: x.get('pathway_name', ''))
-                elif sort_option == "ID":
-                    filtered_pathways = sorted(filtered_pathways, key=lambda x: x.get('pathway_id', ''))
-                
-                # Display as table
-                st.markdown("| # | Pathway Name | ID | KEGG Link |")
-                st.markdown("|---|---|---|---|")
-                for idx, pathway in enumerate(filtered_pathways, 1):
-                    pathway_name = pathway.get('pathway_name', 'Unknown')
-                    pathway_id = pathway.get('pathway_id', 'N/A')
-                    kegg_url = pathway.get('kegg_url', '#')
-                    st.markdown(f"| {idx} | {pathway_name} | `{pathway_id}` | [View Pathway]({kegg_url}) |")
-                
-                st.caption(f"Showing {len(filtered_pathways)} of {len(all_pathways)} pathways")
-            
-            # Download pathway data
-            st.markdown("---")
-            st.subheader("💾 Export Pathway Data")
-            
-            # Create DataFrame for export
-            pathway_df = pd.DataFrame([
-                {
-                    "Pathway_Name": p['pathway_name'],
-                    "Pathway_ID": p['pathway_id'],
-                    "Classification": p.get('pathway_class', ''),
-                    "Description": p.get('pathway_description', ''),
-                    "KEGG_URL": p['kegg_url'],
-                    "Highlighted_URL": p['highlight_url']
-                }
-                for p in all_pathways
-            ])
-            
-            csv_pathways = pathway_df.to_csv(index=False)
-            st.download_button(
-                "📥 Download Pathway List (CSV)",
-                csv_pathways,
-                f"{st.session_state.current_uniprot_id}_kegg_pathways.csv",
-                "text/csv"
-            )
-            
-        else:
-            st.warning(f"⚠️ No KEGG pathway data found for gene: {kegg_data.get('gene_name', 'Unknown')}")
-            st.info("""
-            **Why might this happen?**
-            - Gene name not recognized in KEGG database
-            - Protein not associated with metabolic/signaling pathways
-            - Limited annotation in KEGG for this specific protein
-            
-            Try searching directly on [KEGG website](https://www.kegg.jp/)
-            """)
-        
-        st.divider()
-        
-        # Section 5: FASTA Sequence & BLAST Analysis
+        # Section 2: FASTA Sequence & BLAST Analysis
         st.header("🧬 Protein Sequence Analysis")
         
         # Create tabs
@@ -1116,7 +751,353 @@ def main():
                 
         st.divider()
         
-        # Section 6: Molecular Docking with AutoDock Vina
+        # Section 3: 3D Protein Structure
+        st.header("🧊 3D Protein Structure")
+        
+        alphafold_data = data.get('alphafold_structure', {})
+        pdb_data = data.get('pdb_structure', {})
+        
+        # Create tabs for different structure types
+        if pdb_data.get('available') and alphafold_data.get('available'):
+            structure_tabs = st.tabs(["📊 Experimental (PDB)", "🤖 Predicted (AlphaFold)"])
+        elif pdb_data.get('available'):
+            structure_tabs = st.tabs(["📊 Experimental (PDB)"])
+        elif alphafold_data.get('available'):
+            structure_tabs = st.tabs(["🤖 Predicted (AlphaFold)"])
+        else:
+            st.warning("⚠️ No 3D structure available for this protein")
+            structure_tabs = None
+        
+        if structure_tabs:
+            tab_index = 0
+            
+            # Experimental structure tab
+            if pdb_data.get('available'):
+                with structure_tabs[tab_index]:
+                    st.markdown("**Available Experimental Structures:**")
+                    
+                    # Show all available PDB structures
+                    pdb_structures = pdb_data.get('structures', [])
+                    
+                    for idx, struct in enumerate(pdb_structures[:5]):  # Show first 5
+                        col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+                        with col1:
+                            st.markdown(f"**PDB ID:** [{struct['pdb_id']}]({struct['rcsb_page']})")
+                        with col2:
+                            st.markdown(f"**Method:** {struct['method']}")
+                        with col3:
+                            st.markdown(f"**Resolution:** {struct['resolution']}")
+                        with col4:
+                            if idx == 0:
+                                st.markdown("✅ **Displayed below**")
+                    
+                    if len(pdb_structures) > 5:
+                        st.info(f"+ {len(pdb_structures) - 5} more structures available on RCSB PDB")
+                    
+                    st.markdown("---")
+                    
+                    # Display 3D viewer for PDB
+                    viewer_html = ProteinVisualizer.create_structure_viewer(pdb_data, "pdb")
+                    st.components.v1.html(viewer_html, height=600, scrolling=False)
+                    
+                    # Download option
+                    pdb_file_content = None
+                    try:
+                        pdb_url = pdb_structures[0]['pdb_url']
+                        response = requests.get(pdb_url)
+                        if response.status_code == 200:
+                            pdb_file_content = response.text
+                        else:
+                            pdb_file_content = f"Could not fetch PDB file. Status code: {response.status_code}"
+                    except Exception as e:
+                        pdb_file_content = f"Error fetching PDB file: {str(e)}"
+
+                    st.download_button(
+                        "📥 Download PDB File",
+                        data=pdb_file_content,
+                        file_name=f"{pdb_structures[0]['pdb_id']}.pdb",
+                        mime="text/plain"
+                    )
+                
+                tab_index += 1
+            
+            # AlphaFold structure tab
+            if alphafold_data.get('available'):
+                with structure_tabs[tab_index]:
+                    col1, col2 = st.columns([1, 1])
+                    
+                    with col1:
+                        st.markdown(f"""
+                        **AlphaFold Database Entry**
+                        - **UniProt ID:** {alphafold_data.get('uniprot_id')}
+                        - **Gene:** {alphafold_data.get('gene_name', 'N/A')}
+                        - **Model Version:** v{alphafold_data.get('model_version', 4)}
+                        - **[View on AlphaFold DB]({alphafold_data.get('alphafold_page')})**
+                        - **[Download PDB]({alphafold_data.get('pdb_url')})**
+                        """)
+                    
+                    with col2:
+                        st.info("""
+                        **Confidence Color Code:**
+                        - 🔵 **Dark Blue** (>90): Very high confidence
+                        - 🔵 **Light Blue** (70-90): Confident
+                        - 🟡 **Yellow** (50-70): Low confidence
+                        - 🟠 **Orange** (<50): Very low confidence
+                        """)
+                    
+                    st.markdown("---")
+                    
+                    # Display 3D viewer
+                    viewer_html = ProteinVisualizer.create_structure_viewer(alphafold_data, "alphafold")
+                    st.components.v1.html(viewer_html, height=600, scrolling=False)
+                    
+                    # Confidence plot
+                    st.subheader("📈 Prediction Confidence")
+                    fig_confidence = ProteinVisualizer.create_confidence_plot(
+                        st.session_state.current_uniprot_id,
+                        alphafold_data.get('entry_id')
+                    )
+                    st.plotly_chart(fig_confidence, use_container_width=True)
+                                        
+                    # Download options
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown(f"[📥 Download PDB File]({alphafold_data.get('pdb_url')})")
+                    with col2:
+                        st.markdown(f"[📥 Download PAE Data]({alphafold_data.get('pae_url')})")
+        
+        st.divider()
+        
+        # Section 4: Tissue Expression
+        st.header("🧫 Tissue Expression Analysis")
+        
+        if not tissue_df.empty:
+            # Prepare data
+            chart_data = DataProcessor.prepare_tissue_chart_data(tissue_df, top_n=20)
+            
+            # Create and display chart
+            fig_tissue = ProteinVisualizer.create_tissue_expression_chart(chart_data)
+            st.plotly_chart(fig_tissue, use_container_width=True)
+            
+            # Expression summary
+            high_tissues = tissue_df[tissue_df["level"] == "High"]["tissue"].tolist()
+            if high_tissues:
+                st.info(f"**High expression detected in:** {', '.join(high_tissues[:5])}" + 
+                    (f" and {len(high_tissues)-5} more tissues" if len(high_tissues) > 5 else ""))
+        else:
+            st.warning("⚠️ No tissue expression data available from Human Protein Atlas")
+        
+        st.divider()
+        
+        # Section 5: Subcellular Localization
+        st.header("📍 Subcellular Localization")
+        
+        if not subcellular_df.empty:
+            # Create and display heatmap
+            fig_subcellular = ProteinVisualizer.create_subcellular_heatmap(subcellular_df)
+            st.plotly_chart(fig_subcellular, use_container_width=True)
+            
+            # Location list
+            st.markdown("**Detected Locations:**")
+            for idx, row in subcellular_df.iterrows():
+                st.markdown(f"- **{row['location']}** ({row['reliability']} confidence)")
+        else:
+            st.warning("⚠️ No subcellular localization data available from Human Protein Atlas")
+
+        st.divider()
+        
+        # Section 6: KEGG Pathways for Proteins
+        st.header("🧬 KEGG Pathways for Proteins")
+        
+        kegg_data = data.get('kegg_pathways', {})
+        
+        if kegg_data.get('available'):
+            # Summary metrics
+            total_pathways = kegg_data.get('total_pathways', 0)
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.markdown(f"""
+                    <div class="metric-card">
+                        <h3 style="margin:0; color:#1f77b4;">{total_pathways}</h3>
+                        <p style="margin:0; color:#666;">Total Pathways Found</p>
+                    </div>
+                """, unsafe_allow_html=True)
+            
+            with col2:
+                st.markdown(f"""
+                    <div class="metric-card">
+                        <h3 style="margin:0; color:#1f77b4;">{kegg_data.get('kegg_protein_id', 'N/A')}</h3>
+                        <p style="margin:0; color:#666;">KEGG Protein ID</p>
+                    </div>
+                """, unsafe_allow_html=True)
+            
+            with col3:
+                st.markdown(f"""
+                    <div class="metric-card">
+                        <h3 style="margin:0; color:#1f77b4;">{kegg_data.get('protein_name', 'N/A')}</h3>
+                        <p style="margin:0; color:#666;">Protein Name</p>
+                    </div>
+                """, unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            # Create tabs for different display formats
+            pathway_tabs = st.tabs(["🖼️ Primary Pathway Map", "📋 Next 5 Pathways", "🔗 All Pathways Links"])
+            
+            # Tab 1: First Result with Full Details & Pathway Map
+            first_result = kegg_data.get('first_result')
+            with pathway_tabs[0]:
+                if first_result:
+                    st.subheader(f"🏆 Primary Pathway: {first_result.get('pathway_name', 'Unknown')}")
+                    
+                    # Display all metadata
+                    col1, col2 = st.columns([1, 1])
+                    with col1:
+                        st.markdown("**Pathway Details:**")
+                        st.markdown(f"- **ID:** `{first_result.get('pathway_id', 'N/A')}`")
+                        st.markdown(f"- **Name:** {first_result.get('pathway_name', 'N/A')}")
+                        
+                        if first_result.get('pathway_description'):
+                            st.markdown(f"- **Description:** {first_result.get('pathway_description', 'N/A')}")
+                        
+                        if first_result.get('pathway_class'):
+                            st.markdown(f"- **Classification:** {first_result.get('pathway_class', 'N/A')}")
+                    
+                    with col2:
+                        st.markdown("**Molecular Functions:**")
+                        functions = first_result.get('molecular_functions', [])
+                        if functions:
+                            for func in functions[:10]:  # Limit to 10 functions
+                                st.markdown(f"• {func}")
+                        else:
+                            st.markdown("*No specific molecular functions listed*")
+                    
+                    st.markdown("---")
+                    
+                    # Display pathway map image
+                    st.markdown("**Pathway Map:**")
+                    try:
+                        st.image(first_result.get('kegg_image_url', ''), 
+                                use_container_width=True,
+                                caption=f"{first_result.get('pathway_name')} - Visual representation from KEGG")
+                    except Exception as e:
+                        st.warning(f"Could not load pathway map image. [View on KEGG Website]({first_result.get('kegg_url', '#')})")
+                    
+                    st.markdown("---")
+                    
+                    # Direct links
+                    col_link1, col_link2 = st.columns(2)
+                    with col_link1:
+                        st.markdown(f"**[📌 View on KEGG Website]({first_result.get('kegg_url', '#')})**")
+                    with col_link2:
+                        st.markdown(f"**[🔗 Pathway with Protein Highlighted]({first_result.get('highlight_url', '#')})**")
+                else:
+                    st.info("No primary pathway data available")
+            
+            # Tab 2: Next 5 Results
+            next_results = kegg_data.get('next_results', [])
+            with pathway_tabs[1]:
+                if next_results:
+                    st.subheader("📊 Next 5 Pathways Associated with Protein")
+                    
+                    for idx, pathway in enumerate(next_results, 1):
+                        with st.container():
+                            col1, col2, col3 = st.columns([2, 1, 1])
+                            
+                            with col1:
+                                st.markdown(f"**{idx}. {pathway.get('pathway_name', 'Unknown')}**")
+                                if pathway.get('pathway_class'):
+                                    st.caption(f"Class: {pathway.get('pathway_class', '')}")
+                            
+                            with col2:
+                                st.markdown(f"`{pathway.get('pathway_id', 'N/A')}`")
+                            
+                            with col3:
+                                st.markdown(f"**[View →]({pathway.get('kegg_url', '#')})**")
+                            
+                            st.divider()
+                else:
+                    st.info("Less than 6 pathways found for this protein")
+            
+            # Tab 3: All Pathways Links
+            all_pathways = kegg_data.get('pathways', [])
+            with pathway_tabs[2]:
+                st.subheader(f"🔗 All {len(all_pathways)} Associated Pathways")
+                
+                # Add filter and sort options
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    search_term = st.text_input("🔍 Search pathways:", placeholder="e.g., cancer, metabolism, signaling")
+                with col2:
+                    sort_option = st.selectbox("Sort by:", ["Name", "ID"])
+                
+                # Filter pathways
+                filtered_pathways = all_pathways
+                if search_term:
+                    search_term = search_term.lower()
+                    filtered_pathways = [
+                        p for p in all_pathways 
+                        if search_term in p.get('pathway_name', '').lower() or 
+                           search_term in p.get('pathway_id', '').lower()
+                    ]
+                
+                # Sort pathways
+                if sort_option == "Name":
+                    filtered_pathways = sorted(filtered_pathways, key=lambda x: x.get('pathway_name', ''))
+                elif sort_option == "ID":
+                    filtered_pathways = sorted(filtered_pathways, key=lambda x: x.get('pathway_id', ''))
+                
+                # Display as table
+                st.markdown("| # | Pathway Name | ID | KEGG Link |")
+                st.markdown("|---|---|---|---|")
+                for idx, pathway in enumerate(filtered_pathways, 1):
+                    pathway_name = pathway.get('pathway_name', 'Unknown')
+                    pathway_id = pathway.get('pathway_id', 'N/A')
+                    kegg_url = pathway.get('kegg_url', '#')
+                    st.markdown(f"| {idx} | {pathway_name} | `{pathway_id}` | [View Pathway]({kegg_url}) |")
+                
+                st.caption(f"Showing {len(filtered_pathways)} of {len(all_pathways)} pathways")
+            
+            # Download pathway data
+            st.markdown("---")
+            st.subheader("💾 Export Pathway Data")
+            
+            # Create DataFrame for export
+            pathway_df = pd.DataFrame([
+                {
+                    "Pathway_Name": p['pathway_name'],
+                    "Pathway_ID": p['pathway_id'],
+                    "Classification": p.get('pathway_class', ''),
+                    "Description": p.get('pathway_description', ''),
+                    "KEGG_URL": p['kegg_url'],
+                    "Highlighted_URL": p['highlight_url']
+                }
+                for p in all_pathways
+            ])
+            
+            csv_pathways = pathway_df.to_csv(index=False)
+            st.download_button(
+                "📥 Download Pathway List (CSV)",
+                csv_pathways,
+                f"{st.session_state.current_uniprot_id}_kegg_pathways.csv",
+                "text/csv"
+            )
+            
+        else:
+            st.warning(f"⚠️ No KEGG pathway data found for gene: {kegg_data.get('gene_name', 'Unknown')}")
+            st.info("""
+            **Why might this happen?**
+            - Gene name not recognized in KEGG database
+            - Protein not associated with metabolic/signaling pathways
+            - Limited annotation in KEGG for this specific protein
+            
+            Try searching directly on [KEGG website](https://www.kegg.jp/)
+            """)
+        
+        st.divider()
+        
+        # Section 7: Molecular Docking with AutoDock Vina
         st.header("💊 Molecular Docking Analysis")
         
         chembl_data = data.get('chembl_ligands', {})
@@ -1400,8 +1381,8 @@ def main():
                     st.info("👈 Run a docking simulation in the 'Custom Docking' tab to see results here")
         
         st.divider()
-        
-        # Section 6: Summary Table
+
+        # Section 9: Summary Table
         st.header("📊 Data Summary")
         
         summary_df = DataProcessor.create_summary_table(
@@ -1473,50 +1454,5 @@ def main():
             else:
                 st.warning("No recent papers found; try official gene name.")
         
-        # Section: ChEMBL Ligands
-        st.divider()
-        st.header("💊 ChEMBL Ligands & Drug Compounds")
-        
-        chembl_data = data.get('chembl_ligands', {})
-        
-        if chembl_data.get('available') and chembl_data.get('ligands'):
-            ligands = chembl_data['ligands']
-            st.info(f"Found {len(ligands)} compound(s) targeting this protein in ChEMBL database")
-            
-            for idx, ligand in enumerate(ligands, 1):
-                with st.container():
-                    col1, col2 = st.columns([2, 1])
-                    
-                    with col1:
-                        st.markdown(f"**{idx}. {ligand['name']}**")
-                        st.caption(f"[ChEMBL ID: {ligand['chembl_id']}]({ligand['chembl_url']})")
-                        
-                        # Display properties as metrics
-                        prop_cols = st.columns(5)
-                        with prop_cols[0]:
-                            if ligand.get('mw'):
-                                st.metric("MW (Da)", f"{ligand['mw']:.1f}")
-                        with prop_cols[1]:
-                            if ligand.get('logp') is not None:
-                                st.metric("LogP", f"{ligand['logp']:.2f}")
-                        with prop_cols[2]:
-                            if ligand.get('hbd') is not None:
-                                st.metric("HBD", ligand['hbd'])
-                        with prop_cols[3]:
-                            if ligand.get('hba') is not None:
-                                st.metric("HBA", ligand['hba'])
-                        with prop_cols[4]:
-                            if ligand.get('activity_value') is not None:
-                                st.metric(f"{ligand['activity_type']}", f"{ligand['activity_value']} {ligand['activity_units']}")
-                    
-                    with col2:
-                        if ligand.get('canonical_smiles'):
-                            st.caption("SMILES:")
-                            st.code(ligand['canonical_smiles'], language="text")
-                    
-                    st.divider()
-        else:
-            st.info("ℹ️ No ChEMBL ligands found for this protein. This may indicate the protein is not yet annotated in ChEMBL or has no known ligand/drug compounds.")
-
 if __name__ == "__main__":
     main()

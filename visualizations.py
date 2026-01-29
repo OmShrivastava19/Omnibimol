@@ -154,7 +154,7 @@ class ProteinVisualizer:
         )
         
         return fig
-    
+        
     @staticmethod
     def create_structure_viewer(structure_data: Dict, structure_type: str = "alphafold") -> str:
         """
@@ -172,11 +172,12 @@ class ProteinVisualizer:
             title = f"Experimental Structure - {pdb_id}"
             color_scheme = "chainindex"  # Color by chain
         else:
-            return "<p style='text-align:center; color:gray;'>No structure available</p>"
-
-        if not pdb_url:
-            debug_info = f"Debug: structure_type={structure_type}, available={structure_data.get('available')}, data={str(structure_data)[:200]}..."
-            return f"<p style='text-align:center; color:red;'>No structure URL available<br><small style='color:gray;'>{debug_info}</small></p>"
+            error_msg = structure_data.get("error", "No structure available")
+            return f"<p style='text-align:center; color:gray;'>{error_msg}</p>"
+        
+        # Validate URL
+        if not pdb_url or pdb_url == "":
+            return "<p style='text-align:center; color:red;'>Error: Invalid structure URL</p>"
         
         html = f"""
         <!DOCTYPE html>
@@ -232,12 +233,19 @@ class ProteinVisualizer:
         </head>
         <body>
             <div id="viewport">
-                <div id="loading">Loading 3D structure...</div>
+                <div id="loading">Loading 3D structure from:<br><small>{pdb_url}</small></div>
             </div>
             <div id="title">{title}</div>
             
             <script>
                 (function() {{
+                    // Validate URL
+                    const pdbUrl = "{pdb_url}";
+                    if (!pdbUrl || pdbUrl === "") {{
+                        document.getElementById('loading').innerHTML = '<span class="error">Error: No PDB URL provided</span>';
+                        return;
+                    }}
+                    
                     // Wait for NGL to be fully loaded
                     if (typeof NGL === 'undefined') {{
                         document.getElementById('loading').innerHTML = '<span class="error">Error: NGL library failed to load</span>';
@@ -256,7 +264,7 @@ class ProteinVisualizer:
                         }}, false);
                         
                         // Load the structure
-                        stage.loadFile("{pdb_url}", {{defaultRepresentation: false}})
+                        stage.loadFile(pdbUrl, {{defaultRepresentation: false}})
                             .then(function(component) {{
                                 // Remove loading message
                                 var loadingDiv = document.getElementById('loading');
@@ -298,9 +306,8 @@ class ProteinVisualizer:
                             }})
                             .catch(function(error) {{
                                 console.error('Error loading structure:', error);
-                                var message = (error && error.message) ? error.message : (error ? error.toString() : 'Unknown error');
                                 document.getElementById('loading').innerHTML = 
-                                    '<span class="error">Error loading structure: ' + message + '</span>';
+                                    '<span class="error">Error loading structure from URL:<br>' + pdbUrl + '<br><br>Error: ' + error.message + '<br><br>This structure may not be available in AlphaFold DB.</span>';
                             }});
                             
                     }} catch (error) {{
@@ -315,7 +322,7 @@ class ProteinVisualizer:
         """
         
         return html
-       
+                
     @staticmethod
     def create_confidence_plot(uniprot_id: str, entry_id: str = None) -> go.Figure:
         """
@@ -323,43 +330,65 @@ class ProteinVisualizer:
         pLDDT scores: >90=very high, 70-90=confident, 50-70=low, <50=very low
         """
         import httpx
+        
         try:
+            # Use entry_id if provided, otherwise construct it
             if not entry_id:
                 entry_id = f"AF-{uniprot_id}-F1"
-            entry_id = entry_id.replace(".pdb", "").replace(".cif", "")
-            if "-model_v" in entry_id:
-                entry_id = entry_id.split("-model_v")[0]
-            if not entry_id.startswith("AF-"):
-                entry_id = f"AF-{entry_id}"
-            pdb_url = f"https://alphafold.ebi.ac.uk/files/{entry_id}-model_v4.pdb"
             
-            response = httpx.get(pdb_url, timeout=30.0)
-            response.raise_for_status()
-            pdb_content = response.text
+            # Try multiple versions - start with latest v6
+            urls_to_try = [
+                f"https://alphafold.ebi.ac.uk/files/{entry_id}-model_v6.pdb",
+                f"https://alphafold.ebi.ac.uk/files/{entry_id}-model_v4.pdb",
+                f"https://alphafold.ebi.ac.uk/files/{entry_id}-model_v3.pdb",
+                f"https://alphafold.ebi.ac.uk/files/{entry_id}-model_v2.pdb",
+            ]
+            
+            pdb_content = None
+            for pdb_url in urls_to_try:
+                try:
+                    response = httpx.get(pdb_url, timeout=30.0, follow_redirects=True)
+                    if response.status_code == 200:
+                        pdb_content = response.text
+                        break
+                except:
+                    continue
+            
+            if not pdb_content:
+                raise Exception(f"No AlphaFold structure found for {uniprot_id}")
+            
+            # Parse pLDDT scores from B-factor column in PDB file
             residues = []
             plddt_scores = []
+            
             for line in pdb_content.split('\n'):
-                if line.startswith('ATOM') and line[13:15].strip() == 'CA':
+                if line.startswith('ATOM') and line[13:15].strip() == 'CA':  # Only CA atoms
                     try:
                         residue_num = int(line[22:26].strip())
                         bfactor = float(line[60:66].strip())
+                        
                         residues.append(residue_num)
                         plddt_scores.append(bfactor)
                     except:
                         continue
+            
             if not residues:
                 raise Exception("No confidence data found in PDB file")
+            
+            # Create color mapping for scatter plot
             colors = []
             for score in plddt_scores:
                 if score > 90:
-                    colors.append('#0053D6')
+                    colors.append('#0053D6')  # Very high - dark blue
                 elif score > 70:
-                    colors.append('#65CBF3')
+                    colors.append('#65CBF3')  # Confident - light blue
                 elif score > 50:
-                    colors.append('#FFDB13')
+                    colors.append('#FFDB13')  # Low - yellow
                 else:
-                    colors.append('#FF7D45')
+                    colors.append('#FF7D45')  # Very low - orange
+            
             fig = go.Figure()
+            
             fig.add_trace(go.Scatter(
                 x=residues,
                 y=plddt_scores,
@@ -370,10 +399,17 @@ class ProteinVisualizer:
                 name='pLDDT Score',
                 hovertemplate='Residue: %{x}<br>Confidence: %{y:.1f}<extra></extra>'
             ))
-            fig.add_hrect(y0=90, y1=100, fillcolor="rgba(0, 83, 214, 0.1)", line_width=0, annotation_text="Very High", annotation_position="right")
-            fig.add_hrect(y0=70, y1=90, fillcolor="rgba(101, 203, 243, 0.1)", line_width=0, annotation_text="Confident", annotation_position="right")
-            fig.add_hrect(y0=50, y1=70, fillcolor="rgba(255, 219, 19, 0.1)", line_width=0, annotation_text="Low", annotation_position="right")
-            fig.add_hrect(y0=0, y1=50, fillcolor="rgba(255, 125, 69, 0.1)", line_width=0, annotation_text="Very Low", annotation_position="right")
+            
+            # Add confidence level zones
+            fig.add_hrect(y0=90, y1=100, fillcolor="rgba(0, 83, 214, 0.1)", 
+                        line_width=0, annotation_text="Very High", annotation_position="right")
+            fig.add_hrect(y0=70, y1=90, fillcolor="rgba(101, 203, 243, 0.1)", 
+                        line_width=0, annotation_text="Confident", annotation_position="right")
+            fig.add_hrect(y0=50, y1=70, fillcolor="rgba(255, 219, 19, 0.1)", 
+                        line_width=0, annotation_text="Low", annotation_position="right")
+            fig.add_hrect(y0=0, y1=50, fillcolor="rgba(255, 125, 69, 0.1)", 
+                        line_width=0, annotation_text="Very Low", annotation_position="right")
+            
             fig.update_layout(
                 title="AlphaFold Confidence Score (pLDDT) per Residue",
                 xaxis_title="Residue Position",
@@ -383,21 +419,21 @@ class ProteinVisualizer:
                 template="plotly_white",
                 hovermode='x unified'
             )
+            
             return fig
+            
         except Exception as e:
+            # Return empty figure with error message
             fig = go.Figure()
-            error_msg = f"Could not load confidence data from AlphaFold: {str(e)}"
-            if "404" in str(e):
-                error_msg += f"\nURL attempted: https://alphafold.ebi.ac.uk/files/{entry_id if 'entry_id' in locals() else f'AF-{uniprot_id}-F1'}-model_v4.pdb"
             fig.add_annotation(
-                text=error_msg,
+                text=f"AlphaFold structure not available for {uniprot_id}<br><br>This protein may not be in the AlphaFold database.",
                 xref="paper", yref="paper",
                 x=0.5, y=0.5, showarrow=False,
                 font=dict(size=14, color="gray")
             )
-            fig.update_layout(height=350)
+            fig.update_layout(height=350, template="plotly_white")
             return fig
-    
+                
     @staticmethod
     def create_pathway_network(pathways: list) -> go.Figure:
         """
