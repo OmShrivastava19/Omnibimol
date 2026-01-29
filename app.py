@@ -117,7 +117,7 @@ def main():
 
         st.divider()
 
-        if st.button("🔄 Clear All Cache & Reload"):
+        if st.button("🔄 Clear All Cache & Reload", key="sidebar_clear_cache"):
             # Clear cache database
             st.session_state.cache_manager.clear()
             
@@ -147,7 +147,7 @@ def main():
     )
     
     # Process search (triggered by Enter key or button)
-    if (st.session_state.get('trigger_search') or st.button("🔎 Search", type="primary", width='stretch')) and protein_input:
+    if (st.session_state.get('trigger_search') or st.button("🔎 Search", key="main_search_button", type="primary", width='stretch')) and protein_input:
         with st.spinner("🔍 Searching UniProt database..."):
             # Search UniProt
             search_results = asyncio.run(
@@ -190,7 +190,7 @@ def main():
             selected_gene_name = results[0]['gene_name']
         
         # Confirm and load data
-        if auto_load or st.button("✅ Confirm Selection", type="primary"):
+        if auto_load or st.button("✅ Confirm Selection", key="protein_confirm_selection", type="primary"):
             with st.spinner("📊 Fetching protein data..."):
                 start_time = time.time()
                 
@@ -425,7 +425,7 @@ def main():
                 if 'blast_results' not in st.session_state or \
                    st.session_state.get('blast_protein_id') != st.session_state.current_uniprot_id:
                     
-                    run_blast = st.button("🚀 Run BLAST Search", type="primary")
+                    run_blast = st.button("🚀 Run BLAST Search", key="blast_run_search", type="primary")
                     
                     if run_blast:
                         with st.spinner("🔬 Running BLAST search... This may take 30-60 seconds..."):
@@ -451,7 +451,7 @@ def main():
                         
                         # Display results table
                         blast_table_html = ProteinVisualizer.create_blast_results_table_html(blast_data['hits'])
-                        st.markdown(blast_table_html, unsafe_allow_html=True)
+                        st.components.v1.html(blast_table_html, height=600, scrolling=True)
                         
                         # Download results
                         blast_df = pd.DataFrame(blast_data['hits'])
@@ -474,14 +474,24 @@ def main():
                             )
                         
                         # Option to run new search
-                        if st.button("🔄 Run New BLAST Search"):
+                        if st.button("🔄 Run New BLAST Search", key="blast_run_new_search"):
                             del st.session_state.blast_results
                             del st.session_state.blast_protein_id
                             st.rerun()
                     
                     elif blast_data.get('error'):
-                        st.error(f"❌ BLAST search failed: {blast_data.get('error')}")
-                        if st.button("🔄 Try Again"):
+                        error_msg = blast_data.get('error')
+                        st.error(f"❌ BLAST search failed: {error_msg}")
+                        
+                        # Provide helpful suggestions
+                        if "timed out" in error_msg.lower():
+                            st.info("💡 **Tip:** BLAST searches can take 1-2 minutes for long sequences. Try again with a shorter sequence.")
+                        elif "closed" in error_msg.lower():
+                            st.info("💡 **Tip:** Network connection issue. Please try again.")
+                        else:
+                            st.info("💡 **Tip:** Try searching with a shorter protein sequence or check your internet connection.")
+                        
+                        if st.button("🔄 Try Again", key="blast_try_again"):
                             del st.session_state.blast_results
                             del st.session_state.blast_protein_id
                             st.rerun()
@@ -665,7 +675,7 @@ def main():
                             placeholder="e.g., P04637, P38398"
                         )
                         
-                        if compare_uniprot and st.button("🔍 Fetch Sequence"):
+                        if compare_uniprot and st.button("🔍 Fetch Sequence", key="needle_fetch_sequence"):
                             with st.spinner("Fetching sequence..."):
                                 compare_data = asyncio.run(
                                     st.session_state.api_client.fetch_uniprot_data(compare_uniprot)
@@ -687,7 +697,7 @@ def main():
                     
                     # Run alignment
                     if sequence2:
-                        run_needle = st.button("⚡ Run Needle Alignment", type="primary")
+                        run_needle = st.button("⚡ Run Needle Alignment", key="needle_run_alignment", type="primary")
                         
                         if run_needle:
                             with st.spinner("🧬 Running global alignment... This may take 10-30 seconds..."):
@@ -710,7 +720,7 @@ def main():
                         if needle_data.get('available'):
                             # Show alignment visualization
                             alignment_html = ProteinVisualizer.create_alignment_visualization(needle_data)
-                            st.markdown(alignment_html, unsafe_allow_html=True)
+                            st.components.v1.html(alignment_html, height=800, scrolling=True)
                             
                             # Interpretation
                             st.subheader("📊 Interpretation")
@@ -733,7 +743,7 @@ def main():
                             )
                             
                             # Clear results
-                            if st.button("🔄 Run New Alignment"):
+                            if st.button("🔄 Run New Alignment", key="needle_run_new_alignment"):
                                 del st.session_state.needle_results
                                 if 'compare_sequence' in st.session_state:
                                     del st.session_state.compare_sequence
@@ -741,8 +751,18 @@ def main():
                                 st.rerun()
                         
                         elif needle_data.get('error'):
-                            st.error(f"❌ Alignment failed: {needle_data.get('error')}")
-                    
+                            error_msg = needle_data.get('error')
+                            st.error(f"❌ Alignment failed: {error_msg}")
+                            
+                            # Provide helpful suggestions
+                            if "400" in error_msg:
+                                st.info("💡 **Tip:** Check that both sequences contain only valid amino acid letters (A-Z).")
+                            elif "timed out" in error_msg.lower():
+                                st.info("💡 **Tip:** Alignment is taking too long. Try with shorter sequences.")
+                            
+                            if st.button("🔄 Try Again", key="needle_try_again"):
+                                del st.session_state.needle_results
+                                st.rerun()                    
                     else:
                         st.info("👆 Enter a second sequence above and click 'Run Needle Alignment'")
             
@@ -1217,7 +1237,7 @@ def main():
                         placeholder="e.g., Aspirin, Ibuprofen, Caffeine"
                     )
                     
-                    if compound_name and st.button("🔍 Search PubChem"):
+                    if compound_name and st.button("🔍 Search PubChem", key="docking_search_pubchem"):
                         with st.spinner("Searching PubChem..."):
                             pubchem_data = asyncio.run(
                                 st.session_state.api_client.fetch_pubchem_structure(compound_name)
@@ -1264,7 +1284,7 @@ def main():
                 
                 # Run docking button
                 if selected_ligand:
-                    run_docking = st.button("🚀 Run Molecular Docking", type="primary")
+                    run_docking = st.button("🚀 Run Molecular Docking", key="docking_run_simulation", type="primary")
                     
                     if run_docking:
                         with st.spinner("🧬 Running AutoDock Vina simulation... This may take 30-60 seconds..."):
@@ -1370,7 +1390,7 @@ def main():
                 )
             
                 # Clear results
-                if st.button("🔄 Run New Docking"):
+                if st.button("🔄 Run New Docking", key="docking_run_new_docking"):
                     del st.session_state.docking_results
                     del st.session_state.docked_ligand_name
                     if 'custom_ligand' in st.session_state:

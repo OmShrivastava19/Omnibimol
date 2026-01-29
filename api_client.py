@@ -946,175 +946,176 @@ class ProteinAPIClient:
             return {"available": False, "ligands": [], "gene_name": gene_name}
         except Exception as e:
             return {"available": False, "ligands": [], "gene_name": gene_name}
-    
+        
     async def run_blast_search(self, sequence: str, uniprot_id: str) -> Dict:
         """
         Run BLAST search against NCBI nr database
         Two-step process: Submit job, then poll for results
-        Includes retry logic and improved error handling
         """
         cache_key = f"blast_{uniprot_id}"
         cached = self.cache.get(cache_key)
         if cached:
             return cached
         
-        max_retries = 3
-        retry_count = 0
-        
-        while retry_count < max_retries:
-            try:
-                # Use longer timeout for initial submission, shorter for polling
-                async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
-                    # Step 1: Submit BLAST job
-                    submit_url = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
-                    
-                    submit_params = {
-                        "CMD": "Put",
-                        "PROGRAM": "blastp",
-                        "DATABASE": "nr",
-                        "QUERY": sequence,
-                        "FORMAT_TYPE": "JSON2",
-                        "HITLIST_SIZE": "10",  # Top 10 hits
-                        "EXPECT": "0.001",  # E-value threshold
-                        "FILTER": "L",  # Low complexity filter
-                        "ALIGNMENTS": "10"
-                    }
-                    
-                    try:
-                        submit_response = await client.post(submit_url, data=submit_params)
-                        submit_response.raise_for_status()
-                        submit_text = submit_response.text
-                    except (httpx.ReadError, httpx.ConnectError, httpx.TimeoutException) as conn_error:
-                        retry_count += 1
-                        if retry_count < max_retries:
-                            await asyncio.sleep(2 ** retry_count)  # Exponential backoff
-                            continue
-                        else:
-                            return {
-                                "available": False,
-                                "error": "Server disconnected: Could not connect to NCBI BLAST service. Please try again later.",
-                                "retry_available": True
-                            }
+        try:
+            # Step 1: Submit BLAST job
+            submit_url = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
+            
+            submit_params = {
+                "CMD": "Put",
+                "PROGRAM": "blastp",
+                "DATABASE": "nr",
+                "QUERY": sequence,
+                "FORMAT_TYPE": "XML",
+                "HITLIST_SIZE": "10",
+                "EXPECT": "0.001",
+                "FILTER": "L"
+            }
+            
+            # Use a new client for submission
+            async with httpx.AsyncClient(timeout=60.0) as submit_client:
+                submit_response = await submit_client.post(submit_url, data=submit_params)
+                submit_response.raise_for_status()
+                submit_text = submit_response.text
+            
+            # Extract RID (Request ID) from response
+            rid = None
+            for line in submit_text.split('\n'):
+                if 'RID =' in line:
+                    rid = line.split('=')[1].strip()
+                    break
+            
+            if not rid:
+                return {
+                    "available": False,
+                    "error": "Failed to submit BLAST job - no RID received"
+                }
+            
+            # Step 2: Poll for results (can take 30-60 seconds)
+            max_attempts = 40
+            attempt = 0
+            
+            while attempt < max_attempts:
+                await asyncio.sleep(3)  # Wait 3 seconds between checks
                 
-                # Extract RID (Request ID) from response
-                rid = None
-                for line in submit_text.split('\n'):
-                    if 'RID =' in line:
-                        rid = line.split('=')[1].strip()
-                        break
-                
-                if not rid:
-                    return {
-                        "available": False,
-                        "error": "Failed to submit BLAST job"
-                    }
-                
-                # Step 2: Poll for results (can take 30-60 seconds)
-                max_attempts = 30
-                attempt = 0
-                
-                while attempt < max_attempts:
-                    await asyncio.sleep(2)  # Wait 2 seconds between checks
-                    
+                # Use a fresh client for each poll
+                async with httpx.AsyncClient(timeout=60.0) as poll_client:
                     check_params = {
                         "CMD": "Get",
                         "RID": rid,
-                        "FORMAT_TYPE": "JSON2"
+                        "FORMAT_TYPE": "XML"
                     }
                     
                     try:
-                        check_response = await client.get(submit_url, params=check_params, timeout=15.0)
+                        check_response = await poll_client.get(submit_url, params=check_params)
                         check_text = check_response.text
-                    except (httpx.ReadError, httpx.ConnectError, httpx.TimeoutException):
-                        attempt += 1
-                        continue  # Retry polling
-                    
-                    # Check if results are ready
-                    if "Status=READY" in check_text:
-                        # Parse JSON results
-                        try:
-                            # Extract JSON from response
-                            json_start = check_text.find('{')
-                            if json_start != -1:
-                                json_data = json.loads(check_text[json_start:])
-                                
-                                # Parse BLAST results
-                                hits = []
-                                
-                                if "BlastOutput2" in json_data:
-                                    for report in json_data["BlastOutput2"]:
-                                        if "report" in report:
-                                            search_results = report["report"].get("results", {}).get("search", {})
-                                            hit_list = search_results.get("hits", [])
-                                            
-                                            for hit in hit_list[:10]:  # Top 10
-                                                description = hit.get("description", [{}])[0]
-                                                hsps = hit.get("hsps", [{}])[0]  # High-scoring segment pairs
-                                                
-                                                hits.append({
-                                                    "accession": description.get("accession", "Unknown"),
-                                                    "title": description.get("title", "Unknown"),
-                                                    "organism": description.get("sciname", "Unknown"),
-                                                    "identity_percent": round(hsps.get("identity", 0) / hsps.get("align_len", 1) * 100, 2),
-                                                    "coverage_percent": round(hsps.get("align_len", 0) / len(sequence) * 100, 2),
-                                                    "e_value": hsps.get("evalue", 1.0),
-                                                    "bit_score": hsps.get("bit_score", 0),
-                                                    "align_len": hsps.get("align_len", 0)
-                                                })
-                                
-                                result = {
-                                    "available": True,
-                                    "rid": rid,
-                                    "hits": hits,
-                                    "hit_count": len(hits)
-                                }
-                                
-                                self.cache.set(cache_key, result)
-                                return result
-                                
-                        except Exception as e:
+                        
+                        # Check if results are ready
+                        if "Status=READY" in check_text or "<BlastOutput" in check_text:
+                            # Parse XML results
+                            hits = self._parse_blast_xml(check_text, sequence)
+                            
+                            result = {
+                                "available": True,
+                                "rid": rid,
+                                "hits": hits,
+                                "hit_count": len(hits)
+                            }
+                            
+                            self.cache.set(cache_key, result)
+                            return result
+                        
+                        elif "Status=WAITING" in check_text or "Status=UNKNOWN" in check_text:
+                            attempt += 1
+                            continue
+                        elif "Status=FAILURE" in check_text or "Status=ERROR" in check_text:
                             return {
                                 "available": False,
-                                "error": f"Failed to parse BLAST results: {str(e)}"
+                                "error": "BLAST job failed on NCBI server"
                             }
-                    
-                    elif "Status=WAITING" in check_text:
+                        else:
+                            attempt += 1
+                            continue
+                            
+                    except Exception as poll_error:
+                        if attempt >= max_attempts - 1:
+                            raise
                         attempt += 1
                         continue
-                    else:
-                        return {
-                            "available": False,
-                            "error": "BLAST job failed or expired"
-                        }
-                
-                return {
-                    "available": False,
-                    "error": "BLAST search timed out after 60 seconds. Results may still be processing. Please try again.",
-                    "retry_available": True
-                }
-                
-            except (httpx.ReadError, httpx.ConnectError, httpx.TimeoutException) as e:
-                retry_count += 1
-                if retry_count < max_retries:
-                    await asyncio.sleep(2 ** retry_count)  # Exponential backoff
-                    continue
-                else:
-                    return {
-                        "available": False,
-                        "error": "Server disconnected: NCBI BLAST service is temporarily unavailable. Please try again.",
-                        "retry_available": True
-                    }
-            except Exception as e:
-                return {
-                    "available": False,
-                    "error": f"Unexpected error: {str(e)}. Please try again or contact support.",
-                    "retry_available": True
-                }
+            
+            return {
+                "available": False,
+                "error": "BLAST search timed out after 2 minutes"
+            }
+            
+        except Exception as e:
+            return {
+                "available": False,
+                "error": f"Unexpected error: {str(e)}"
+            }
+
+    def _parse_blast_xml(self, xml_text: str, query_sequence: str) -> list:
+        """
+        Parse BLAST XML output to extract hits
+        """
+        import re
         
-        return {
-            "available": False,
-            "error": "BLAST search failed after multiple retries. Please try again later."
-        }
+        hits = []
+        
+        try:
+            # Simple XML parsing using regex (for basic extraction)
+            # Find all Hit blocks
+            hit_pattern = r'<Hit>(.*?)</Hit>'
+            hit_blocks = re.findall(hit_pattern, xml_text, re.DOTALL)
+            
+            for hit_block in hit_blocks[:10]:  # Top 10 hits
+                try:
+                    # Extract fields
+                    accession_match = re.search(r'<Hit_accession>(.*?)</Hit_accession>', hit_block)
+                    def_match = re.search(r'<Hit_def>(.*?)</Hit_def>', hit_block)
+                    
+                    # Get HSP (High-scoring Segment Pair) info
+                    identity_match = re.search(r'<Hsp_identity>(\d+)</Hsp_identity>', hit_block)
+                    align_len_match = re.search(r'<Hsp_align-len>(\d+)</Hsp_align-len>', hit_block)
+                    evalue_match = re.search(r'<Hsp_evalue>([\d.e+-]+)</Hsp_evalue>', hit_block)
+                    bitscore_match = re.search(r'<Hsp_bit-score>([\d.]+)</Hsp_bit-score>', hit_block)
+                    
+                    if accession_match and identity_match and align_len_match:
+                        accession = accession_match.group(1)
+                        definition = def_match.group(1) if def_match else "Unknown"
+                        identity = int(identity_match.group(1))
+                        align_len = int(align_len_match.group(1))
+                        evalue = float(evalue_match.group(1)) if evalue_match else 1.0
+                        bitscore = float(bitscore_match.group(1)) if bitscore_match else 0
+                        
+                        # Extract organism from definition
+                        organism = "Unknown"
+                        org_match = re.search(r'\[(.*?)\]', definition)
+                        if org_match:
+                            organism = org_match.group(1)
+                        
+                        # Calculate percentages
+                        identity_percent = (identity / align_len) * 100 if align_len > 0 else 0
+                        coverage_percent = (align_len / len(query_sequence)) * 100 if len(query_sequence) > 0 else 0
+                        
+                        hits.append({
+                            "accession": accession,
+                            "title": definition[:200],  # Truncate long titles
+                            "organism": organism,
+                            "identity_percent": round(identity_percent, 2),
+                            "coverage_percent": round(coverage_percent, 2),
+                            "e_value": evalue,
+                            "bit_score": bitscore,
+                            "align_len": align_len
+                        })
+                except:
+                    continue
+            
+            return hits
+            
+        except Exception as e:
+            st.warning(f"Error parsing BLAST results: {str(e)}")
+            return []
 
     def get_fasta_sequence(self, uniprot_data: Dict) -> str:
         """
@@ -1195,7 +1196,7 @@ class ProteinAPIClient:
             }
 
     async def run_needle_alignment(self, sequence1: str, sequence2: str, 
-                               id1: str = "Query", id2: str = "Subject") -> Dict:
+                                id1: str = "Query", id2: str = "Subject") -> Dict:
         """
         Run EMBOSS Needle pairwise sequence alignment via EMBL-EBI REST API
         Needle performs global alignment (Needleman-Wunsch algorithm)
@@ -1206,34 +1207,34 @@ class ProteinAPIClient:
             return cached
         
         try:
+            # Clean sequences (remove whitespace and non-amino acid characters)
+            seq1_clean = ''.join(c for c in sequence1.upper() if c.isalpha())
+            seq2_clean = ''.join(c for c in sequence2.upper() if c.isalpha())
+            
+            # Prepare FASTA format
+            fasta1 = f">{id1}\n{seq1_clean}"
+            fasta2 = f">{id2}\n{seq2_clean}"
+            
+            # Step 1: Submit job
+            submit_url = "https://www.ebi.ac.uk/Tools/services/rest/emboss_needle/run"
+            
+            # Correct parameters based on EBI documentation
+            submit_data = {
+                "email": "omnibiomol@example.com",
+                "title": f"Alignment_{id1}_vs_{id2}",
+                "asequence": fasta1,
+                "bsequence": fasta2,
+                "gapopen": "10",
+                "gapextend": "0.5",
+                "endweight": "false",
+                "endopen": "10",
+                "endextend": "0.5",
+                "matrix": "EBLOSUM62",
+                "sformat": "pair"
+            }
+            
+            # Submit with correct headers
             async with httpx.AsyncClient(timeout=120.0) as client:
-                # EMBL-EBI EMBOSS Needle endpoint
-                submit_url = "https://www.ebi.ac.uk/Tools/services/rest/emboss_needle/run"
-                
-                # Clean sequences (remove whitespace and non-amino acid characters)
-                seq1_clean = ''.join(c for c in sequence1.upper() if c.isalpha())
-                seq2_clean = ''.join(c for c in sequence2.upper() if c.isalpha())
-                
-                # Prepare FASTA format
-                fasta1 = f">{id1}\n{seq1_clean}"
-                fasta2 = f">{id2}\n{seq2_clean}"
-                
-                # Prepare form data (application/x-www-form-urlencoded)
-                submit_data = {
-                    "email": "omnibiomol@example.com",
-                    "title": f"Alignment_{id1}_vs_{id2}",
-                    "asequence": fasta1,
-                    "bsequence": fasta2,
-                    "gapopen": "10",
-                    "gapextend": "0.5",
-                    "endweight": "false",
-                    "endopen": "10",
-                    "endextend": "0.5",
-                    "matrix": "BLOSUM62",
-                    "sformat": "pair"
-                }
-                
-                # Step 1: Submit job with correct content type
                 headers = {
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Accept": "text/plain"
@@ -1248,7 +1249,7 @@ class ProteinAPIClient:
                 
                 job_id = submit_response.text.strip()
                 
-                if not job_id or len(job_id) > 50:  # Job ID should be short
+                if not job_id or len(job_id) > 50:
                     return {
                         "available": False,
                         "error": "Failed to submit Needle alignment job"
@@ -1256,13 +1257,14 @@ class ProteinAPIClient:
                 
                 # Step 2: Poll for completion
                 status_url = f"https://www.ebi.ac.uk/Tools/services/rest/emboss_needle/status/{job_id}"
-                result_url = f"https://www.ebi.ac.uk/Tools/services/rest/emboss_needle/result/{job_id}/aln-pair"
+                # FIXED: Use 'out' instead of 'aln-pair'
+                result_url = f"https://www.ebi.ac.uk/Tools/services/rest/emboss_needle/result/{job_id}/out"
                 
                 max_attempts = 40
                 attempt = 0
                 
                 while attempt < max_attempts:
-                    await asyncio.sleep(3)  # Wait 3 seconds between checks
+                    await asyncio.sleep(3)
                     
                     try:
                         status_response = await client.get(status_url)
@@ -1318,18 +1320,16 @@ class ProteinAPIClient:
                 
         except httpx.HTTPStatusError as e:
             error_msg = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
-            st.error(f"Needle alignment error: {error_msg}")
             return {
                 "available": False,
                 "error": error_msg
             }
         except Exception as e:
-            st.error(f"Needle alignment error: {str(e)}")
             return {
                 "available": False,
                 "error": str(e)
             }
-
+            
     def _parse_needle_output(self, alignment_text: str, id1: str, id2: str) -> Dict:
         """
         Parse EMBOSS Needle alignment output
