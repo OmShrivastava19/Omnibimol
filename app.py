@@ -77,7 +77,7 @@ def main():
     """, unsafe_allow_html=True)
     
     # Header with banner
-    st.image("icons/Omnibimol_banner.png", use_container_width=True)
+    st.image("icons/Omnibimol_banner.png", width='stretch')
     
     # Initialize cache and API client
     if 'cache_manager' not in st.session_state:
@@ -147,7 +147,7 @@ def main():
     )
     
     # Process search (triggered by Enter key or button)
-    if (st.session_state.get('trigger_search') or st.button("🔎 Search", type="primary", use_container_width=True)) and protein_input:
+    if (st.session_state.get('trigger_search') or st.button("🔎 Search", type="primary", width='stretch')) and protein_input:
         with st.spinner("🔍 Searching UniProt database..."):
             # Search UniProt
             search_results = asyncio.run(
@@ -287,7 +287,7 @@ def main():
         # GO terms chart
         if go_count > 0:
             fig_go = ProteinVisualizer.create_go_terms_chart(go_terms)
-            st.plotly_chart(fig_go, use_container_width=True)
+            st.plotly_chart(fig_go, width='stretch')
         
         st.divider()
 
@@ -393,7 +393,7 @@ def main():
                 
                 # Composition chart
                 fig_composition = ProteinVisualizer.create_sequence_composition_chart(composition)
-                st.plotly_chart(fig_composition, use_container_width=True)
+                st.plotly_chart(fig_composition, width='stretch')
                 
                 st.info("""
                 **Color Legend:**
@@ -551,7 +551,7 @@ def main():
                             features, 
                             uniprot_data.get('sequence_length', len(sequence))
                         )
-                        st.plotly_chart(fig_features, use_container_width=True)
+                        st.plotly_chart(fig_features, width='stretch')
                         
                         # Detailed feature table
                         st.subheader("📋 Feature Details")
@@ -575,7 +575,7 @@ def main():
                         )
                         
                         filtered_df = feature_df[feature_df['Type'].isin(feature_type_filter)]
-                        st.dataframe(filtered_df, use_container_width=True, hide_index=True)
+                        st.dataframe(filtered_df, width='stretch', hide_index=True)
                         
                         # Download
                         csv_features = filtered_df.to_csv(index=False)
@@ -857,7 +857,7 @@ def main():
                         st.session_state.current_uniprot_id,
                         alphafold_data.get('entry_id')
                     )
-                    st.plotly_chart(fig_confidence, use_container_width=True)
+                    st.plotly_chart(fig_confidence, width='stretch')
                                         
                     # Download options
                     col1, col2 = st.columns(2)
@@ -877,7 +877,7 @@ def main():
             
             # Create and display chart
             fig_tissue = ProteinVisualizer.create_tissue_expression_chart(chart_data)
-            st.plotly_chart(fig_tissue, use_container_width=True)
+            st.plotly_chart(fig_tissue, width='stretch')
             
             # Expression summary
             high_tissues = tissue_df[tissue_df["level"] == "High"]["tissue"].tolist()
@@ -895,7 +895,7 @@ def main():
         if not subcellular_df.empty:
             # Create and display heatmap
             fig_subcellular = ProteinVisualizer.create_subcellular_heatmap(subcellular_df)
-            st.plotly_chart(fig_subcellular, use_container_width=True)
+            st.plotly_chart(fig_subcellular, width='stretch')
             
             # Location list
             st.markdown("**Detected Locations:**")
@@ -979,7 +979,7 @@ def main():
                     st.markdown("**Pathway Map:**")
                     try:
                         st.image(first_result.get('kegg_image_url', ''), 
-                                use_container_width=True,
+                                width='stretch',
                                 caption=f"{first_result.get('pathway_name')} - Visual representation from KEGG")
                     except Exception as e:
                         st.warning(f"Could not load pathway map image. [View on KEGG Website]({first_result.get('kegg_url', '#')})")
@@ -1329,13 +1329,13 @@ def main():
                 
                 # Binding modes chart
                 fig_docking = ProteinVisualizer.create_docking_results_chart(results)
-                st.plotly_chart(fig_docking, use_container_width=True)
+                st.plotly_chart(fig_docking, width='stretch')
                 
                 # Detailed modes table
                 st.subheader("📋 Binding Mode Details")
                 
                 modes_df = pd.DataFrame(results.get('modes', []))
-                st.dataframe(modes_df, use_container_width=True, hide_index=True)
+                st.dataframe(modes_df, width='stretch', hide_index=True)
                 
                 # Interpretation
                 st.subheader("💡 Interpretation")
@@ -1395,7 +1395,7 @@ def main():
             data.get('chembl_ligands')
         )
 
-        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+        st.dataframe(summary_df, width='stretch', hide_index=True)
         
         # Download options
         st.subheader("💾 Export Data")
