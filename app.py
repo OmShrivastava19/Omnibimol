@@ -1,22 +1,15 @@
-# app.py - Full imports with purpose annotations
+# app.py - Streamlit protein analysis application
 import streamlit as st
-import httpx
 import asyncio
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import sqlite3
-import json
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import time
-from contextlib import asynccontextmanager
+import requests
 from cache_manager import *
 from data_processor import *
 from visualizations import *
 from api_client import *
-import requests
 
 # app.py - Main Streamlit application
 def main():
@@ -117,16 +110,11 @@ def main():
 
         st.divider()
 
-        if st.button("🔄 Clear All Cache & Reload", key="sidebar_clear_cache"):
-            # Clear cache database
+        if st.button("🔄 Clear Cache", key="sidebar_clear_cache"):
             st.session_state.cache_manager.clear()
-            
-            # Clear session state
-            for key in list(st.session_state.keys()):
-                if key not in ['cache_manager', 'api_client']:
-                    del st.session_state[key]
-    
-            st.success("Cache cleared! Please search for your protein again.")
+            st.session_state.pop('current_data', None)
+            st.session_state.pop('current_uniprot_id', None)
+            st.session_state.pop('protein_input', None)
             st.rerun()
     
     # Main input section
@@ -1117,6 +1105,103 @@ def main():
         
         st.divider()
         
+        # Section: STRING Protein-Protein Interactions
+        st.header("🔗 Protein-Protein Interaction Network (STRING)")
+        
+        string_data = data.get('string_ppi', {})
+        
+        st.info("""
+        **About STRING Database:**
+        - Comprehensive protein-protein interaction database
+        - Combines experimental data, computational prediction, and text mining
+        - Confidence scores from 0-1000 (higher = more reliable)
+        """)
+        if string_data.get('available') and string_data.get('interactions'):
+            interactions = string_data['interactions']
+            gene_name = string_data.get('gene_name', st.session_state.current_uniprot_id)
+            
+            # Summary metrics
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                st.metric("Total Interactions", len(interactions))
+            with col2:
+                high_conf = [i for i in interactions if i['combined_score'] >= 700]
+                st.metric("High Confidence (≥700)", len(high_conf))
+            with col3:
+                st.metric("STRING Protein ID", string_data.get('string_id', 'N/A'))
+            
+            # Additional confidence metrics
+            col4, col5, col6 = st.columns(3)
+            
+            with col4:
+                highest_conf = [i for i in interactions if i['combined_score'] >= 900]
+                st.metric("Highest Confidence (≥900)", len(highest_conf))
+            with col5:
+                medium_conf = [i for i in interactions if i['combined_score'] >= 400 and i['combined_score'] < 700]
+                st.metric("Medium Confidence (≥400)", len(medium_conf))
+            with col6:
+                low_conf = [i for i in interactions if i['combined_score'] < 400]
+                st.metric("Low Confidence (<400)", len(low_conf))
+            
+            st.markdown("---")
+            
+            # Create tabs
+            ppi_tabs = st.tabs(["🕸️ Network Graph", "📋 Interaction Table"])
+            
+            # Tab 1: Network visualization
+            with ppi_tabs[0]:
+                network_fig = ProteinVisualizer.create_ppi_network_chart(interactions, gene_name)
+                st.plotly_chart(network_fig, width='stretch')
+                
+                st.caption("""
+                **Color Legend:**
+                
+                🔴 Red = Query protein | 🔵 Dark Blue = Highest confidence (≥900) | 🟢 Green = High confidence (≥700) | 🟠 Orange = Medium confidence (≥400) | ⚪ Gray = Low confidence (<400)
+                """)
+            
+            # Tab 2: Interaction table
+            with ppi_tabs[1]:
+                st.subheader("Protein Interaction Partners")
+                
+                # Display interactions in a table
+                ppi_table_html = ProteinVisualizer.create_ppi_table_html(interactions)
+                st.components.v1.html(ppi_table_html, height=600, scrolling=True)
+            
+            st.markdown("---")
+            
+            # External links
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown(f"**[🔗 View on STRING Database]({string_data.get('string_url', '#')})**")
+            with col2:
+                st.markdown(f"**[📊 Network Image]({string_data.get('network_image_url', '#')})**")
+            
+            st.markdown("---")
+            
+            # Download interaction data
+            interaction_df = pd.DataFrame(interactions)
+            csv_interactions = interaction_df.to_csv(index=False)
+            st.download_button(
+                "📥 Download Interaction Data",
+                csv_interactions,
+                f"{st.session_state.current_uniprot_id}_string_interactions.csv",
+                "text/csv"
+            )
+        else:
+            st.warning(f"⚠️ No STRING interaction data found for {st.session_state.current_uniprot_id}")
+            error_msg = string_data.get('error', 'Unknown error')
+            st.info(f"""
+            **Possible reasons:**
+            - Protein not found in STRING database (Gene: {string_data.get('gene_name', 'Unknown')})
+            - Limited experimental or predicted interaction data
+            - Protein may have few known interactors
+            
+            **Error:** {error_msg}
+            """)
+
+        st.divider()
+
         # Section 7: Molecular Docking with AutoDock Vina
         st.header("💊 Molecular Docking Analysis")
         
@@ -1153,9 +1238,53 @@ def main():
                 
                 st.markdown("---")
                 
-                # Display ligand table
-                ligand_table_html = ProteinVisualizer.create_ligand_table_html(ligands)
-                st.components.v1.html(ligand_table_html, height=800, scrolling=True)
+                # Display ligand cards with Dock buttons
+                st.info("💡 **Tip:** Click the 'Dock' button next to any ligand to run molecular docking simulation")
+                
+                for idx, ligand in enumerate(ligands[:20]):  # Show top 20
+                    with st.expander(f"🧪 {ligand.get('name', ligand.get('chembl_id'))} - {ligand.get('activity_value', 'N/A')} {ligand.get('activity_units', 'nM')}"):
+                        col_img, col_info, col_action = st.columns([1, 2, 1])
+                        
+                        with col_img:
+                            # Structure image
+                            img_url = f"https://www.ebi.ac.uk/chembl/api/data/image/{ligand.get('chembl_id')}.svg"
+                            st.image(img_url, width=150)
+                        
+                        with col_info:
+                            st.markdown(f"**ChEMBL ID:** [{ligand.get('chembl_id')}]({ligand.get('chembl_url', '#')})")
+                            st.markdown(f"**Activity:** {ligand.get('activity_type', 'N/A')}")
+                            st.markdown(f"**Value:** {ligand.get('activity_value', 'N/A')} {ligand.get('activity_units', 'nM')}")
+                            mw = ligand.get('molecular_weight')
+                            if mw and mw != 'N/A':
+                                st.markdown(f"**MW:** {float(mw):.1f} Da")
+                        
+                        with col_action:
+                            if st.button(f"🎯 Dock", key=f"dock_ligand_{idx}"):
+                                # Store ligand for docking
+                                st.session_state.selected_ligand_for_docking = {
+                                    'chembl_id': ligand.get('chembl_id'),
+                                    'name': ligand.get('name', ligand.get('chembl_id')),
+                                    'smiles': ligand.get('smiles', ''),
+                                    'mw': ligand.get('molecular_weight', 0),
+                                    'activity_value': ligand.get('activity_value', None)
+                                }
+                                # Switch to docking results tab
+                                st.info(f"✅ Selected {ligand.get('name', ligand.get('chembl_id'))} for docking. Running simulation...")
+                                
+                                # Run docking simulation
+                                docking_result = st.session_state.api_client.simulate_docking_score(
+                                    protein_length=uniprot_data.get('sequence_length', 500),
+                                    ligand_mw=ligand.get('molecular_weight', 0),
+                                    activity_value=ligand.get('activity_value', None)
+                                )
+                                
+                                st.session_state.docking_results = docking_result
+                                st.session_state.docked_ligand_name = ligand.get('name', ligand.get('chembl_id'))
+                                
+                                st.success(f"✅ Docking complete! Check the 'Docking Results' tab.")
+                                st.rerun()
+                
+                st.markdown("---")
                 
                 # Download ligand data
                 ligand_df = pd.DataFrame([
@@ -1210,9 +1339,10 @@ def main():
                 st.markdown("**Select Ligand Source:**")
                 
                 ligand_source = st.radio(
-                    "",
+                    "Ligand Source",
                     ["Known ligand from ChEMBL", "Custom compound (PubChem)", "Upload SMILES/SDF"],
-                    horizontal=False
+                    horizontal=False,
+                    label_visibility='collapsed'
                 )
                 
                 selected_ligand = None

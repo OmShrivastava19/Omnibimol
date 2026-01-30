@@ -83,3 +83,7 @@ class CacheManager:
         cursor.execute("DELETE FROM cache")
         conn.commit()
         conn.close()
+    
+    def clear(self):
+        """Alias for clear_all() - clear all cache entries"""
+        self.clear_all()

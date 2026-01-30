@@ -1,15 +1,13 @@
 import httpx
 import pandas as pd
 import streamlit as st
-import sqlite3
-import json
-import threading
 import asyncio
-from datetime import datetime
 from typing import List, Dict
 import os
 import random
 import math
+import re
+import html
 
 # Load TSV data at startup
 @st.cache_data
@@ -27,79 +25,14 @@ def load_hpa_data():
     
     return normal_tissue_df, subcellular_df
 
-# Thread-safe SQLite connection manager
-class ThreadSafeSQLite:
-    def __init__(self, db_path):
-        self.db_path = db_path
-        self.local = threading.local()
-
-    def get_connection(self):
-        if not hasattr(self.local, "connection"):
-            self.local.connection = sqlite3.connect(self.db_path, check_same_thread=False)
-        return self.local.connection
-
-    def close_connection(self):
-        if hasattr(self.local, "connection"):
-            self.local.connection.close()
-            del self.local.connection
-
-# Cache manager class
-class CacheManager:
-    """Handles caching of API responses"""
-    
-    def __init__(self, db_path: str = "cache.db"):
-        self.db_path = db_path
-        self.conn = ThreadSafeSQLite(db_path).get_connection()
-        self.create_tables()
-        
-    def create_tables(self):
-        """Create tables for caching if they don't exist"""
-        with self.conn:
-            self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS cache (
-                id INTEGER PRIMARY KEY,
-                key TEXT UNIQUE,
-                value TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-            """)
-    
-    def get(self, key: str):
-        """Get cached value by key"""
-        cur = self.conn.cursor()
-        cur.execute("SELECT value FROM cache WHERE key = ?", (key,))
-        row = cur.fetchone()
-        return json.loads(row[0]) if row else None
-    
-    def set(self, key: str, value):
-        """Set cache value by key"""
-        with self.conn:
-            self.conn.execute("""
-            INSERT OR REPLACE INTO cache (key, value)
-            VALUES (?, ?)
-            """, (key, json.dumps(value)))
-    
-    def clear(self):
-        """Clear the cache"""
-        with self.conn:
-            self.conn.execute("DELETE FROM cache")
-    
-    def close(self):
-        """Close the database connection"""
-        self.conn.close()
-
 # api_client.py - UniProt and HPA API integration with error handling
 class ProteinAPIClient:
     """Handles all API interactions with UniProt and Human Protein Atlas"""
     
-    def __init__(self, cache_manager: CacheManager):
+    def __init__(self, cache_manager):
         self.cache = cache_manager
         self.uniprot_base = "https://rest.uniprot.org"
         self.hpa_base = "https://www.proteinatlas.org/api"
-        
-        # Replace the existing SQLite connection with the thread-safe connection
-        self.db = ThreadSafeSQLite("omnibiomol_cache.db")
-        self.conn = self.db.get_connection()
         
     async def search_uniprot(self, protein_name: str, max_results: int = 5) -> List[Dict]:
         """
@@ -317,6 +250,7 @@ class ProteinAPIClient:
             self.fetch_pdb_structure(uniprot_id),
             self.fetch_kegg_pathways(gene_name, uniprot_id),
             self.fetch_chembl_ligands(uniprot_id),
+            self.fetch_string_ppi(gene_name, uniprot_id, limit=15),
             self.fetch_literature_summary(uniprot_id, gene_name),
             return_exceptions=True
         )
@@ -333,7 +267,8 @@ class ProteinAPIClient:
             "pdb_structure": results[2] if not isinstance(results[2], Exception) else {"available": False, "structures": []},
             "kegg_pathways": results[3] if not isinstance(results[3], Exception) else {"available": False, "pathways": []},
             "chembl_ligands": results[4] if not isinstance(results[4], Exception) else {"available": False, "ligands": []},
-            "literature": results[5] if not isinstance(results[5], Exception) else {"papers": [], "wiki_title": None, "wiki_snippet": None}
+            "string_ppi": results[5] if not isinstance(results[5], Exception) else {"available": False, "interactions": []},
+            "literature": results[6] if not isinstance(results[6], Exception) else {"papers": [], "wiki_title": None, "wiki_snippet": None}
         }
             
     async def fetch_alphafold_structure(self, uniprot_id: str, gene_name: str = None) -> Dict:
@@ -757,6 +692,11 @@ class ProteinAPIClient:
                     wiki_page = wiki_search[0]
                     wiki_title = wiki_page.get('title')
                     wiki_snippet = wiki_page.get('snippet')
+                    
+                    # Clean HTML tags and entities from snippet
+                    if wiki_snippet:
+                        wiki_snippet = re.sub(r'<[^>]+>', '', wiki_snippet)  # Remove HTML tags
+                        wiki_snippet = html.unescape(wiki_snippet)  # Convert HTML entities
             else:
                 st.warning("Wikipedia returned empty response")
         except requests.exceptions.RequestException as e:
@@ -812,141 +752,6 @@ class ProteinAPIClient:
             st.error(f"Error parsing PubMed data: {str(e)}")
         return papers
 
-    async def fetch_chembl_ligands(self, uniprot_id: str, gene_name: str) -> dict:
-        """
-        Fetch ChEMBL ligands/compounds associated with a protein target.
-        Returns top ligands with bioactivity data.
-        """
-        import requests
-        cache_key = f"chembl_{uniprot_id}"
-        cached = self.cache.get(cache_key)
-        if cached:
-            return cached
-        
-        try:
-            target_id = None
-            headers = {
-                'User-Agent': 'OmniBiMol/1.0 (Protein Analysis Platform; +http://github.com)'
-            }
-            
-            # Step 1: Search for target by gene name (most reliable)
-            chembl_url = "https://www.ebi.ac.uk/chembl/api/data/target"
-            
-            # Try gene name search first with pref_name
-            search_params = {
-                'format': 'json',
-                'limit': 5,
-                'pref_name__icontains': gene_name
-            }
-            response = requests.get(chembl_url, params=search_params, headers=headers, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('results') and len(data['results']) > 0:
-                    # Filter for protein targets
-                    for result in data['results']:
-                        if result.get('target_type') in ['SINGLE PROTEIN', 'PROTEIN COMPLEX']:
-                            target_id = result.get('target_chembl_id')
-                            break
-            
-            # If not found by name, try by target synonym
-            if not target_id:
-                search_params = {
-                    'format': 'json',
-                    'limit': 5,
-                    'target_synonym__icontains': gene_name
-                }
-                response = requests.get(chembl_url, params=search_params, headers=headers, timeout=10)
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get('results') and len(data['results']) > 0:
-                        for result in data['results']:
-                            if result.get('target_type') in ['SINGLE PROTEIN', 'PROTEIN COMPLEX']:
-                                target_id = result.get('target_chembl_id')
-                                break
-            
-            # If still not found, try UniProt ID
-            if not target_id:
-                search_params = {
-                    'format': 'json',
-                    'limit': 5,
-                    'target_synonym__icontains': uniprot_id
-                }
-                response = requests.get(chembl_url, params=search_params, headers=headers, timeout=10)
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get('results') and len(data['results']) > 0:
-                        for result in data['results']:
-                            if result.get('target_type') in ['SINGLE PROTEIN', 'PROTEIN COMPLEX']:
-                                target_id = result.get('target_chembl_id')
-                                break
-            
-            if not target_id:
-                return {"available": False, "ligands": [], "gene_name": gene_name}
-            
-            # Step 2: Get activities/compounds for this target
-            activities_url = "https://www.ebi.ac.uk/chembl/api/data/activity"
-            activity_params = {
-                'format': 'json',
-                'limit': 30,
-                'target_chembl_id': target_id
-            }
-            
-            response = requests.get(activities_url, params=activity_params, headers=headers, timeout=10)
-            if response.status_code != 200:
-                return {"available": False, "ligands": [], "gene_name": gene_name}
-            
-            data = response.json()
-            ligands = []
-            seen = set()
-            
-            for activity in data.get('results', []):
-                compound_chembl_id = activity.get('molecule_chembl_id')
-                if not compound_chembl_id or compound_chembl_id in seen:
-                    continue
-                
-                seen.add(compound_chembl_id)
-                
-                try:
-                    # Get compound details
-                    compound_url = f"https://www.ebi.ac.uk/chembl/api/data/molecule/{compound_chembl_id}"
-                    compound_response = requests.get(compound_url, params={'format': 'json'}, headers=headers, timeout=10)
-                    if compound_response.status_code == 200:
-                        compound_data = compound_response.json()
-                        
-                        ligands.append({
-                            'name': activity.get('ligand_name', compound_data.get('pref_name', 'Unknown')),
-                            'chembl_id': compound_chembl_id,
-                            'canonical_smiles': compound_data.get('canonical_smiles', ''),
-                            'mw': compound_data.get('molecular_weight'),
-                            'logp': compound_data.get('alogp'),
-                            'hbd': compound_data.get('num_h_donors'),
-                            'hba': compound_data.get('num_h_acceptors'),
-                            'activity_type': activity.get('type', 'Unknown'),
-                            'activity_value': activity.get('value'),
-                            'activity_unit': activity.get('units', ''),
-                            'chembl_url': f"https://www.ebi.ac.uk/chembl/compound_report_card/{compound_chembl_id}/"
-                        })
-                        
-                        if len(ligands) >= 10:
-                            break
-                except Exception:
-                    continue
-            
-            result = {
-                "available": len(ligands) > 0,
-                "target_id": target_id,
-                "ligands": ligands,
-                "gene_name": gene_name
-            }
-            
-            self.cache.set(cache_key, result)
-            return result
-            
-        except requests.exceptions.Timeout:
-            return {"available": False, "ligands": [], "gene_name": gene_name}
-        except Exception as e:
-            return {"available": False, "ligands": [], "gene_name": gene_name}
-        
     async def run_blast_search(self, sequence: str, uniprot_id: str) -> Dict:
         """
         Run BLAST search against NCBI nr database
@@ -1486,14 +1291,28 @@ class ProteinAPIClient:
                             
                             molecule = mol_data.get("molecule_structures", {})
                             
+                            # Extract compound name with fallback logic
+                            compound_name = mol_data.get("pref_name")
+                            if not compound_name and mol_data.get("molecule_synonyms"):
+                                synonyms = mol_data["molecule_synonyms"]
+                                if synonyms and len(synonyms) > 0:
+                                    compound_name = synonyms[0].get("synonyms")
+                            if not compound_name:
+                                compound_name = f"Compound {molecule_chembl_id}"
+                            
                             ligands.append({
                                 "chembl_id": molecule_chembl_id,
-                                "name": mol_data.get("pref_name", molecule_chembl_id),
+                                "name": compound_name,
+                                "canonical_smiles": molecule.get("canonical_smiles", ""),
                                 "smiles": molecule.get("canonical_smiles", ""),
                                 "activity_type": activity_type,
                                 "activity_value": activity_value,
                                 "activity_units": activity_units,
                                 "molecular_weight": mol_data.get("molecule_properties", {}).get("full_mwt"),
+                                "mw": mol_data.get("molecule_properties", {}).get("full_mwt"),
+                                "logp": mol_data.get("molecule_properties", {}).get("alogp"),
+                                "hbd": mol_data.get("molecule_properties", {}).get("hbd"),
+                                "hba": mol_data.get("molecule_properties", {}).get("hba"),
                                 "chembl_url": f"https://www.ebi.ac.uk/chembl/compound_report_card/{molecule_chembl_id}/"
                             })
                             
@@ -1654,3 +1473,146 @@ class ProteinAPIClient:
             "exhaustiveness": 8,
             "simulated": True  # Flag indicating this is simulated
         }
+
+
+
+
+
+    async def fetch_string_ppi(self, gene_name: str, uniprot_id: str, limit: int = 10) -> Dict:
+        """
+        Fetch protein-protein interactions from STRING database
+        STRING provides experimentally validated and predicted interactions
+        """
+        cache_key = f"string_ppi_{uniprot_id}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # STRING API endpoint
+                # First, get STRING ID from gene name
+                base_url = "https://string-db.org/api/json/get_string_ids"
+                
+                params = {
+                    "identifiers": gene_name,
+                    "species": 9606,  # Homo sapiens
+                    "limit": 1
+                }
+                
+                response = await client.post(base_url, data=params)
+                response.raise_for_status()
+                id_data = response.json()
+                
+                if not id_data or len(id_data) == 0:
+                    return {
+                        "available": False,
+                        "gene_name": gene_name,
+                        "interactions": [],
+                        "error": "Protein not found in STRING database"
+                    }
+                
+                string_id = id_data[0].get("stringId")
+                
+                # Get interaction partners
+                interaction_url = "https://string-db.org/api/json/interaction_partners"
+                
+                interaction_params = {
+                    "identifiers": string_id,
+                    "species": 9606,
+                    "limit": limit,
+                    "required_score": 400  # Medium confidence (0-1000 scale)
+                }
+                
+                interaction_response = await client.post(interaction_url, data=interaction_params)
+                interaction_response.raise_for_status()
+                interaction_data = interaction_response.json()
+                
+                # Parse interactions
+                interactions = []
+                
+                for partner in interaction_data:
+                    partner_name = partner.get("preferredName_B", partner.get("stringId_B", "Unknown"))
+                    # STRING API returns score on 0-1 scale, convert to 0-1000 scale for consistency
+                    raw_score = partner.get("score", 0)
+                    combined_score = int(raw_score * 1000) if raw_score else 0
+                    
+                    # Get evidence types from individual scores
+                    evidence = []
+                    if partner.get("escore", 0) > 0:  # Experimental
+                        evidence.append("Experimental")
+                    if partner.get("dscore", 0) > 0:  # Database
+                        evidence.append("Database")
+                    if partner.get("tscore", 0) > 0:  # Text mining
+                        evidence.append("Text mining")
+                    if partner.get("ascore", 0) > 0:  # Co-expression
+                        evidence.append("Co-expression")
+                    if partner.get("fscore", 0) > 0:  # Fusion
+                        evidence.append("Fusion")
+                    if partner.get("pscore", 0) > 0:  # Phylogenetic
+                        evidence.append("Phylogenetic")
+                    if partner.get("nscore", 0) > 0:  # Neighborhood
+                        evidence.append("Neighborhood")
+                    
+                    # Confidence level based on converted score (0-1000 scale)
+                    # Official STRING thresholds (0-1 scale): 0.15=Low, 0.40=Medium, 0.70=High, 0.90=Highest
+                    # Converted to 0-1000 scale: 150=Low, 400=Medium, 700=High, 900=Highest
+                    if combined_score >= 900:
+                        confidence = "Highest"
+                    elif combined_score >= 700:
+                        confidence = "High"
+                    elif combined_score >= 400:
+                        confidence = "Medium"
+                    else:
+                        confidence = "Low"
+                    
+                    interactions.append({
+                        "partner_name": partner_name,
+                        "partner_id": partner.get("stringId_B", ""),
+                        "combined_score": combined_score,
+                        "confidence": confidence,
+                        "evidence_types": ", ".join(evidence) if evidence else "Predicted",
+                        "experimental_score": int(partner.get("escore", 0) * 1000),
+                        "database_score": int(partner.get("dscore", 0) * 1000),
+                        "textmining_score": int(partner.get("tscore", 0) * 1000),
+                        "coexpression_score": int(partner.get("ascore", 0) * 1000),
+                        "fusion_score": int(partner.get("fscore", 0) * 1000),
+                        "phylogenetic_score": int(partner.get("pscore", 0) * 1000),
+                        "neighborhood_score": int(partner.get("nscore", 0) * 1000)
+                    })
+                
+                # Sort by combined score
+                interactions = sorted(interactions, key=lambda x: x["combined_score"], reverse=True)
+                
+                # Get network image URL
+                network_url = f"https://string-db.org/api/image/network?identifiers={string_id}&species=9606&limit={limit}"
+                
+                result = {
+                    "available": len(interactions) > 0,
+                    "gene_name": gene_name,
+                    "string_id": string_id,
+                    "interactions": interactions,
+                    "interaction_count": len(interactions),
+                    "network_image_url": network_url,
+                    "string_url": f"https://string-db.org/network/{string_id}"
+                }
+                
+                self.cache.set(cache_key, result)
+                return result
+                
+        except httpx.HTTPStatusError as e:
+            st.warning(f"STRING API error: {e.response.status_code}")
+            return {
+                "available": False,
+                "gene_name": gene_name,
+                "interactions": [],
+                "error": f"STRING API error: {e.response.status_code}"
+            }
+        except Exception as e:
+            st.warning(f"STRING PPI fetch error: {str(e)}")
+            return {
+                "available": False,
+                "gene_name": gene_name,
+                "interactions": [],
+                "error": str(e)
+            }

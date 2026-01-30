@@ -1154,8 +1154,15 @@ class ProteinVisualizer:
         
         <script>
             function selectForDocking(chemblId, name) {
-                alert('Docking simulation for ' + name + ' (' + chemblId + ')');
-                // In production, this would trigger docking calculation
+                // Send message to Streamlit parent window
+                window.parent.postMessage({
+                    type: 'streamlit:setComponentValue',
+                    data: {
+                        chembl_id: chemblId,
+                        name: name,
+                        action: 'dock'
+                    }
+                }, '*');
             }
         </script>
         """
@@ -1218,3 +1225,224 @@ class ProteinVisualizer:
                     annotation_text="Moderate binding", annotation_position="right")
         
         return fig
+
+
+    @staticmethod
+    def create_ppi_network_chart(interactions: list, query_protein: str) -> go.Figure:
+        """
+        Create network graph for protein-protein interactions
+        """
+        if not interactions:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No protein interactions available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16, color="gray")
+            )
+            fig.update_layout(height=400)
+            return fig
+        
+        import math
+        
+        # Create circular layout
+        n = len(interactions) + 1  # +1 for query protein
+        
+        # Query protein at center
+        node_x = [0]
+        node_y = [0]
+        node_names = [query_protein]
+        node_colors = ['#d62728']  # Red for query
+        node_sizes = [30]
+        
+        # Partner proteins in circle
+        for i, interaction in enumerate(interactions):
+            angle = 2 * math.pi * i / len(interactions)
+            x = math.cos(angle)
+            y = math.sin(angle)
+            
+            node_x.append(x)
+            node_y.append(y)
+            node_names.append(interaction['partner_name'])
+            
+            # Color by confidence
+            if interaction['confidence'] == 'Highest':
+                node_colors.append('#1f77b4')  # Dark blue for highest
+            elif interaction['confidence'] == 'High':
+                node_colors.append('#2ca02c')  # Green for high
+            elif interaction['confidence'] == 'Medium':
+                node_colors.append('#ff7f0e')  # Orange for medium
+            else:
+                node_colors.append('#7f7f7f')  # Gray for low
+            
+            # Size by score
+            size = 10 + (interaction['combined_score'] / 1000) * 20
+            node_sizes.append(size)
+        
+        # Create edges grouped by confidence level
+        edge_groups = {
+            'Highest': {'x': [], 'y': [], 'color': 'rgba(31, 119, 180, 0.6)'},
+            'High': {'x': [], 'y': [], 'color': 'rgba(44, 160, 44, 0.5)'},
+            'Medium': {'x': [], 'y': [], 'color': 'rgba(255, 127, 14, 0.5)'},
+            'Low': {'x': [], 'y': [], 'color': 'rgba(127, 127, 127, 0.3)'}
+        }
+        
+        for i in range(len(interactions)):
+            conf = interactions[i]['confidence']
+            # Line from center to partner
+            edge_groups[conf]['x'].extend([0, node_x[i+1], None])
+            edge_groups[conf]['y'].extend([0, node_y[i+1], None])
+        
+        # Create figure
+        fig = go.Figure()
+        
+        # Add edges as separate traces for each confidence level
+        for conf_level, edges in edge_groups.items():
+            if edges['x']:  # Only add if there are edges for this confidence
+                fig.add_trace(go.Scatter(
+                    x=edges['x'],
+                    y=edges['y'],
+                    mode='lines',
+                    line=dict(color=edges['color'], width=2),
+                    hoverinfo='none',
+                    name=f"{conf_level} confidence",
+                    showlegend=False
+                ))
+        
+        # Add nodes
+        hover_text = []
+        for i, name in enumerate(node_names):
+            if i == 0:
+                hover_text.append(f"<b>{name}</b><br>Query Protein")
+            else:
+                interaction = interactions[i-1]
+                hover_text.append(
+                    f"<b>{name}</b><br>"
+                    f"Score: {interaction['combined_score']}/1000<br>"
+                    f"Confidence: {interaction['confidence']}<br>"
+                    f"Evidence: {interaction['evidence_types']}"
+                )
+        
+        fig.add_trace(go.Scatter(
+            x=node_x,
+            y=node_y,
+            mode='markers+text',
+            marker=dict(
+                size=node_sizes,
+                color=node_colors,
+                line=dict(color='white', width=2)
+            ),
+            text=node_names,
+            textposition='top center',
+            textfont=dict(size=10),
+            hovertext=hover_text,
+            hoverinfo='text',
+            showlegend=False
+        ))
+        
+        fig.update_layout(
+            title="Protein-Protein Interaction Network",
+            height=600,
+            showlegend=False,
+            hovermode='closest',
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+            plot_bgcolor='white',
+            margin=dict(l=20, r=20, t=50, b=20)
+        )
+        
+        return fig
+
+    @staticmethod
+    def create_ppi_table_html(interactions: list) -> str:
+        """
+        Create formatted HTML table for PPI data
+        """
+        if not interactions:
+            return "<p style='text-align:center; color:gray;'>No interactions found</p>"
+        
+        html = """
+        <style>
+            .ppi-table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 20px 0;
+                font-size: 13px;
+            }
+            .ppi-table th {
+                background-color: #1f77b4;
+                color: white;
+                padding: 10px;
+                text-align: left;
+                font-weight: bold;
+            }
+            .ppi-table td {
+                padding: 8px 10px;
+                border-bottom: 1px solid #ddd;
+            }
+            .ppi-table tr:hover {
+                background-color: #f5f5f5;
+            }
+            .confidence-high {
+                background-color: #d4edda;
+                color: #155724;
+                padding: 2px 8px;
+                border-radius: 3px;
+                font-weight: bold;
+            }
+            .confidence-medium {
+                background-color: #fff3cd;
+                color: #856404;
+                padding: 2px 8px;
+                border-radius: 3px;
+                font-weight: bold;
+            }
+            .confidence-low {
+                background-color: #f8d7da;
+                color: #721c24;
+                padding: 2px 8px;
+                border-radius: 3px;
+                font-weight: bold;
+            }
+        </style>
+        
+        <table class="ppi-table">
+            <thead>
+                <tr>
+                    <th style="width: 25%">Partner Protein</th>
+                    <th style="width: 15%">Combined Score</th>
+                    <th style="width: 15%">Confidence</th>
+                    <th style="width: 45%">Evidence Types</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+        
+        for interaction in interactions:
+            partner = interaction['partner_name']
+            score = interaction['combined_score']
+            confidence = interaction['confidence']
+            evidence = interaction['evidence_types']
+            
+            if confidence == "High":
+                conf_class = "confidence-high"
+            elif confidence == "Medium":
+                conf_class = "confidence-medium"
+            else:
+                conf_class = "confidence-low"
+            
+            html += f"""
+            <tr>
+                <td><strong>{partner}</strong></td>
+                <td>{score}/1000</td>
+                <td><span class="{conf_class}">{confidence}</span></td>
+                <td>{evidence}</td>
+            </tr>
+            """
+        
+        html += """
+            </tbody>
+        </table>
+        """
+        
+        return html

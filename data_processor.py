@@ -38,7 +38,6 @@ class DataProcessor:
         return df_pivot
     
     @staticmethod
-    @staticmethod
     def create_summary_table(uniprot_data: Dict, tissue_df: pd.DataFrame, 
                             subcellular_df: pd.DataFrame, alphafold_data: Dict = None, 
                             pdb_data: Dict = None, kegg_data: Dict = None,
@@ -57,31 +56,6 @@ class DataProcessor:
         pathway_count = 0
         if kegg_data and kegg_data.get('available'):
             pathway_count = len(kegg_data.get('pathways', []))
-        
-        summary = {
-            "Metric": [
-                "UniProt ID",
-                "Sequence Length",
-                "Molecular Weight (Da)",
-                "3D Structure",
-                "KEGG Pathways",
-                "Tissues with Expression",
-                "High Expression Tissues",
-                "Subcellular Locations",
-                "GO Terms (Total)"
-            ],
-            "Value": [
-                uniprot_data.get("uniprot_id", "N/A"),
-                f"{uniprot_data.get('sequence_length', 0):,}",
-                f"{uniprot_data.get('mass', 0):,.0f}",
-                structure_status,
-                pathway_count if pathway_count > 0 else "Not found",
-                len(tissue_df[tissue_df["level_numeric"] > 0]) if not tissue_df.empty else 0,
-                len(tissue_df[tissue_df["level"] == "High"]) if not tissue_df.empty else 0,
-                len(subcellular_df) if not subcellular_df.empty else 0,
-                sum(len(v) for v in uniprot_data.get("go_terms", {}).values())
-            ]
-        }
 
         # Ligand count
         ligand_count = 0
@@ -95,8 +69,8 @@ class DataProcessor:
                 "Molecular Weight (Da)",
                 "3D Structure",
                 "KEGG Pathways",
-                "Known Ligands",  # Add this
-                "Tissues with Expression",
+                "Known Ligands",
+                "Tissues with Expression (HPA)",
                 "High Expression Tissues",
                 "Subcellular Locations",
                 "GO Terms (Total)"
@@ -107,7 +81,7 @@ class DataProcessor:
                 f"{uniprot_data.get('mass', 0):,.0f}",
                 structure_status,
                 pathway_count if pathway_count > 0 else "Not found",
-                ligand_count if ligand_count > 0 else "Not found",  # Add this
+                ligand_count if ligand_count > 0 else "Not found",
                 len(tissue_df[tissue_df["level_numeric"] > 0]) if not tissue_df.empty else 0,
                 len(tissue_df[tissue_df["level"] == "High"]) if not tissue_df.empty else 0,
                 len(subcellular_df) if not subcellular_df.empty else 0,
