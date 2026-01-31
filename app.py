@@ -403,92 +403,176 @@ def main():
             if sequence:
                 st.info("""
                 **About BLAST Search:**
-                - Searches for similar proteins across all organisms
-                - Shows top 10 matches from NCBI nr database
-                - Takes 30-60 seconds to complete
-                - Results are cached for 24 hours
+                - Searches for similar proteins across human proteome
+                - Uses full sequence for maximum accuracy
+                - Returns top 15 matches from NCBI nr database
+                - Results are cached for 24 hours after first search
                 """)
                 
-                # Check if BLAST results already exist
+                # Check if BLAST results already exist in cache
                 if 'blast_results' not in st.session_state or \
-                   st.session_state.get('blast_protein_id') != st.session_state.current_uniprot_id:
+                st.session_state.get('blast_protein_id') != st.session_state.current_uniprot_id:
                     
-                    run_blast = st.button("🚀 Run BLAST Search", key="blast_run_search", type="primary")
+                    # Show sequence info before running
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.markdown(f"**Full sequence length:** {len(sequence)} amino acids | **Target hits:** 15")
+                    with col2:
+                        run_blast = st.button("🚀 Run BLAST Search", type="primary", key="blast_run_search")
                     
                     if run_blast:
-                        with st.spinner("🔬 Running BLAST search... This may take 30-60 seconds..."):
+                        # Create placeholder for live status updates
+                        status_placeholder = st.empty()
+                        progress_placeholder = st.empty()
+                        
+                        status_placeholder.info("📤 Submitting full sequence to NCBI BLAST...")
+                        
+                        # Run BLAST with live updates
+                        start_time = time.time()
+                        
+                        with st.spinner("🔬 Running BLAST search... Searching nr database for top 15 matches..."):
                             blast_results = asyncio.run(
                                 st.session_state.api_client.run_blast_search(
                                     sequence,
                                     st.session_state.current_uniprot_id
                                 )
                             )
-                            
-                            st.session_state.blast_results = blast_results
-                            st.session_state.blast_protein_id = st.session_state.current_uniprot_id
-                            st.rerun()
+                        
+                        elapsed = time.time() - start_time
+                        
+                        # Clear status messages
+                        status_placeholder.empty()
+                        progress_placeholder.empty()
+                        
+                        # Store results
+                        st.session_state.blast_results = blast_results
+                        st.session_state.blast_protein_id = st.session_state.current_uniprot_id
+                        st.session_state.blast_time = elapsed
+                        st.rerun()
                 
                 # Display BLAST results if available
                 if 'blast_results' in st.session_state and \
-                   st.session_state.get('blast_protein_id') == st.session_state.current_uniprot_id:
+                st.session_state.get('blast_protein_id') == st.session_state.current_uniprot_id:
                     
                     blast_data = st.session_state.blast_results
                     
                     if blast_data.get('available') and blast_data.get('hits'):
-                        st.success(f"✅ Found {len(blast_data['hits'])} homologous proteins")
+                        elapsed = st.session_state.get('blast_time', 0)
+                        hits = blast_data['hits']
                         
-                        # Display results table
-                        blast_table_html = ProteinVisualizer.create_blast_results_table_html(blast_data['hits'])
-                        st.components.v1.html(blast_table_html, height=600, scrolling=True)
+                        # Success message
+                        st.success(f"✅ Found {len(hits)} homologous proteins in {elapsed:.1f}s")
                         
-                        # Download results
-                        blast_df = pd.DataFrame(blast_data['hits'])
-                        csv_blast = blast_df.to_csv(index=False)
+                        # Summary metrics
+                        col1, col2, col3, col4 = st.columns(4)
                         
-                        col1, col2 = st.columns([3, 1])
                         with col1:
-                            st.caption("""
-                            **Interpretation:**
-                            - **Identity**: Percentage of identical amino acids
-                            - **Coverage**: Percentage of query sequence aligned
-                            - **E-value**: Lower values indicate more significant matches
+                            st.metric("Total Hits", len(hits))
+                        with col2:
+                            high_identity = len([h for h in hits if h['identity_percent'] >= 80])
+                            st.metric("High Identity (≥80%)", high_identity)
+                        with col3:
+                            avg_identity = sum([h['identity_percent'] for h in hits]) / len(hits)
+                            st.metric("Avg Identity", f"{avg_identity:.1f}%")
+                        with col4:
+                            st.metric("Database", blast_data.get('database', 'nr'))
+                        
+                        st.markdown("---")
+                        
+                        # Results table
+                        blast_table_html = ProteinVisualizer.create_blast_results_table_html(hits)
+                        st.components.v1.html(blast_table_html, height=800, scrolling=True)
+                        
+                        # Interpretation guide
+                        st.subheader("📊 Interpretation Guide")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.markdown("""
+                            **Identity Levels:**
+                            - 🟢 **≥80%** - Highly conserved orthologs
+                            - 🟡 **40-80%** - Related proteins (homologs)
+                            - 🔴 **<40%** - Distant or unrelated
+                            
+                            **Coverage:**
+                            - Percentage of query sequence aligned
+                            - Higher = more complete alignment
                             """)
                         with col2:
+                            st.markdown("""
+                            **E-value:**
+                            - Lower = more significant match
+                            - < 1e-10: Very significant
+                            - < 0.01: Significant
+                            - > 1: Not significant
+                            
+                            **Similarity:**
+                            - Includes conservative substitutions
+                            - Always ≥ Identity percentage
+                            """)
+                        
+                        # Download options
+                        st.markdown("---")
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            blast_df = pd.DataFrame(hits)
+                            csv_blast = blast_df.to_csv(index=False)
                             st.download_button(
-                                "📥 Download Results",
+                                "📥 Download Results (CSV)",
                                 csv_blast,
                                 f"{st.session_state.current_uniprot_id}_blast_results.csv",
-                                "text/csv"
+                                "text/csv",
+                                key="blast_download_csv"
                             )
                         
-                        # Option to run new search
-                        if st.button("🔄 Run New BLAST Search", key="blast_run_new_search"):
+                        with col2:
+                            # Generate FASTA of hit accessions for bulk download
+                            accessions = "\n".join([f">{h['accession']} {h['organism']}\n# Identity: {h['identity_percent']}%" for h in hits])
+                            st.download_button(
+                                "📥 Download Accession List",
+                                accessions,
+                                f"{st.session_state.current_uniprot_id}_blast_accessions.txt",
+                                "text/plain",
+                                key="blast_download_accessions"
+                            )
+                        
+                        # Run new search option
+                        if st.button("🔄 Run New BLAST Search", key="blast_run_new"):
+                            del st.session_state.blast_results
+                            del st.session_state.blast_protein_id
+                            if 'blast_time' in st.session_state:
+                                del st.session_state.blast_time
+                            st.rerun()
+                    
+                    elif blast_data.get('error'):
+                        error_msg = blast_data.get('error', '')
+                        st.error(f"❌ BLAST search failed: {error_msg}")
+                        
+                        # Context-specific tips
+                        if "timed out" in error_msg.lower():
+                            st.info("💡 **Tip:** NCBI servers may be busy. Results typically arrive in 30-90 seconds. Try again in a moment.")
+                        elif "failed" in error_msg.lower():
+                            st.info("💡 **Tip:** NCBI server encountered an error. This is temporary - please try again.")
+                        else:
+                            st.info("💡 **Tip:** Check your internet connection and try again.")
+                        
+                        if st.button("🔄 Try Again", key="blast_error_retry"):
                             del st.session_state.blast_results
                             del st.session_state.blast_protein_id
                             st.rerun()
                     
-                    elif blast_data.get('error'):
-                        error_msg = blast_data.get('error')
-                        st.error(f"❌ BLAST search failed: {error_msg}")
+                    else:
+                        st.warning("⚠️ No significant matches found in nr database")
                         
-                        # Provide helpful suggestions
-                        if "timed out" in error_msg.lower():
-                            st.info("💡 **Tip:** BLAST searches can take 1-2 minutes for long sequences. Try again with a shorter sequence.")
-                        elif "closed" in error_msg.lower():
-                            st.info("💡 **Tip:** Network connection issue. Please try again.")
-                        else:
-                            st.info("💡 **Tip:** Try searching with a shorter protein sequence or check your internet connection.")
-                        
-                        if st.button("🔄 Try Again", key="blast_try_again"):
+                        if st.button("🔄 Try Again", key="blast_no_results_retry"):
                             del st.session_state.blast_results
                             del st.session_state.blast_protein_id
                             st.rerun()
-                    else:
-                        st.warning("⚠️ No significant matches found")
             
             else:
                 st.warning("⚠️ No sequence data available for BLAST search")
-        
+
         # Tab 4: EMBL Features & Needle Alignment
         with sequence_tabs[3]:
             st.subheader("EMBL-EBI Sequence Analysis")
@@ -1289,13 +1373,13 @@ def main():
                 # Download ligand data
                 ligand_df = pd.DataFrame([
                     {
-                        "ChEMBL_ID": l['chembl_id'],
-                        "Name": l['name'],
-                        "SMILES": l.get('smiles', ''),
-                        "Activity_Type": l['activity_type'],
-                        "Activity_Value": l['activity_value'],
-                        "Units": l['activity_units'],
-                        "Molecular_Weight": l.get('molecular_weight', 'N/A')
+                        "ChEMBL_ID": str(l['chembl_id']),
+                        "Name": str(l['name']),
+                        "SMILES": str(l.get('smiles', '')),
+                        "Activity_Type": str(l['activity_type']),
+                        "Activity_Value": str(l['activity_value']) if l['activity_value'] is not None else 'N/A',
+                        "Units": str(l['activity_units']),
+                        "Molecular_Weight": str(l.get('molecular_weight', 'N/A'))
                     }
                     for l in ligands
                 ])
@@ -1484,8 +1568,12 @@ def main():
                 # Detailed modes table
                 st.subheader("📋 Binding Mode Details")
                 
-                modes_df = pd.DataFrame(results.get('modes', []))
-                st.dataframe(modes_df, width='stretch', hide_index=True)
+                modes_data = results.get('modes', [])
+                if modes_data:
+                    modes_df = pd.DataFrame(modes_data)
+                    # Convert all columns to strings for Arrow compatibility
+                    modes_df = modes_df.astype(str)
+                    st.dataframe(modes_df, width='stretch', hide_index=True)
                 
                 # Interpretation
                 st.subheader("💡 Interpretation")

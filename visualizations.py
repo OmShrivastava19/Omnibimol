@@ -695,6 +695,7 @@ class ProteinVisualizer:
     def create_blast_results_table_html(blast_hits: list) -> str:
         """
         Create formatted HTML table for BLAST results
+        Displays all new fields: similarity, gaps, coverage, query range
         """
         if not blast_hits:
             return "<p style='text-align:center; color:gray;'>No BLAST results available</p>"
@@ -705,110 +706,146 @@ class ProteinVisualizer:
                 width: 100%;
                 border-collapse: collapse;
                 margin: 20px 0;
-                font-size: 13px;
+                font-size: 12px;
             }
             .blast-table th {
                 background-color: #2ca02c;
                 color: white;
-                padding: 10px;
+                padding: 9px 8px;
                 text-align: left;
                 font-weight: bold;
-                font-size: 12px;
+                position: sticky;
+                top: 0;
             }
             .blast-table td {
-                padding: 8px 10px;
+                padding: 7px 8px;
                 border-bottom: 1px solid #ddd;
             }
+            .blast-table tr:nth-child(even) {
+                background-color: #f9f9f9;
+            }
             .blast-table tr:hover {
-                background-color: #f5f5f5;
+                background-color: #e8f5e9;
             }
             .accession-link {
                 color: #1f77b4;
                 text-decoration: none;
                 font-family: monospace;
-                font-weight: 500;
+                font-weight: 600;
+                font-size: 11px;
             }
             .accession-link:hover {
                 text-decoration: underline;
             }
             .organism {
                 font-style: italic;
-                color: #666;
+                color: #555;
+                font-size: 11px;
             }
             .identity-high {
                 background-color: #d4edda;
                 color: #155724;
-                padding: 2px 6px;
+                padding: 2px 7px;
                 border-radius: 3px;
                 font-weight: bold;
             }
             .identity-medium {
                 background-color: #fff3cd;
                 color: #856404;
-                padding: 2px 6px;
+                padding: 2px 7px;
                 border-radius: 3px;
                 font-weight: bold;
             }
             .identity-low {
                 background-color: #f8d7da;
                 color: #721c24;
-                padding: 2px 6px;
+                padding: 2px 7px;
                 border-radius: 3px;
                 font-weight: bold;
             }
             .e-value {
                 font-family: monospace;
                 font-size: 11px;
+                color: #333;
+            }
+            .hit-number {
+                font-weight: bold;
+                color: #2ca02c;
+                text-align: center;
+            }
+            .description-cell {
+                max-width: 200px;
+                word-wrap: break-word;
+                color: #444;
             }
         </style>
         
         <table class="blast-table">
             <thead>
                 <tr>
-                    <th style="width: 12%">Accession</th>
-                    <th style="width: 35%">Description</th>
-                    <th style="width: 18%">Organism</th>
-                    <th style="width: 10%">Identity</th>
-                    <th style="width: 10%">Coverage</th>
-                    <th style="width: 15%">E-value</th>
+                    <th style="width: 3%">#</th>
+                    <th style="width: 10%">Accession</th>
+                    <th style="width: 22%">Description</th>
+                    <th style="width: 14%">Organism</th>
+                    <th style="width: 9%">Identity</th>
+                    <th style="width: 9%">Similarity</th>
+                    <th style="width: 9%">Coverage</th>
+                    <th style="width: 8%">Gaps</th>
+                    <th style="width: 10%">E-value</th>
+                    <th style="width: 6%">Score</th>
                 </tr>
             </thead>
             <tbody>
         """
         
-        for hit in blast_hits:
+        for idx, hit in enumerate(blast_hits, 1):
             accession = hit.get('accession', 'N/A')
-            title = hit.get('title', 'Unknown')[:60] + ('...' if len(hit.get('title', '')) > 60 else '')
+            title = hit.get('title', 'Unknown')
             organism = hit.get('organism', 'Unknown')
             identity = hit.get('identity_percent', 0)
+            similarity = hit.get('similarity_percent', 0)
             coverage = hit.get('coverage_percent', 0)
+            gaps = hit.get('gap_percent', 0)
             e_value = hit.get('e_value', 1.0)
+            bit_score = hit.get('bit_score', 0)
+            query_range = hit.get('query_range', 'N/A')
+            ncbi_url = hit.get('ncbi_url', f'https://www.ncbi.nlm.nih.gov/protein/{accession}')
+            
+            # Truncate description
+            short_title = title[:80] + ('...' if len(title) > 80 else '')
             
             # Color code identity
             if identity >= 80:
                 identity_class = "identity-high"
-            elif identity >= 50:
+            elif identity >= 40:
                 identity_class = "identity-medium"
             else:
                 identity_class = "identity-low"
             
             # Format e-value
-            if e_value < 0.0001:
+            if e_value == 0:
+                e_value_str = "0.0"
+            elif e_value < 1e-100:
+                e_value_str = "< 1e-100"
+            elif e_value < 0.0001:
                 e_value_str = f"{e_value:.2e}"
             else:
                 e_value_str = f"{e_value:.4f}"
             
             html += f"""
             <tr>
+                <td class="hit-number">{idx}</td>
                 <td>
-                    <a href="https://www.ncbi.nlm.nih.gov/protein/{accession}" 
-                    target="_blank" class="accession-link">{accession}</a>
+                    <a href="{ncbi_url}" target="_blank" class="accession-link">{accession}</a>
                 </td>
-                <td>{title}</td>
+                <td class="description-cell" title="{title}">{short_title}</td>
                 <td class="organism">{organism}</td>
                 <td><span class="{identity_class}">{identity:.1f}%</span></td>
+                <td>{similarity:.1f}%</td>
                 <td>{coverage:.1f}%</td>
+                <td>{gaps:.1f}%</td>
                 <td class="e-value">{e_value_str}</td>
+                <td>{bit_score:.0f}</td>
             </tr>
             """
         
@@ -818,7 +855,7 @@ class ProteinVisualizer:
         """
         
         return html
-    
+
     @staticmethod
     def create_feature_map(features: list, sequence_length: int) -> go.Figure:
         """

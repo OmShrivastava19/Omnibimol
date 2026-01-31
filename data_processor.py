@@ -76,16 +76,16 @@ class DataProcessor:
                 "GO Terms (Total)"
             ],
             "Value": [
-                uniprot_data.get("uniprot_id", "N/A"),
-                f"{uniprot_data.get('sequence_length', 0):,}",
-                f"{uniprot_data.get('mass', 0):,.0f}",
-                structure_status,
-                pathway_count if pathway_count > 0 else "Not found",
-                ligand_count if ligand_count > 0 else "Not found",
-                len(tissue_df[tissue_df["level_numeric"] > 0]) if not tissue_df.empty else 0,
-                len(tissue_df[tissue_df["level"] == "High"]) if not tissue_df.empty else 0,
-                len(subcellular_df) if not subcellular_df.empty else 0,
-                sum(len(v) for v in uniprot_data.get("go_terms", {}).values())
+                str(uniprot_data.get("uniprot_id", "N/A")),
+                str(f"{uniprot_data.get('sequence_length', 0):,}"),
+                str(f"{uniprot_data.get('mass', 0):,.0f}"),
+                str(structure_status),
+                str(pathway_count if pathway_count > 0 else "Not found"),
+                str(ligand_count if ligand_count > 0 else "Not found"),
+                str(len(tissue_df[tissue_df["level_numeric"] > 0]) if not tissue_df.empty else 0),
+                str(len(tissue_df[tissue_df["level"] == "High"]) if not tissue_df.empty else 0),
+                str(len(subcellular_df) if not subcellular_df.empty else 0),
+                str(sum(len(v) for v in uniprot_data.get("go_terms", {}).values()))
             ]
         }
         

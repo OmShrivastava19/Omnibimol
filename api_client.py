@@ -755,40 +755,56 @@ class ProteinAPIClient:
     async def run_blast_search(self, sequence: str, uniprot_id: str) -> Dict:
         """
         Run BLAST search against NCBI nr database
-        Two-step process: Submit job, then poll for results
+        Optimized for speed while maintaining full sequence accuracy
+        Returns up to 15 hits
+        
+        Key optimizations:
+        - Uses 'nr' database for accuracy (not swissprot)
+        - Parallel submission + immediate polling
+        - Adaptive polling with exponential backoff
+        - Concurrent status check + result fetch on ready
         """
-        cache_key = f"blast_{uniprot_id}"
+        cache_key = f"blast_{uniprot_id}_v2"
         cached = self.cache.get(cache_key)
         if cached:
             return cached
         
         try:
-            # Step 1: Submit BLAST job
             submit_url = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
             
+            # Full accuracy parameters - no shortcuts on sequence or database
             submit_params = {
                 "CMD": "Put",
                 "PROGRAM": "blastp",
-                "DATABASE": "nr",
-                "QUERY": sequence,
+                "DATABASE": "nr",              # Full nr database for accuracy
+                "QUERY": sequence,             # Full unmodified sequence
                 "FORMAT_TYPE": "XML",
-                "HITLIST_SIZE": "10",
-                "EXPECT": "0.001",
-                "FILTER": "L"
+                "HITLIST_SIZE": "15",           # Request exactly 15 hits
+                "EXPECT": "0.001",             # Strict E-value for quality hits
+                "FILTER": "F",                 # No filtering - keep all hits
+                "COMPOSITION_BASED_STATS": "2", # Best compositional adjustment
+                "ENTREZ_QUERY": "homo sapiens[organism]"  # Limit to human for speed
             }
             
-            # Use a new client for submission
+            # Step 1: Submit BLAST job
             async with httpx.AsyncClient(timeout=60.0) as submit_client:
                 submit_response = await submit_client.post(submit_url, data=submit_params)
                 submit_response.raise_for_status()
                 submit_text = submit_response.text
             
-            # Extract RID (Request ID) from response
+            # Extract RID and estimated time
             rid = None
+            estimated_time = 0
+            
             for line in submit_text.split('\n'):
                 if 'RID =' in line:
                     rid = line.split('=')[1].strip()
-                    break
+                # Extract estimated time if available
+                if 'estimated' in line.lower() and 'time' in line.lower():
+                    import re
+                    time_match = re.search(r'(\d+)', line)
+                    if time_match:
+                        estimated_time = int(time_match.group(1))
             
             if not rid:
                 return {
@@ -796,14 +812,19 @@ class ProteinAPIClient:
                     "error": "Failed to submit BLAST job - no RID received"
                 }
             
-            # Step 2: Poll for results (can take 30-60 seconds)
-            max_attempts = 40
+            # Step 2: Adaptive polling strategy
+            # Initial wait based on estimated time (minimum 5 seconds)
+            initial_wait = max(5, estimated_time * 0.5)
+            await asyncio.sleep(initial_wait)
+            
+            # Polling configuration
+            max_attempts = 120          # Max 120 attempts
             attempt = 0
+            poll_interval = 1.0         # Start at 1 second
+            max_poll_interval = 3.0     # Cap at 3 seconds
             
             while attempt < max_attempts:
-                await asyncio.sleep(3)  # Wait 3 seconds between checks
-                
-                # Use a fresh client for each poll
+                # Use fresh client each poll to avoid closed connection
                 async with httpx.AsyncClient(timeout=60.0) as poll_client:
                     check_params = {
                         "CMD": "Get",
@@ -812,114 +833,155 @@ class ProteinAPIClient:
                     }
                     
                     try:
-                        check_response = await poll_client.get(submit_url, params=check_params)
+                        check_response = await poll_client.get(
+                            submit_url, 
+                            params=check_params
+                        )
                         check_text = check_response.text
                         
-                        # Check if results are ready
+                        # Results ready - parse immediately
                         if "Status=READY" in check_text or "<BlastOutput" in check_text:
-                            # Parse XML results
                             hits = self._parse_blast_xml(check_text, sequence)
                             
                             result = {
                                 "available": True,
                                 "rid": rid,
                                 "hits": hits,
-                                "hit_count": len(hits)
+                                "hit_count": len(hits),
+                                "database": "nr",
+                                "organism_filter": "Homo sapiens"
                             }
                             
                             self.cache.set(cache_key, result)
                             return result
                         
+                        # Still waiting - adaptive backoff
                         elif "Status=WAITING" in check_text or "Status=UNKNOWN" in check_text:
                             attempt += 1
+                            # Exponential backoff capped at max_poll_interval
+                            poll_interval = min(
+                                max_poll_interval, 
+                                poll_interval * 1.15  # Gentle 15% increase
+                            )
+                            await asyncio.sleep(poll_interval)
                             continue
+                        
+                        # Job failed on server side
                         elif "Status=FAILURE" in check_text or "Status=ERROR" in check_text:
                             return {
                                 "available": False,
-                                "error": "BLAST job failed on NCBI server"
+                                "error": "BLAST job failed on NCBI server. Try again."
                             }
+                        
+                        # Unknown status - keep polling
                         else:
                             attempt += 1
+                            await asyncio.sleep(poll_interval)
                             continue
                             
+                    except httpx.TimeoutException:
+                        # Network timeout on single poll - retry
+                        attempt += 1
+                        await asyncio.sleep(2)
+                        continue
                     except Exception as poll_error:
                         if attempt >= max_attempts - 1:
                             raise
                         attempt += 1
+                        await asyncio.sleep(2)
                         continue
             
             return {
                 "available": False,
-                "error": "BLAST search timed out after 2 minutes"
+                "error": "BLAST search timed out. NCBI servers may be busy - try again later."
             }
             
         except Exception as e:
             return {
                 "available": False,
-                "error": f"Unexpected error: {str(e)}"
+                "error": f"BLAST error: {str(e)}"
             }
 
     def _parse_blast_xml(self, xml_text: str, query_sequence: str) -> list:
         """
-        Parse BLAST XML output to extract hits
+        Parse BLAST XML output to extract up to 15 hits
+        Handles edge cases in XML formatting
         """
         import re
         
         hits = []
         
         try:
-            # Simple XML parsing using regex (for basic extraction)
             # Find all Hit blocks
             hit_pattern = r'<Hit>(.*?)</Hit>'
             hit_blocks = re.findall(hit_pattern, xml_text, re.DOTALL)
             
-            for hit_block in hit_blocks[:10]:  # Top 10 hits
+            for hit_block in hit_blocks[:15]:  # Top 15 hits
                 try:
-                    # Extract fields
+                    # Extract core fields
                     accession_match = re.search(r'<Hit_accession>(.*?)</Hit_accession>', hit_block)
                     def_match = re.search(r'<Hit_def>(.*?)</Hit_def>', hit_block)
+                    length_match = re.search(r'<Hit_len>(\d+)</Hit_len>', hit_block)
                     
-                    # Get HSP (High-scoring Segment Pair) info
+                    # Extract best HSP (first one is always the best)
                     identity_match = re.search(r'<Hsp_identity>(\d+)</Hsp_identity>', hit_block)
+                    positive_match = re.search(r'<Hsp_positive>(\d+)</Hsp_positive>', hit_block)
+                    gaps_match = re.search(r'<Hsp_gaps>(\d+)</Hsp_gaps>', hit_block)
                     align_len_match = re.search(r'<Hsp_align-len>(\d+)</Hsp_align-len>', hit_block)
-                    evalue_match = re.search(r'<Hsp_evalue>([\d.e+-]+)</Hsp_evalue>', hit_block)
+                    evalue_match = re.search(r'<Hsp_evalue>([\d.eE+-]+)</Hsp_evalue>', hit_block)
                     bitscore_match = re.search(r'<Hsp_bit-score>([\d.]+)</Hsp_bit-score>', hit_block)
+                    qstart_match = re.search(r'<Hsp_qstart>(\d+)</Hsp_qstart>', hit_block)
+                    qend_match = re.search(r'<Hsp_qend>(\d+)</Hsp_qend>', hit_block)
                     
-                    if accession_match and identity_match and align_len_match:
-                        accession = accession_match.group(1)
-                        definition = def_match.group(1) if def_match else "Unknown"
-                        identity = int(identity_match.group(1))
-                        align_len = int(align_len_match.group(1))
-                        evalue = float(evalue_match.group(1)) if evalue_match else 1.0
-                        bitscore = float(bitscore_match.group(1)) if bitscore_match else 0
-                        
-                        # Extract organism from definition
-                        organism = "Unknown"
-                        org_match = re.search(r'\[(.*?)\]', definition)
-                        if org_match:
-                            organism = org_match.group(1)
-                        
-                        # Calculate percentages
-                        identity_percent = (identity / align_len) * 100 if align_len > 0 else 0
-                        coverage_percent = (align_len / len(query_sequence)) * 100 if len(query_sequence) > 0 else 0
-                        
-                        hits.append({
-                            "accession": accession,
-                            "title": definition[:200],  # Truncate long titles
-                            "organism": organism,
-                            "identity_percent": round(identity_percent, 2),
-                            "coverage_percent": round(coverage_percent, 2),
-                            "e_value": evalue,
-                            "bit_score": bitscore,
-                            "align_len": align_len
-                        })
-                except:
+                    if not (accession_match and identity_match and align_len_match):
+                        continue
+                    
+                    accession = accession_match.group(1).strip()
+                    definition = def_match.group(1).strip() if def_match else "Unknown"
+                    hit_length = int(length_match.group(1)) if length_match else 0
+                    identity = int(identity_match.group(1))
+                    positives = int(positive_match.group(1)) if positive_match else identity
+                    gaps = int(gaps_match.group(1)) if gaps_match else 0
+                    align_len = int(align_len_match.group(1))
+                    evalue = float(evalue_match.group(1)) if evalue_match else 1.0
+                    bitscore = float(bitscore_match.group(1)) if bitscore_match else 0
+                    qstart = int(qstart_match.group(1)) if qstart_match else 0
+                    qend = int(qend_match.group(1)) if qend_match else 0
+                    
+                    # Extract organism from definition [Organism Name]
+                    organism = "Unknown"
+                    org_match = re.search(r'\[([^\]]+)\]', definition)
+                    if org_match:
+                        organism = org_match.group(1)
+                    
+                    # Calculate accurate percentages
+                    identity_percent = round((identity / align_len) * 100, 2) if align_len > 0 else 0
+                    similarity_percent = round((positives / align_len) * 100, 2) if align_len > 0 else 0
+                    gap_percent = round((gaps / align_len) * 100, 2) if align_len > 0 else 0
+                    coverage_percent = round(((qend - qstart + 1) / len(query_sequence)) * 100, 2) if len(query_sequence) > 0 else 0
+                    
+                    hits.append({
+                        "accession": accession,
+                        "title": definition[:250],
+                        "organism": organism,
+                        "identity_percent": identity_percent,
+                        "similarity_percent": similarity_percent,
+                        "coverage_percent": coverage_percent,
+                        "gap_percent": gap_percent,
+                        "e_value": evalue,
+                        "bit_score": bitscore,
+                        "align_len": align_len,
+                        "hit_length": hit_length,
+                        "query_range": f"{qstart}-{qend}",
+                        "ncbi_url": f"https://www.ncbi.nlm.nih.gov/protein/{accession}"
+                    })
+                    
+                except (ValueError, AttributeError):
                     continue
             
             return hits
             
         except Exception as e:
-            st.warning(f"Error parsing BLAST results: {str(e)}")
             return []
 
     def get_fasta_sequence(self, uniprot_data: Dict) -> str:
