@@ -11,14 +11,6 @@ import warnings
 warnings.filterwarnings('ignore')
 
 try:
-    from rdkit import Chem
-    from rdkit.Chem import Descriptors, Crippen, Lipinski, rdMolDescriptors
-    RDKIT_AVAILABLE = True
-except ImportError:
-    RDKIT_AVAILABLE = False
-    print("Warning: RDKit not available. Install with: conda install -c conda-forge rdkit")
-
-try:
     from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
     from sklearn.preprocessing import StandardScaler
     from sklearn.model_selection import train_test_split
