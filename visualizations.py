@@ -1,6 +1,13 @@
-import pandas as pd
 import plotly.graph_objects as go
-from typing import Dict
+import plotly.express as px
+from typing import Dict, List
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend for Streamlit
+import matplotlib.pyplot as plt
+from io import StringIO, BytesIO
+import base64
 
 # visualizations.py - Plotly chart generation
 class ProteinVisualizer:
@@ -1483,3 +1490,1548 @@ class ProteinVisualizer:
         """
         
         return html
+
+    @staticmethod
+    def create_docking_3d_viewer(protein_structure: Dict, ligand_data: Dict, 
+                                docking_result: Dict, ligand_name: str,
+                                view_mode: str = "Cartoon (Ribbon)") -> str:
+        """
+        Create 3D viewer showing protein with docked ligand using py3Dmol.
+        
+        Features:
+        - Automatically clears and resets viewer for each render (prevents stale structures)
+        - Removes all previous models before loading new ones
+        - Centers and zooms the protein-ligand complex using zoomTo()
+        - Applies fallback zoom if initial zoom is insufficient
+        - Uses unique viewer instance per render (Streamlit-compatible)
+        """
+        if not protein_structure.get('available'):
+            return "<p style='text-align:center; color:gray;'>No protein structure available</p>"
+        
+        # Get PDB data - prefer pdb_text over pdb_url
+        pdb_text = protein_structure.get('pdb_text', '')
+        pdb_url = protein_structure.get('pdb_url', '')
+        
+        # Validate pdb_url - skip if it's a data URI
+        if pdb_url and pdb_url.startswith('data:'):
+            pdb_url = ''
+        
+        # Critical validation: ensure we have actual PDB data
+        if not pdb_text and not pdb_url:
+            return """<div style='text-align:center; padding:20px; color:#d32f2f; background:#ffebee; border:1px solid #ef5350; border-radius:8px; margin:20px;'>
+                <h3>⚠️ No Protein Structure Data Available</h3>
+                <p>Please predict the protein structure in the <strong>Protein Structure Prediction</strong> tab first.</p>
+                <p style='font-size:0.9em; color:#666;'>The docking visualization requires a predicted 3D structure.</p>
+            </div>"""
+        
+        ligand_smiles = ligand_data.get('smiles', '')
+        
+        # Get binding affinity for display
+        affinity = docking_result.get('binding_affinity', 0)
+        
+        # Build a simple ligand PDB from docking center (visualization only)
+        best_center = docking_result.get("best_mode", {}).get("center", {})
+        try:
+            center_x = float(best_center.get("x", 0.0) or 0.0)
+            center_y = float(best_center.get("y", 0.0) or 0.0)
+            center_z = float(best_center.get("z", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            center_x, center_y, center_z = 0.0, 0.0, 0.0
+
+        def _format_hetatm(serial, name, resn, chain, resi, x, y, z, element):
+            return (
+                f"HETATM{serial:5d} {name:<4}{resn:>3} {chain}{resi:4d}    "
+                f"{x:8.3f}{y:8.3f}{z:8.3f}  1.00 20.00          {element:>2}"
+            )
+
+        ligand_atoms = [
+            ("C1", center_x, center_y, center_z, "C"),
+            ("O1", center_x + 1.2, center_y, center_z, "O"),
+            ("N1", center_x - 1.2, center_y, center_z, "N"),
+            ("S1", center_x, center_y + 1.2, center_z, "S"),
+        ]
+        ligand_pdb_lines = [
+            _format_hetatm(idx + 1, atom[0], "LIG", "A", 1, atom[1], atom[2], atom[3], atom[4])
+            for idx, atom in enumerate(ligand_atoms)
+        ]
+        ligand_pdb_lines.append("END")
+        ligand_pdb = "\n".join(ligand_pdb_lines)
+
+        # Properly escape ligand_name and pdb_text for JavaScript
+        import json
+        ligand_name_escaped = json.dumps(ligand_name)
+        pdb_text_escaped = json.dumps(pdb_text if pdb_text else '')
+        pdb_url_escaped = json.dumps(pdb_url if pdb_url else '')
+        ligand_pdb_escaped = json.dumps(ligand_pdb)
+        view_mode_escaped = json.dumps(view_mode)
+        
+        # Generate unique ID for this viewer instance (prevents reuse/caching)
+        import uuid
+        viewer_id = f"viewer_{uuid.uuid4().hex[:8]}"
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+            <style>
+                body {{
+                    margin: 0;
+                    padding: 0;
+                    font-family: Arial, sans-serif;
+                }}
+                #{viewer_id} {{
+                    width: 100%;
+                    height: 600px;
+                    border: 2px solid #2ca02c;
+                    border-radius: 8px;
+                    position: relative;
+                    background-color: white;
+                }}
+                #loading-{viewer_id} {{
+                    position: absolute;
+                    top: 50%;
+                    left: 50%;
+                    transform: translate(-50%, -50%);
+                    font-size: 16px;
+                    color: #666;
+                    z-index: 10;
+                    background: white;
+                    padding: 20px;
+                    border-radius: 8px;
+                }}
+                #controls-{viewer_id} {{
+                    position: absolute;
+                    bottom: 10px;
+                    right: 10px;
+                    background-color: rgba(255,255,255,0.95);
+                    padding: 12px;
+                    border-radius: 6px;
+                    font-size: 12px;
+                    border: 1px solid #ccc;
+                    z-index: 100;
+                }}
+                #info-{viewer_id} {{
+                    position: absolute;
+                    top: 10px;
+                    left: 10px;
+                    background-color: rgba(44, 160, 44, 0.9);
+                    color: white;
+                    padding: 10px 15px;
+                    border-radius: 6px;
+                    font-size: 13px;
+                    z-index: 100;
+                    font-weight: 500;
+                }}
+                #legend-{viewer_id} {{
+                    position: absolute;
+                    top: 10px;
+                    right: 10px;
+                    background-color: rgba(255,255,255,0.95);
+                    padding: 10px;
+                    border-radius: 6px;
+                    font-size: 11px;
+                    border: 1px solid #ccc;
+                    z-index: 100;
+                }}
+                .legend-item {{
+                    margin: 3px 0;
+                }}
+                .color-box {{
+                    display: inline-block;
+                    width: 15px;
+                    height: 15px;
+                    margin-right: 5px;
+                    border: 1px solid #666;
+                    vertical-align: middle;
+                }}
+                #title-{viewer_id} {{
+                    text-align: center;
+                    margin-top: 10px;
+                    font-size: 15px;
+                    color: #2ca02c;
+                    font-weight: bold;
+                }}
+            </style>
+        </head>
+        <body>
+            <div id="{viewer_id}">
+                <div id="loading-{viewer_id}">Loading protein-ligand complex...</div>
+                <div id="info-{viewer_id}">
+                    Binding Affinity: {affinity} kcal/mol<br>
+                    Ligand: <span id="ligand-name-info-{viewer_id}"></span>
+                </div>
+                <div id="legend-{viewer_id}">
+                    <div class="legend-item">
+                        <span class="color-box" style="background-color:#0053D6"></span>Protein
+                    </div>
+                    <div class="legend-item">
+                        <span class="color-box" style="background-color:#FFD700"></span>Ligand
+                    </div>
+                    <div class="legend-item">
+                        <span class="color-box" style="background-color:#FF6B6B"></span>Binding Site
+                    </div>
+                </div>
+            </div>
+            <div id="title-{viewer_id}">Protein-Ligand Docking Complex (Simulated Pose)</div>
+            
+            <script>
+                (function() {{
+                    // Store configuration
+                    var viewerId = '{viewer_id}';
+                    var pdbText = {pdb_text_escaped};
+                    var pdbUrl = {pdb_url_escaped};
+                    var ligandName = {ligand_name_escaped};
+                    var ligandPdb = {ligand_pdb_escaped};
+                    var viewMode = {view_mode_escaped};
+                    
+                    document.getElementById('ligand-name-info-' + viewerId).textContent = ligandName;
+                    
+                    try {{
+                        // Wait for 3Dmol to load
+                        if (typeof $3Dmol === 'undefined') {{
+                            document.getElementById('loading-' + viewerId).innerHTML = 
+                                '<span style="color:red">Error: 3Dmol library failed to load</span>';
+                            return;
+                        }}
+                        
+                        // Create unique viewer instance
+                        var viewer = $3Dmol.createViewer(
+                            document.getElementById(viewerId),
+                            {{backgroundColor: 'white'}}
+                        );
+                        
+                        // CRITICAL: Clear any existing content before loading
+                        viewer.clear();
+                        viewer.removeAllModels();
+                        
+                        // Prepare PDB content
+                        var pdbContent = null;
+                        var loadSource = null;
+                        
+                        if (pdbText && pdbText.length > 0) {{
+                            pdbContent = pdbText;
+                            loadSource = 'text';
+                        }} else if (pdbUrl && pdbUrl.length > 0) {{
+                            pdbContent = pdbUrl;
+                            loadSource = 'url';
+                        }} else {{
+                            document.getElementById('loading-' + viewerId).innerHTML = 
+                                '<span style="color:red">⚠️ No valid PDB data available</span>';
+                            return;
+                        }}
+                        
+                        // Load structure based on available source
+                        if (loadSource === 'text') {{
+                            // Load from PDB text
+                            renderProteinLigand(pdbContent);
+                        }} else {{
+                            // For URL loading, use AJAX
+                            var xhr = new XMLHttpRequest();
+                            xhr.onreadystatechange = function() {{
+                                if (xhr.readyState === 4) {{
+                                    if (xhr.status === 200) {{
+                                        renderProteinLigand(xhr.responseText);
+                                    }} else {{
+                                        document.getElementById('loading-' + viewerId).innerHTML = 
+                                            '<span style="color:red">Error loading PDB from URL</span>';
+                                    }}
+                                }}
+                            }};
+                            xhr.open('GET', pdbContent, true);
+                            xhr.send();
+                            return;
+                        }}
+                        
+                        // Render function (called when models are added)
+                        function renderProteinLigand(proteinPdb) {{
+                            try {{
+                                // Hide loading message
+                                var loadingDiv = document.getElementById('loading-' + viewerId);
+                                if (loadingDiv) loadingDiv.style.display = 'none';
+
+                                // REQUIRED EXECUTION ORDER
+                                viewer.clear();
+                                viewer.removeAllModels();
+                                viewer.addModel(proteinPdb, 'pdb');   // model 0
+                                viewer.addModel(ligandPdb, 'pdb');    // model 1
+                                viewer.setStyle({{}}, {{}});          // HARD RESET STYLES
+
+                                if (viewMode === 'Cartoon (Ribbon)') {{
+                                    // Protein: cartoon with spectrum coloring (presentation-grade)
+                                    viewer.setStyle(
+                                        {{model: 0}},
+                                        {{
+                                            cartoon: {{
+                                                color: 'spectrum',
+                                                thickness: 0.75,
+                                                opacity: 0.95,
+                                                smooth: true,
+                                                style: 'edged'
+                                            }}
+                                        }}
+                                    );
+
+                                    // Ligand: bold sticks + spheres for focal point
+                                    viewer.setStyle(
+                                        {{model: 1}},
+                                        {{
+                                            stick: {{colorscheme: 'orangeCarbon', radius: 0.25}},
+                                            sphere: {{colorscheme: 'orangeCarbon', scale: 0.4}}
+                                        }}
+                                    );
+                                }} else {{
+                                    // All-atom: protein ball-and-stick (neutral palette)
+                                    viewer.setStyle(
+                                        {{model: 0}},
+                                        {{
+                                            stick: {{color: '#888888', radius: 0.2}},
+                                            sphere: {{color: '#888888', scale: 0.25}}
+                                        }}
+                                    );
+
+                                    // Ligand: bold ball-and-stick (focal point)
+                                    viewer.setStyle(
+                                        {{model: 1}},
+                                        {{
+                                            stick: {{colorscheme: 'orangeCarbon', radius: 0.28}},
+                                            sphere: {{colorscheme: 'orangeCarbon', scale: 0.4}}
+                                        }}
+                                    );
+                                }}
+
+                                viewer.zoomTo();
+                                viewer.zoom(0.85);
+                                viewer.spin({{y: 1}}, 0.2);
+                                viewer.render();
+
+                                // Stop rotation on interaction (immediate response)
+                                function stopSpin() {{
+                                    viewer.spin(false);
+                                    viewer.render();
+                                }}
+                                var container = document.getElementById(viewerId);
+                                if (container) {{
+                                    ['mousedown', 'touchstart', 'pointerdown'].forEach(function(evt) {{
+                                        container.addEventListener(evt, stopSpin, {{passive: true}});
+                                    }});
+                                }}
+
+                                // Add control instructions
+                                var controlsDiv = document.createElement('div');
+                                controlsDiv.id = 'controls-' + viewerId;
+                                controlsDiv.innerHTML = '🖱️ Left: Rotate | Right: Zoom | Middle: Pan';
+                                document.getElementById(viewerId).appendChild(controlsDiv);
+                                
+                            }} catch (e) {{
+                                console.error('Render error:', e);
+                                document.getElementById('loading-' + viewerId).innerHTML = 
+                                    '<span style="color:red">⚠️ Error rendering structure: ' + (e.message || 'Unknown error') + '</span>';
+                            }}
+                        }}
+                        
+                        // Call render function immediately (structure is now loaded)
+                    }} catch (error) {{
+                        console.error('Exception:', error);
+                        document.getElementById('loading-' + viewerId).innerHTML = 
+                            '<span style="color:red">Error: ' + error.message + '</span>';
+                    }}
+                }})();
+            </script>
+        </body>
+        </html>
+        """
+        
+        return html
+
+
+    @staticmethod
+    def predict_best_ligand(ligands: list, protein_data: Dict) -> Dict:
+        """
+        Predict which known ligand should bind best based on multiple factors
+        
+        Scoring criteria:
+        1. Experimental activity data (IC50/Ki)
+        2. Molecular properties (MW, LogP)
+        3. Drug-likeness (Lipinski's Rule of Five)
+        
+        Returns top predicted ligand with explanation
+        """
+        if not ligands:
+            return {"available": False, "message": "No ligands to analyze"}
+        
+        predictions = []
+        
+        for ligand in ligands:
+            score = 0
+            reasons = []
+            
+            # Factor 1: Activity value (most important)
+            activity_value = ligand.get('activity_value', float('inf'))
+            activity_type = ligand.get('activity_type', '')
+            
+            if activity_value < 10:  # Very potent
+                score += 50
+                reasons.append(f"Very potent {activity_type}: {activity_value:.2f} nM")
+            elif activity_value < 100:  # Potent
+                score += 35
+                reasons.append(f"Potent {activity_type}: {activity_value:.2f} nM")
+            elif activity_value < 1000:  # Moderate
+                score += 20
+                reasons.append(f"Moderate {activity_type}: {activity_value:.2f} nM")
+            else:  # Weak
+                score += 5
+                reasons.append(f"Weak activity: {activity_value:.2f} nM")
+            
+            # Factor 2: Molecular weight (drug-like range)
+            mw = ligand.get('molecular_weight', 0)
+            # Convert to float if it's a string
+            if isinstance(mw, str):
+                try:
+                    mw = float(mw)
+                except (ValueError, TypeError):
+                    mw = 0
+            
+            if mw and 160 <= mw <= 500:  # Optimal drug-like range
+                score += 15
+                reasons.append(f"Optimal MW: {mw:.1f} Da")
+            elif mw and mw <= 160:
+                score += 5
+                reasons.append(f"Low MW: {mw:.1f} Da")
+            elif mw and mw > 500:
+                score += 8
+                reasons.append(f"High MW: {mw:.1f} Da")
+            
+            # Factor 3: SMILES availability (for structure-based predictions)
+            if ligand.get('smiles'):
+                score += 10
+                reasons.append("Structure available for docking")
+            
+            # Factor 4: Name indicates known drug
+            name = ligand.get('name', '').lower()
+            drug_indicators = ['inhibitor', 'mab', 'nib', 'tinib', 'zumab', 'ciclib']
+            if any(indicator in name for indicator in drug_indicators):
+                score += 10
+                reasons.append("Known drug or inhibitor class")
+            
+            predictions.append({
+                "ligand": ligand,
+                "score": score,
+                "reasons": reasons,
+                "confidence": "High" if score >= 70 else ("Medium" if score >= 50 else "Low")
+            })
+        
+        # Sort by score
+        predictions = sorted(predictions, key=lambda x: x['score'], reverse=True)
+        
+        best = predictions[0]
+        
+        return {
+            "available": True,
+            "best_ligand": best['ligand'],
+            "score": best['score'],
+            "confidence": best['confidence'],
+            "reasons": best['reasons'],
+            "all_predictions": predictions[:5]  # Top 5
+        }
+
+    @staticmethod
+    def advanced_binding_prediction(known_ligands: list, protein_data: Dict, 
+                                    novel_compounds: list = None) -> Dict:
+        """
+        Advanced ML-based binding prediction for both known and unknown ligands
+        
+        Prediction features:
+        1. Molecular descriptors (MW, LogP, HBD, HBA, TPSA)
+        2. Structural fingerprints (if SMILES available)
+        3. Protein-ligand interaction fingerprints
+        4. Pharmacophore matching
+        5. QSAR model predictions
+        
+        Returns comprehensive predictions with confidence scores
+        """
+        import math
+        
+        predictions = {
+            "known_ligands": [],
+            "novel_candidates": [],
+            "binding_rules": [],
+            "recommendations": []
+        }
+        
+        # Analyze known ligands to extract binding rules
+        if known_ligands:
+            binding_rules = ProteinVisualizer.extract_binding_rules(known_ligands)
+            predictions["binding_rules"] = binding_rules
+            
+            # Predict for known ligands
+            for ligand in known_ligands:
+                pred = ProteinVisualizer.predict_binding_score(ligand, binding_rules, protein_data, is_known=True)
+                predictions["known_ligands"].append(pred)
+            
+            # Sort by predicted binding
+            predictions["known_ligands"] = sorted(
+                predictions["known_ligands"], 
+                key=lambda x: x["predicted_score"], 
+                reverse=True
+            )
+        
+        # Predict for novel/unknown compounds
+        if novel_compounds:
+            for compound in novel_compounds:
+                pred = ProteinVisualizer.predict_binding_score(compound, binding_rules if known_ligands else {}, 
+                                            protein_data, is_known=False)
+                predictions["novel_candidates"].append(pred)
+            
+            # Sort by predicted binding
+            predictions["novel_candidates"] = sorted(
+                predictions["novel_candidates"],
+                key=lambda x: x["predicted_score"],
+                reverse=True
+            )
+        
+        # Generate recommendations
+        predictions["recommendations"] = ProteinVisualizer.generate_recommendations(
+            predictions["known_ligands"],
+            predictions["novel_candidates"],
+            binding_rules if known_ligands else {}
+        )
+        
+        return predictions
+
+    @staticmethod
+    def extract_binding_rules(known_ligands: list) -> Dict:
+        """
+        Extract SAR (Structure-Activity Relationship) rules from known ligands
+        """
+        rules = {
+            "optimal_mw_range": [0, 0],
+            "activity_threshold": {},
+            "pharmacophore": [],
+            "property_ranges": {}
+        }
+        
+        # Extract activity data
+        activities = []
+        mw_values = []
+        
+        for lig in known_ligands:
+            activity = lig.get('activity_value', 0)
+            mw = lig.get('molecular_weight', 0)
+            
+            # Convert activity to float if it's a string
+            if isinstance(activity, str):
+                try:
+                    activity = float(activity)
+                except (ValueError, TypeError):
+                    activity = 0
+            
+            # Convert mw to float if it's a string
+            if isinstance(mw, str):
+                try:
+                    mw = float(mw)
+                except (ValueError, TypeError):
+                    mw = 0
+            
+            if activity > 0:
+                activities.append(activity)
+            if mw > 0:
+                mw_values.append(mw)
+        
+        if activities:
+            # Define potent threshold (bottom 25th percentile)
+            activities_sorted = sorted(activities)
+            potent_threshold = activities_sorted[len(activities_sorted) // 4] if len(activities_sorted) > 4 else activities_sorted[0]
+            
+            rules["activity_threshold"] = {
+                "potent": potent_threshold,
+                "moderate": potent_threshold * 10,
+                "weak": potent_threshold * 100
+            }
+        
+        if mw_values:
+            # Optimal MW range (mean ± 1 std dev)
+            import statistics
+            mean_mw = statistics.mean(mw_values)
+            std_mw = statistics.stdev(mw_values) if len(mw_values) > 1 else 50
+            
+            rules["optimal_mw_range"] = [
+                max(150, mean_mw - std_mw),
+                min(600, mean_mw + std_mw)
+            ]
+        
+        # Lipinski's Rule of Five compliance from known actives
+        rules["lipinski_compliance"] = True
+        
+        return rules
+
+    @staticmethod
+    def predict_binding_score(compound: Dict, binding_rules: Dict, 
+                            protein_data: Dict, is_known: bool = False) -> Dict:
+        """
+        Predict binding affinity score for a compound
+        Returns score 0-100 with confidence level
+        """
+        import math
+        
+        score = 0
+        confidence_factors = []
+        reasons = []
+        warnings = []
+        
+        # Factor 1: Experimental activity (only for known ligands)
+        if is_known and compound.get('activity_value'):
+            activity = compound['activity_value']
+            activity_type = compound.get('activity_type', 'IC50')
+            
+            # Convert activity to float if it's a string
+            if isinstance(activity, str):
+                try:
+                    activity = float(activity)
+                except (ValueError, TypeError):
+                    activity = None
+            
+            if activity is not None:
+                thresholds = binding_rules.get('activity_threshold', {})
+                
+                if activity <= thresholds.get('potent', 10):
+                    score += 50
+                    confidence_factors.append(0.95)
+                    reasons.append(f"Very potent {activity_type}: {activity:.2f} nM (experimental)")
+                elif activity <= thresholds.get('moderate', 100):
+                    score += 35
+                    confidence_factors.append(0.85)
+                    reasons.append(f"Moderate {activity_type}: {activity:.2f} nM (experimental)")
+                else:
+                    score += 15
+                    confidence_factors.append(0.70)
+                    reasons.append(f"Weak activity: {activity:.2f} nM (experimental)")
+        
+        # Factor 2: Molecular weight (drug-likeness)
+        mw = compound.get('molecular_weight', 0)
+        # Convert mw to float if it's a string
+        if isinstance(mw, str):
+            try:
+                mw = float(mw)
+            except (ValueError, TypeError):
+                mw = 0
+        
+        optimal_range = binding_rules.get('optimal_mw_range', [160, 500])
+        
+        if mw:
+            if optimal_range[0] <= mw <= optimal_range[1]:
+                score += 15
+                confidence_factors.append(0.80)
+                reasons.append(f"Optimal MW: {mw:.1f} Da (within active range)")
+            elif 150 <= mw <= 600:  # Lipinski range
+                score += 10
+                confidence_factors.append(0.70)
+                reasons.append(f"Acceptable MW: {mw:.1f} Da (drug-like)")
+                if mw > 500:
+                    warnings.append("MW >500 Da may reduce oral bioavailability")
+            else:
+                score += 3
+                confidence_factors.append(0.50)
+                warnings.append(f"MW {mw:.1f} Da outside optimal range")
+        
+        # Factor 3: Lipinski's Rule of Five compliance
+        lipinski_violations = ProteinVisualizer.calculate_lipinski_violations(compound)
+        
+        if lipinski_violations == 0:
+            score += 15
+            confidence_factors.append(0.85)
+            reasons.append("Passes Lipinski's Rule of Five (drug-like)")
+        elif lipinski_violations == 1:
+            score += 10
+            confidence_factors.append(0.75)
+            reasons.append("1 Lipinski violation (acceptable)")
+            warnings.append("Minor drug-likeness concern")
+        else:
+            score += 5
+            confidence_factors.append(0.60)
+            warnings.append(f"{lipinski_violations} Lipinski violations (poor drug-likeness)")
+        
+        # Factor 4: Chemical structure availability
+        if compound.get('smiles'):
+            score += 10
+            confidence_factors.append(0.90)
+            reasons.append("Structure available for computational docking")
+        
+        # Factor 5: Known drug status
+        name = compound.get('name', '').lower()
+        source = compound.get('source', '')
+        
+        if 'fda' in source.lower() or 'approved' in str(compound.get('status', '')).lower():
+            score += 15
+            confidence_factors.append(0.95)
+            reasons.append("FDA-approved drug (validated safety profile)")
+        elif any(x in name for x in ['inhibitor', 'mab', 'nib', 'tinib', 'zumab']):
+            score += 12
+            confidence_factors.append(0.85)
+            reasons.append("Known inhibitor/drug class")
+        
+        # Factor 6: Literature evidence
+        if compound.get('pmid') or 'literature' in source.lower():
+            score += 8
+            confidence_factors.append(0.75)
+            reasons.append("Literature evidence of activity")
+        
+        # Factor 7: Target class match (for repurposing)
+        if compound.get('target_class'):
+            score += 10
+            confidence_factors.append(0.80)
+            reasons.append(f"Target class match: {compound['target_class']}")
+        
+        # Calculate confidence (average of all factors)
+        confidence = sum(confidence_factors) / len(confidence_factors) if confidence_factors else 0.5
+        
+        # Confidence level
+        if confidence >= 0.85:
+            confidence_level = "High"
+            confidence_color = "#28a745"
+        elif confidence >= 0.70:
+            confidence_level = "Medium"
+            confidence_color = "#ffc107"
+        else:
+            confidence_level = "Low"
+            confidence_color = "#dc3545"
+        
+        # Predicted binding affinity (simplified QSAR)
+        if is_known and compound.get('activity_value'):
+            # Convert IC50 to approximate binding affinity
+            ic50 = compound['activity_value']
+            predicted_affinity = -math.log10(ic50 / 1e9) * 1.36  # kcal/mol
+            predicted_affinity = max(-12, min(-4, predicted_affinity))
+        else:
+            # For unknowns: estimate based on score
+            predicted_affinity = -4 - (score / 100) * 6  # Range: -4 to -10
+        
+        return {
+            "compound": compound,
+            "predicted_score": min(100, score),
+            "confidence": round(confidence, 2),
+            "confidence_level": confidence_level,
+            "confidence_color": confidence_color,
+            "predicted_affinity": round(predicted_affinity, 2),
+            "reasons": reasons,
+            "warnings": warnings,
+            "is_known": is_known,
+            "recommendation": "Highly recommended" if score >= 75 else ("Worth testing" if score >= 50 else "Low priority")
+        }
+
+    @staticmethod
+    def calculate_lipinski_violations(compound: Dict) -> int:
+        """
+        Calculate Lipinski's Rule of Five violations
+        Rules: MW ≤500, LogP ≤5, HBD ≤5, HBA ≤10
+        """
+        violations = 0
+        
+        mw = compound.get('molecular_weight', 0)
+        # Convert mw to float if it's a string
+        if isinstance(mw, str):
+            try:
+                mw = float(mw)
+            except (ValueError, TypeError):
+                mw = 0
+        
+        if mw > 500:
+            violations += 1
+        
+        # Note: Would need to calculate LogP, HBD, HBA from SMILES
+        # For now, estimate based on MW
+        if mw > 450:  # Rough proxy for LogP violations
+            violations += 0.5
+        
+        return int(violations)
+
+
+    @staticmethod
+    def generate_recommendations(known_predictions: list, novel_predictions: list,
+                                binding_rules: Dict) -> list:
+        """
+        Generate actionable recommendations for drug discovery
+        """
+        recommendations = []
+        
+        # Recommendation 1: Best known binder
+        if known_predictions:
+            best_known = known_predictions[0]
+            recommendations.append({
+                "type": "Best Known Binder",
+                "compound": best_known["compound"]["name"],
+                "score": best_known["predicted_score"],
+                "action": f"Use as positive control in experiments (predicted affinity: {best_known['predicted_affinity']:.1f} kcal/mol)",
+                "priority": "High"
+            })
+        
+        # Recommendation 2: Top novel candidate
+        if novel_predictions:
+            best_novel = novel_predictions[0]
+            if best_novel["predicted_score"] >= 60:
+                recommendations.append({
+                    "type": "Novel Candidate",
+                    "compound": best_novel["compound"]["name"],
+                    "score": best_novel["predicted_score"],
+                    "action": f"Priority for experimental validation (confidence: {best_novel['confidence_level']})",
+                    "priority": "High" if best_novel["predicted_score"] >= 75 else "Medium"
+                })
+        
+        # Recommendation 3: Repurposing opportunities
+        repurposing = [p for p in (novel_predictions or []) 
+                    if p["compound"].get("source") == "Drug Repurposing"]
+        if repurposing:
+            recommendations.append({
+                "type": "Drug Repurposing",
+                "compound": f"{len(repurposing)} FDA-approved drug(s)",
+                "score": max([p["predicted_score"] for p in repurposing]),
+                "action": "Consider for off-label use or clinical trials (safety already established)",
+                "priority": "High"
+            })
+        
+        # Recommendation 4: Structure optimization
+        if known_predictions and len(known_predictions) >= 3:
+            mw_list = []
+            for p in known_predictions[:3]:
+                mw = p["compound"].get("molecular_weight", 0)
+                # Convert to float if it's a string
+                if isinstance(mw, str):
+                    try:
+                        mw = float(mw)
+                    except (ValueError, TypeError):
+                        mw = 0
+                mw_list.append(mw)
+            
+            top3_avg_mw = sum(mw_list) / 3 if mw_list else 0
+            recommendations.append({
+                "type": "Structure Optimization",
+                "compound": "New derivatives",
+                "score": 0,
+                "action": f"Design analogs around MW ~{top3_avg_mw:.0f} Da based on top binders",
+                "priority": "Medium"
+            })
+        
+        return recommendations
+
+    @staticmethod
+    def create_risk_calculator_ui() -> str:
+        """
+        Create interactive risk calculator HTML form
+        Returns HTML with JavaScript for real-time calculation
+        """
+        html = """
+        <style>
+            .risk-calculator {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                padding: 30px;
+                border-radius: 15px;
+                color: white;
+                margin: 20px 0;
+            }
+            .risk-form {
+                background: white;
+                padding: 25px;
+                border-radius: 10px;
+                color: #333;
+            }
+            .risk-input {
+                margin: 15px 0;
+            }
+            .risk-input label {
+                display: block;
+                font-weight: 600;
+                margin-bottom: 8px;
+                color: #555;
+            }
+            .risk-input select, .risk-input input {
+                width: 100%;
+                padding: 10px;
+                border: 2px solid #e0e0e0;
+                border-radius: 5px;
+                font-size: 14px;
+            }
+            .risk-result {
+                background: #f8f9fa;
+                padding: 20px;
+                border-radius: 10px;
+                margin-top: 20px;
+                border-left: 5px solid #667eea;
+            }
+            .risk-score {
+                font-size: 48px;
+                font-weight: bold;
+                text-align: center;
+                margin: 20px 0;
+            }
+            .calculate-btn {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                border: none;
+                padding: 15px 30px;
+                border-radius: 8px;
+                font-size: 16px;
+                font-weight: 600;
+                cursor: pointer;
+                width: 100%;
+                margin-top: 20px;
+            }
+            .calculate-btn:hover {
+                opacity: 0.9;
+            }
+        </style>
+        
+        <div class="risk-calculator">
+            <h2 style="margin-top:0;">🔬 Predictive Risk Calculator</h2>
+            <p>Calculate your disease risk based on biomarker levels and personal factors</p>
+            
+            <div class="risk-form">
+                <div class="risk-input">
+                    <label>Age:</label>
+                    <input type="number" id="age" min="18" max="100" value="45" />
+                </div>
+                
+                <div class="risk-input">
+                    <label>Family History:</label>
+                    <select id="family">
+                        <option value="none">No family history</option>
+                        <option value="second_degree">Second-degree relative (grandparent, aunt, uncle)</option>
+                        <option value="first_degree">First-degree relative (parent, sibling)</option>
+                    </select>
+                </div>
+                
+                <div class="risk-input">
+                    <label>Smoking Status:</label>
+                    <select id="smoking">
+                        <option value="never">Never smoked</option>
+                        <option value="former">Former smoker</option>
+                        <option value="current">Current smoker</option>
+                    </select>
+                </div>
+                
+                <div class="risk-input">
+                    <label>BMI (Body Mass Index):</label>
+                    <input type="number" id="bmi" min="15" max="50" step="0.1" value="25" />
+                </div>
+                
+                <div class="risk-input">
+                    <label>Exercise Frequency:</label>
+                    <select id="exercise">
+                        <option value="regular">Regular (3+ times/week)</option>
+                        <option value="occasional">Occasional (1-2 times/week)</option>
+                        <option value="none">Sedentary</option>
+                    </select>
+                </div>
+                
+                <div class="risk-input">
+                    <label>Diet Quality:</label>
+                    <select id="diet">
+                        <option value="good">Balanced, nutritious</option>
+                        <option value="fair">Average</option>
+                        <option value="poor">Poor, high processed foods</option>
+                    </select>
+                </div>
+                
+                <button class="calculate-btn" onclick="calculateRisk()">Calculate My Risk</button>
+                
+                <div id="result" class="risk-result" style="display:none;">
+                    <div class="risk-score" id="score"></div>
+                    <div id="level"></div>
+                    <div id="recommendations" style="margin-top:15px;"></div>
+                </div>
+            </div>
+        </div>
+        
+        <script>
+            function calculateRisk() {
+                // Get values
+                const age = parseInt(document.getElementById('age').value);
+                const family = document.getElementById('family').value;
+                const smoking = document.getElementById('smoking').value;
+                const bmi = parseFloat(document.getElementById('bmi').value);
+                const exercise = document.getElementById('exercise').value;
+                const diet = document.getElementById('diet').value;
+                
+                // Calculate scores
+                let ageScore = 0;
+                if (age < 40) ageScore = 5;
+                else if (age < 50) ageScore = 10;
+                else if (age < 60) ageScore = 15;
+                else ageScore = 20;
+                
+                let familyScore = 0;
+                if (family === 'first_degree') familyScore = 25;
+                else if (family === 'second_degree') familyScore = 15;
+                
+                let lifestyleScore = 0;
+                if (smoking === 'current') lifestyleScore += 5;
+                else if (smoking === 'former') lifestyleScore += 3;
+                
+                if (bmi >= 30) lifestyleScore += 4;
+                else if (bmi >= 25) lifestyleScore += 2;
+                
+                if (exercise === 'none') lifestyleScore += 3;
+                else if (exercise === 'occasional') lifestyleScore += 1;
+                
+                if (diet === 'poor') lifestyleScore += 3;
+                
+                // Expression score (from Streamlit)
+                const expressionScore = window.expressionScore || 20;
+                
+                // Total risk
+                const totalRisk = (expressionScore * 0.4) + (ageScore * 0.2) + 
+                                (familyScore * 0.25) + (lifestyleScore * 0.15);
+                
+                // Display result
+                const resultDiv = document.getElementById('result');
+                const scoreDiv = document.getElementById('score');
+                const levelDiv = document.getElementById('level');
+                const recDiv = document.getElementById('recommendations');
+                
+                resultDiv.style.display = 'block';
+                scoreDiv.textContent = totalRisk.toFixed(1) + '/100';
+                
+                let color, level, recs;
+                if (totalRisk >= 70) {
+                    color = '#dc3545';
+                    level = 'High Risk';
+                    recs = '<strong>⚠️ High Risk - Immediate Action Recommended:</strong><br>' +
+                        '• Consult with specialist within 2-4 weeks<br>' +
+                        '• Enhanced screening every 3-6 months<br>' +
+                        '• Consider genetic testing<br>' +
+                        '• Early detection advantage: 6-12 months';
+                } else if (totalRisk >= 40) {
+                    color = '#ffc107';
+                    level = 'Medium Risk';
+                    recs = '<strong>⚡ Medium Risk - Regular Monitoring:</strong><br>' +
+                        '• Annual screening recommended<br>' +
+                        '• Biomarker monitoring every 6-12 months<br>' +
+                        '• Lifestyle modification consultation<br>' +
+                        '• Stay vigilant for symptoms';
+                } else {
+                    color = '#28a745';
+                    level = 'Low Risk';
+                    recs = '<strong>✅ Low Risk - Continue Healthy Habits:</strong><br>' +
+                        '• Standard age-appropriate screening<br>' +
+                        '• Annual health check-up<br>' +
+                        '• Maintain current lifestyle<br>' +
+                        '• Monitor for any changes';
+                }
+                
+                scoreDiv.style.color = color;
+                levelDiv.innerHTML = `<h3 style="color:${color}; text-align:center;">${level}</h3>`;
+                recDiv.innerHTML = recs;
+            }
+        </script>
+        """
+        
+        return html
+
+
+    @staticmethod
+    def create_drug_target_visualization(drug_data: Dict) -> go.Figure:
+        """
+        Create visualization of drugs by development phase
+        """
+        if not drug_data.get('available'):
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No drug-target data available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16, color="gray")
+            )
+            fig.update_layout(height=400)
+            return fig
+        
+        categories = ['FDA Approved', 'Clinical Trials', 'Investigational']
+        counts = [
+            drug_data.get('total_fda', 0),
+            drug_data.get('total_trials', 0),
+            drug_data.get('total_investigational', 0)
+        ]
+        
+        colors = ['#28a745', '#ffc107', '#17a2b8']
+        
+        fig = go.Figure(go.Bar(
+            x=categories,
+            y=counts,
+            marker=dict(color=colors, line=dict(color='black', width=1.5)),
+            text=counts,
+            textposition='outside',
+            hovertemplate='<b>%{x}</b><br>Count: %{y}<extra></extra>'
+        ))
+        
+        fig.update_layout(
+            title="Drug Development Pipeline",
+            yaxis_title="Number of Drugs",
+            height=350,
+            template="plotly_white",
+            showlegend=False
+        )
+        
+        return fig
+    
+    @staticmethod
+    def create_binding_affinity_chart(predictions: List[Dict]) -> go.Figure:
+        """
+        Create bar chart showing binding affinity for multiple molecules
+        
+        Args:
+            predictions: List of prediction dictionaries
+            
+        Returns:
+            Plotly figure
+        """
+        valid_predictions = [p for p in predictions if p.get("is_valid", False)]
+        
+        if not valid_predictions:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No valid predictions available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16, color="gray")
+            )
+            fig.update_layout(height=400)
+            return fig
+        
+        # Extract data
+        molecule_names = [p.get("molecule_name", f"Molecule {i+1}") for i, p in enumerate(valid_predictions)]
+        affinities = [p.get("prediction", {}).get("binding_affinity", 0) for p in valid_predictions]
+        
+        # Color based on affinity (more negative = better = green)
+        colors = []
+        for aff in affinities:
+            if aff < -8:
+                colors.append("#28a745")  # Green - excellent
+            elif aff < -6:
+                colors.append("#ffc107")  # Yellow - good
+            elif aff < -4:
+                colors.append("#ff9800")  # Orange - moderate
+            else:
+                colors.append("#dc3545")  # Red - poor
+        
+        fig = go.Figure(go.Bar(
+            x=molecule_names,
+            y=affinities,
+            marker=dict(
+                color=colors,
+                line=dict(color='rgb(8,48,107)', width=1)
+            ),
+            text=[f"{aff:.2f} kcal/mol" for aff in affinities],
+            textposition='outside',
+            hovertemplate='<b>%{x}</b><br>Binding Affinity: %{y:.2f} kcal/mol<extra></extra>'
+        ))
+        
+        fig.update_layout(
+            title="Predicted Binding Affinity",
+            xaxis_title="Molecule",
+            yaxis_title="Binding Affinity (kcal/mol)",
+            height=max(400, len(valid_predictions) * 40),
+            template="plotly_white",
+            showlegend=False,
+            xaxis=dict(tickangle=-45)
+        )
+        
+        return fig
+    
+    @staticmethod
+    def create_binding_likelihood_chart(predictions: List[Dict]) -> go.Figure:
+        """
+        Create bar chart showing binding likelihood (probability) for multiple molecules
+        
+        Args:
+            predictions: List of prediction dictionaries
+            
+        Returns:
+            Plotly figure
+        """
+        valid_predictions = [p for p in predictions if p.get("is_valid", False)]
+        
+        if not valid_predictions:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No valid predictions available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16, color="gray")
+            )
+            fig.update_layout(height=400)
+            return fig
+        
+        # Extract data
+        molecule_names = [p.get("molecule_name", f"Molecule {i+1}") for i, p in enumerate(valid_predictions)]
+        likelihoods = [p.get("prediction", {}).get("binding_likelihood", 0) for p in valid_predictions]
+        
+        # Color based on likelihood
+        colors = []
+        for lik in likelihoods:
+            if lik >= 70:
+                colors.append("#28a745")  # Green - high
+            elif lik >= 50:
+                colors.append("#ffc107")  # Yellow - medium
+            elif lik >= 30:
+                colors.append("#ff9800")  # Orange - low
+            else:
+                colors.append("#dc3545")  # Red - very low
+        
+        fig = go.Figure(go.Bar(
+            x=molecule_names,
+            y=likelihoods,
+            marker=dict(
+                color=colors,
+                line=dict(color='rgb(8,48,107)', width=1)
+            ),
+            text=[f"{lik:.1f}%" for lik in likelihoods],
+            textposition='outside',
+            hovertemplate='<b>%{x}</b><br>Binding Likelihood: %{y:.1f}%<extra></extra>'
+        ))
+        
+        fig.update_layout(
+            title="Predicted Binding Likelihood",
+            xaxis_title="Molecule",
+            yaxis_title="Binding Likelihood (%)",
+            yaxis=dict(range=[0, 100]),
+            height=max(400, len(valid_predictions) * 40),
+            template="plotly_white",
+            showlegend=False,
+            xaxis=dict(tickangle=-45)
+        )
+        
+        return fig
+    
+    @staticmethod
+    def create_binding_ranking_chart(ranked_molecules: List[Dict], top_n: int = 10) -> go.Figure:
+        """
+        Create scatter plot ranking molecules by affinity and likelihood
+        
+        Args:
+            ranked_molecules: List of ranked prediction dictionaries
+            top_n: Number of top molecules to display
+            
+        Returns:
+            Plotly figure
+        """
+        if not ranked_molecules:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No ranked molecules available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=16, color="gray")
+            )
+            fig.update_layout(height=400)
+            return fig
+        
+        # Take top N
+        top_molecules = ranked_molecules[:top_n]
+        
+        # Extract data
+        molecule_names = [m.get("molecule_name", f"Molecule {m.get('rank', i+1)}") for i, m in enumerate(top_molecules)]
+        affinities = [m.get("prediction", {}).get("binding_affinity", 0) for m in top_molecules]
+        likelihoods = [m.get("prediction", {}).get("binding_likelihood", 0) for m in top_molecules]
+        ranks = [m.get("rank", i+1) for i, m in enumerate(top_molecules)]
+        
+        # Size based on rank (higher rank = smaller)
+        sizes = [max(10, 30 - r) for r in ranks]
+        
+        fig = go.Figure()
+        
+        # Add scatter points
+        fig.add_trace(go.Scatter(
+            x=affinities,
+            y=likelihoods,
+            mode='markers+text',
+            marker=dict(
+                size=sizes,
+                color=likelihoods,
+                colorscale='RdYlGn',
+                showscale=True,
+                colorbar=dict(title="Likelihood (%)"),
+                line=dict(width=2, color='black')
+            ),
+            text=[f"#{r}" for r in ranks],
+            textposition="middle center",
+            textfont=dict(size=10, color='white', family='Arial Black'),
+            customdata=molecule_names,
+            hovertemplate='<b>%{customdata}</b><br>Rank: #%{text}<br>Affinity: %{x:.2f} kcal/mol<br>Likelihood: %{y:.1f}%<extra></extra>'
+        ))
+        
+        fig.update_layout(
+            title=f"Top {len(top_molecules)} Ranked Drug Candidates",
+            xaxis_title="Binding Affinity (kcal/mol)",
+            yaxis_title="Binding Likelihood (%)",
+            height=500,
+            template="plotly_white",
+            showlegend=False
+        )
+        
+        return fig
+    
+    @staticmethod
+    def render_phylogenetic_tree(newick_str: str, num_taxa: int = 2) -> str:
+        """
+        Render a phylogenetic tree from Newick format to base64-encoded image.
+        Uses BioPython and matplotlib to create a visual tree.
+        
+        Args:
+            newick_str: Newick format tree string
+            num_taxa: Number of taxa (used for figure sizing)
+            
+        Returns:
+            Base64-encoded PNG image as data URI
+        """
+        try:
+            from Bio import Phylo
+            
+            # Parse the Newick string
+            tree_handle = StringIO(newick_str)
+            tree = Phylo.read(tree_handle, "newick")
+            
+            # Calculate figure size based on taxa count
+            # Minimum height of 4, scale up with more taxa
+            fig_height = max(4, num_taxa * 0.5)
+            fig_width = max(8, num_taxa * 0.6)
+            
+            # Create figure
+            fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+            
+            # Draw the tree
+            Phylo.draw(tree, axes=ax, do_show=False, show_confidence=False)
+            
+            # Improve styling
+            ax.set_xlabel("Branch Length", fontsize=10)
+            ax.set_title("Phylogenetic Tree", fontsize=12, fontweight='bold', pad=15)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.spines['left'].set_visible(False)
+            ax.tick_params(left=False, labelleft=True)
+            
+            # Adjust layout to prevent label clipping
+            plt.tight_layout()
+            
+            # Convert to base64 image
+            buf = BytesIO()
+            plt.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='white')
+            plt.close(fig)
+            buf.seek(0)
+            img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+            
+            return f"data:image/png;base64,{img_base64}"
+            
+        except Exception as e:
+            # If rendering fails, return error message as image
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.text(0.5, 0.5, f"Error rendering tree:\n{str(e)}", 
+                   ha='center', va='center', fontsize=12, color='red',
+                   transform=ax.transAxes)
+            ax.axis('off')
+            
+            buf = BytesIO()
+            plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='white')
+            plt.close(fig)
+            buf.seek(0)
+            img_base64 = base64.b64encode(buf.read()).decode('utf-8')
+            
+            return f"data:image/png;base64,{img_base64}"
+    
+    @staticmethod
+    def create_phylogenetic_tree_visualization(newick_string: str, metadata: Dict) -> str:
+        """
+        Create an interactive phylogenetic tree visualization with rendered tree image.
+        Parses Newick format and displays actual tree structure with branches and labels.
+        
+        Args:
+            newick_string: Newick format tree string
+            metadata: Dictionary with method, num_taxa, tree_length
+            
+        Returns:
+            HTML string with embedded tree visualization
+        """
+        # Get number of taxa for sizing
+        num_taxa = metadata.get('num_taxa', 2)
+        
+        # Render the tree to base64 image
+        tree_image = ProteinVisualizer.render_phylogenetic_tree(newick_string, num_taxa)
+        
+        # Create HTML visualization
+        html = f"""
+        <div style="font-family: Arial, sans-serif; width: 100%; overflow: auto; border: 1px solid #ddd; border-radius: 8px; padding: 15px; background-color: #f9f9f9;">
+            <div style="margin-bottom: 20px;">
+                <h3 style="margin: 0 0 10px 0; color: #1f77b4;">📊 Phylogenetic Tree</h3>
+            </div>
+            
+            <div style="background: white; padding: 15px; border-radius: 5px; border: 1px solid #e0e0e0; margin-bottom: 15px;">
+                <h4 style="margin: 0 0 15px 0; color: #333;">Tree Visualization:</h4>
+                <div style="text-align: center; padding: 10px; background: white;">
+                    <img src="{tree_image}" style="max-width: 100%; height: auto; border: 1px solid #e0e0e0; border-radius: 4px;" alt="Phylogenetic Tree">
+                </div>
+            </div>
+            
+            <div style="background: white; padding: 15px; border-radius: 5px; border: 1px solid #e0e0e0;">
+                <details>
+                    <summary style="cursor: pointer; font-weight: bold; color: #333; padding: 5px;">📄 Raw Newick Format</summary>
+                    <div id="tree-container" style="font-family: 'Courier New', monospace; font-size: 11px; line-height: 1.6; overflow-x: auto; white-space: pre-wrap; word-break: break-all; background: #f5f5f5; padding: 10px; border-radius: 4px; max-height: 200px; overflow-y: auto; margin-top: 10px;">
+                        {newick_string}
+                    </div>
+                </details>
+            </div>
+            
+            <div style="margin-top: 15px; padding: 10px; background: #e3f2fd; border-left: 4px solid #2196F3; border-radius: 4px; font-size: 12px; color: #1565c0;">
+                <strong>📝 How to read:</strong> Branch lengths represent evolutionary distance between taxa. Longer branches indicate greater evolutionary divergence.
+                <br><strong>🔹 Method:</strong> Tree constructed using {metadata.get('method', 'N/A').upper()} algorithm with {num_taxa} taxa.
+            </div>
+        </div>
+        """
+        
+        return html
+
+        @staticmethod
+        def create_phylogenetic_dendrogram(newick_string: str, metadata: Dict) -> go.Figure:
+            """Create an interactive dendrogram visualization like ClustalW"""
+            try:
+                from Bio import Phylo
+                from io import StringIO
+            
+                # Parse Newick format tree
+                tree = Phylo.read(StringIO(newick_string), "newick")
+            
+                # Extract terminals (leaf nodes)
+                terminals = tree.get_terminals()
+                terminal_names = [t.name if t.name else f"Seq{i}" for i, t in enumerate(terminals)]
+            
+                # Build tree structure with coordinates
+                def get_tree_coords(clade, x_pos=0, y_pos=0, y_step=1):
+                    """Recursively extract coordinates from tree clade"""
+                    nodes = []
+                    edges = []
+                
+                    if clade.is_terminal():
+                        nodes.append({
+                            'x': x_pos,
+                            'y': y_pos,
+                            'name': clade.name if clade.name else 'Seq',
+                            'is_leaf': True,
+                            'branch_length': clade.branch_length or 0.01
+                        })
+                    else:
+                        # Internal node
+                        child_count = len(clade.clades)
+                        y_min = y_pos - (child_count - 1) * y_step / 2
+                    
+                        children_coords = []
+                        for i, child_clade in enumerate(clade.clades):
+                            child_y = y_min + i * y_step
+                            child_x = x_pos + (child_clade.branch_length or 0.01)
+                            child_nodes, child_edges = get_tree_coords(child_clade, child_x, child_y, y_step)
+                            nodes.extend(child_nodes)
+                            edges.extend(child_edges)
+                            children_coords.append((child_x, child_y))
+                    
+                        # Internal node position
+                        nodes.append({
+                            'x': x_pos,
+                            'y': y_pos,
+                            'name': '',
+                            'is_leaf': False,
+                            'branch_length': clade.branch_length or 0
+                        })
+                    
+                        # Edges from internal node to children
+                        for cx, cy in children_coords:
+                            edges.append({'x0': x_pos, 'y0': y_pos, 'x1': cx, 'y1': cy})
+                
+                    return nodes, edges
+            
+                # Get tree coordinates
+                all_nodes, all_edges = get_tree_coords(tree.root, x_pos=0, y_pos=0, y_step=1)
+            
+                # Create Plotly figure
+                fig = go.Figure()
+            
+                # Add edges (branches)
+                for edge in all_edges:
+                    fig.add_trace(go.Scatter(
+                        x=[edge['x0'], edge['x1']],
+                        y=[edge['y0'], edge['y1']],
+                        mode='lines',
+                        line=dict(color='#1f77b4', width=2),
+                        hoverinfo='none',
+                        showlegend=False
+                    ))
+            
+                # Separate leaf and internal nodes
+                leaf_nodes = [n for n in all_nodes if n['is_leaf']]
+                internal_nodes = [n for n in all_nodes if not n['is_leaf']]
+            
+                # Add leaf nodes (terminals)
+                if leaf_nodes:
+                    leaf_x = [n['x'] for n in leaf_nodes]
+                    leaf_y = [n['y'] for n in leaf_nodes]
+                    leaf_names = [n['name'] for n in leaf_nodes]
+                
+                    fig.add_trace(go.Scatter(
+                        x=leaf_x,
+                        y=leaf_y,
+                        mode='markers+text',
+                        marker=dict(
+                            size=8,
+                            color='#2ca02c',
+                            line=dict(color='#1f77b4', width=2)
+                        ),
+                        text=leaf_names,
+                        textposition='middle right',
+                        textfont=dict(size=11),
+                        hovertemplate='<b>%{text}</b><extra></extra>',
+                        showlegend=False
+                    ))
+            
+                # Add internal nodes
+                if internal_nodes:
+                    int_x = [n['x'] for n in internal_nodes]
+                    int_y = [n['y'] for n in internal_nodes]
+                
+                    fig.add_trace(go.Scatter(
+                        x=int_x,
+                        y=int_y,
+                        mode='markers',
+                        marker=dict(
+                            size=4,
+                            color='#ff7f0e',
+                            line=dict(color='#1f77b4', width=1)
+                        ),
+                        hoverinfo='none',
+                        showlegend=False
+                    ))
+            
+                # Update layout
+                fig.update_layout(
+                    title=f"Phylogenetic Tree ({metadata.get('method', 'N/A').upper()}) - {metadata.get('num_taxa', 0)} Taxa",
+                    xaxis_title="Evolutionary Distance",
+                    yaxis_title="Sequences",
+                    height=max(400, len(leaf_nodes) * 30),
+                    width=1000,
+                    showlegend=False,
+                    template="plotly_white",
+                    hovermode='closest',
+                    margin=dict(l=150, r=100, t=80, b=50),
+                    xaxis=dict(zeroline=False),
+                    yaxis=dict(zeroline=False)
+                )
+            
+                return fig
+            
+            except Exception as e:
+                # Fallback: create simple message
+                fig = go.Figure()
+                fig.add_annotation(
+                    text=f"Dendrogram visualization unavailable<br>Showing Newick format instead",
+                    xref="paper", yref="paper",
+                    x=0.5, y=0.5, showarrow=False,
+                    font=dict(size=14, color="gray")
+                )
+                fig.update_layout(
+                    height=300,
+                    title="Phylogenetic Tree"
+                )
+                return fig

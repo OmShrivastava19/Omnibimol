@@ -4,10 +4,10 @@ import streamlit as st
 import asyncio
 from typing import List, Dict
 import os
-import random
-import math
 import re
 import html
+import hashlib
+import sys
 
 # Load TSV data at startup
 @st.cache_data
@@ -27,6 +27,98 @@ def load_hpa_data():
 
 # api_client.py - UniProt and HPA API integration with error handling
 class ProteinAPIClient:
+    # DataProcessor methods
+    class DataProcessor:
+        """Processes raw API data into visualization-ready formats"""
+
+        @staticmethod
+        def prepare_tissue_chart_data(df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
+            """
+            Prepare tissue expression data for bar chart
+            Prioritizes top N tissues by expression level
+            """
+            if df.empty:
+                return df
+
+            # Sort by expression level and take top N
+            df_sorted = df.sort_values("level_numeric", ascending=False)
+
+            # If more than top_n tissues, take top N with highest expression
+            if len(df_sorted) > top_n:
+                df_sorted = df_sorted.head(top_n)
+
+            return df_sorted.sort_values("level_numeric", ascending=True)
+
+        @staticmethod
+        def prepare_subcellular_heatmap(df: pd.DataFrame) -> pd.DataFrame:
+            """
+            Prepare subcellular location data for heatmap visualization
+            """
+            if df.empty:
+                return df
+
+            # Create pivot-style data for heatmap
+            df_pivot = df.copy()
+            df_pivot["value"] = df_pivot["reliability_numeric"]
+
+            return df_pivot
+
+        @staticmethod
+        def create_summary_table(uniprot_data: Dict, tissue_df: pd.DataFrame,
+                                subcellular_df: pd.DataFrame, alphafold_data: Dict = None,
+                                pdb_data: Dict = None, kegg_data: Dict = None,
+                                chembl_data: Dict = None) -> pd.DataFrame:
+            """
+            Create comprehensive summary table with key metrics
+            """
+            # Structure availability
+            structure_status = "None available"
+            if pdb_data and pdb_data.get('available'):
+                structure_status = f"Experimental ({pdb_data.get('count')} PDB entries)"
+            elif alphafold_data and alphafold_data.get('available'):
+                structure_status = "AlphaFold prediction"
+
+            # Pathway count
+            pathway_count = 0
+            if kegg_data and kegg_data.get('available'):
+                pathway_count = len(kegg_data.get('pathways', []))
+
+            # Ligand count
+            ligand_count = 0
+            if chembl_data and chembl_data.get('available'):
+                ligand_count = len(chembl_data.get('ligands', []))
+
+            summary = {
+                "Metric": [
+                    "UniProt ID",
+                    "Sequence Length",
+                    "Molecular Weight (Da)",
+                    "3D Structure",
+                    "KEGG Pathways",
+                    "Known Ligands",
+                    "Tissues with Expression (HPA)",
+                    "High Expression Tissues",
+                    "Subcellular Locations",
+                    "GO Terms (Total)"
+                ],
+                "Value": [
+                    str(uniprot_data.get("uniprot_id", "N/A")),
+                    str(f"{uniprot_data.get('sequence_length', 0):,}"),
+                    str(f"{uniprot_data.get('mass', 0):,.0f}"),
+                    str(structure_status),
+                    str(pathway_count if pathway_count > 0 else "Not found"),
+                    str(ligand_count if ligand_count > 0 else "Not found"),
+                    str(len(tissue_df[tissue_df["level_numeric"] > 0]) if not tissue_df.empty else 0),
+                    str(len(tissue_df[tissue_df["level"] == "High"]) if not tissue_df.empty else 0),
+                    str(len(subcellular_df) if not subcellular_df.empty else 0),
+                    str(sum(len(v) for v in uniprot_data.get("go_terms", {}).values()))
+                ]
+            }
+
+            df = pd.DataFrame(summary)
+            # Ensure Value column is consistently typed as string to avoid Arrow type errors
+            df['Value'] = df['Value'].astype(str)
+            return df
     """Handles all API interactions with UniProt and Human Protein Atlas"""
     
     def __init__(self, cache_manager):
@@ -268,7 +360,8 @@ class ProteinAPIClient:
             "kegg_pathways": results[3] if not isinstance(results[3], Exception) else {"available": False, "pathways": []},
             "chembl_ligands": results[4] if not isinstance(results[4], Exception) else {"available": False, "ligands": []},
             "string_ppi": results[5] if not isinstance(results[5], Exception) else {"available": False, "interactions": []},
-            "literature": results[6] if not isinstance(results[6], Exception) else {"papers": [], "wiki_title": None, "wiki_snippet": None}
+            "literature": results[6] if not isinstance(results[6], Exception) else {"papers": [], "wiki_title": None, "wiki_snippet": None},
+            "drug_targets": {"available": False}
         }
             
     async def fetch_alphafold_structure(self, uniprot_id: str, gene_name: str = None) -> Dict:
@@ -629,7 +722,6 @@ class ProteinAPIClient:
         Fetches literature summary from PubMed and Wikipedia for a protein.
         Caches results for 7 days.
         """
-        import requests
         import time
         cache_key = f"lit_{uniprot_id}"
         cached = self.cache.get(cache_key)
@@ -651,22 +743,26 @@ class ProteinAPIClient:
                 'sort': 'relevance',
                 'usehistory': 'y'
             }
-            search = requests.get(pubmed_url, params=params, timeout=10).json()
+            async with httpx.AsyncClient() as client:
+                search_response = await client.get(pubmed_url, params=params, timeout=10)
+                search = search_response.json()
             pmids = search.get('esearchresult', {}).get('idlist', [])
             
             if pmids:
                 try:
                     efetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
-                    abs_data = requests.get(
-                        efetch_url,
-                        params={'db': 'pubmed', 'id': ','.join(pmids), 'retmode': 'xml'},
-                        timeout=10
-                    ).text
+                    async with httpx.AsyncClient() as client:
+                        abs_response = await client.get(
+                            efetch_url,
+                            params={'db': 'pubmed', 'id': ','.join(pmids), 'retmode': 'xml'},
+                            timeout=10
+                        )
+                        abs_data = abs_response.text
                     papers = self.parse_pubmed_abstracts(abs_data)
                 except Exception as e:
-                    st.warning(f"Could not fetch PubMed abstracts: {str(e)}")
+                    pass  # Silently fail on abstract fetch
         except Exception as e:
-            st.warning(f"PubMed search error: {str(e)}")
+            pass  # Silently fail on PubMed search
         
         try:
             # Wikipedia search with proper User-Agent to avoid 403
@@ -682,8 +778,8 @@ class ProteinAPIClient:
                 'srlimit': 1,
                 'srprop': 'snippet'
             }
-            wiki_response = requests.get(wiki_url, params=wiki_params, headers=headers, timeout=10)
-            wiki_response.raise_for_status()
+            async with httpx.AsyncClient() as client:
+                wiki_response = await client.get(wiki_url, params=wiki_params, headers=headers, timeout=10)
             
             if wiki_response.text:
                 wiki_res = wiki_response.json()
@@ -697,14 +793,8 @@ class ProteinAPIClient:
                     if wiki_snippet:
                         wiki_snippet = re.sub(r'<[^>]+>', '', wiki_snippet)  # Remove HTML tags
                         wiki_snippet = html.unescape(wiki_snippet)  # Convert HTML entities
-            else:
-                st.warning("Wikipedia returned empty response")
-        except requests.exceptions.RequestException as e:
-            st.warning(f"Wikipedia connection error: {str(e)}")
-        except ValueError as e:
-            st.warning(f"Wikipedia response parsing error: Invalid JSON response")
         except Exception as e:
-            st.warning(f"Wikipedia search error: {str(e)}")
+            pass  # Silently fail on Wikipedia search
         
         result = {
             'papers': papers,
@@ -754,21 +844,43 @@ class ProteinAPIClient:
 
     async def run_blast_search(self, sequence: str, uniprot_id: str) -> Dict:
         """
-        Run BLAST search against NCBI nr database
+        Run BLAST search with SwissProt first, fallback to nr database
         Optimized for speed while maintaining full sequence accuracy
         Returns up to 15 hits
         
-        Key optimizations:
-        - Uses 'nr' database for accuracy (not swissprot)
-        - Parallel submission + immediate polling
-        - Adaptive polling with exponential backoff
-        - Concurrent status check + result fetch on ready
+        Strategy:
+        - First tries SwissProt database (faster, curated)
+        - If no results, falls back to nr database (comprehensive)
+        - Uses adaptive polling with exponential backoff
         """
-        cache_key = f"blast_{uniprot_id}_v2"
+        cache_key = f"blast_{uniprot_id}_v3"
         cached = self.cache.get(cache_key)
         if cached:
             return cached
         
+        # Try SwissProt first
+        swissprot_result = await self._run_blast_search_against_db(
+            sequence, uniprot_id, database="swissprot"
+        )
+        
+        # If SwissProt returned results, use them
+        if swissprot_result.get("available") and swissprot_result.get("hits"):
+            self.cache.set(cache_key, swissprot_result)
+            return swissprot_result
+        
+        # Otherwise, fall back to NR database
+        nr_result = await self._run_blast_search_against_db(
+            sequence, uniprot_id, database="nr"
+        )
+        
+        self.cache.set(cache_key, nr_result)
+        return nr_result
+
+    async def _run_blast_search_against_db(self, sequence: str, uniprot_id: str, database: str) -> Dict:
+        """
+        Internal method to run BLAST search against a specific database
+        Handles single database submission and polling
+        """
         try:
             submit_url = "https://blast.ncbi.nlm.nih.gov/Blast.cgi"
             
@@ -776,14 +888,15 @@ class ProteinAPIClient:
             submit_params = {
                 "CMD": "Put",
                 "PROGRAM": "blastp",
-                "DATABASE": "nr",              # Full nr database for accuracy
+                "DATABASE": database,          # SwissProt or nr
                 "QUERY": sequence,             # Full unmodified sequence
-                "FORMAT_TYPE": "XML",
+                "FORMAT_TYPE": "Tabular",
+                "FORMAT_OBJECT": "Alignment",
                 "HITLIST_SIZE": "15",           # Request exactly 15 hits
-                "EXPECT": "0.001",             # Strict E-value for quality hits
+                "ALIGNMENTS": "15",
+                "DESCRIPTIONS": "15",
                 "FILTER": "F",                 # No filtering - keep all hits
                 "COMPOSITION_BASED_STATS": "2", # Best compositional adjustment
-                "ENTREZ_QUERY": "homo sapiens[organism]"  # Limit to human for speed
             }
             
             # Step 1: Submit BLAST job
@@ -809,19 +922,19 @@ class ProteinAPIClient:
             if not rid:
                 return {
                     "available": False,
-                    "error": "Failed to submit BLAST job - no RID received"
+                    "error": f"Failed to submit {database.upper()} BLAST job - no RID received"
                 }
             
-            # Step 2: Adaptive polling strategy
-            # Initial wait based on estimated time (minimum 5 seconds)
-            initial_wait = max(5, estimated_time * 0.5)
+            # Step 2: Adaptive polling strategy with shorter timeouts
+            # Initial wait - much shorter for faster response
+            initial_wait = max(2, min(estimated_time // 2, 5))  # Cap initial wait at 5 seconds
             await asyncio.sleep(initial_wait)
             
-            # Polling configuration
-            max_attempts = 120          # Max 120 attempts
+            # Polling configuration - optimized for speed
+            max_attempts = 90           # Max 3 minutes (with shorter intervals)
             attempt = 0
-            poll_interval = 1.0         # Start at 1 second
-            max_poll_interval = 3.0     # Cap at 3 seconds
+            poll_interval = 0.3         # Start at 0.3 second for faster polling
+            max_poll_interval = 1.5     # Cap at 1.5 seconds
             
             while attempt < max_attempts:
                 # Use fresh client each poll to avoid closed connection
@@ -848,21 +961,20 @@ class ProteinAPIClient:
                                 "rid": rid,
                                 "hits": hits,
                                 "hit_count": len(hits),
-                                "database": "nr",
-                                "organism_filter": "Homo sapiens"
+                                "database": database.upper()
                             }
                             
-                            self.cache.set(cache_key, result)
                             return result
                         
                         # Still waiting - adaptive backoff
                         elif "Status=WAITING" in check_text or "Status=UNKNOWN" in check_text:
                             attempt += 1
                             # Exponential backoff capped at max_poll_interval
-                            poll_interval = min(
-                                max_poll_interval, 
-                                poll_interval * 1.15  # Gentle 15% increase
-                            )
+                            # Faster ramp-up for quick jobs, slower for long jobs
+                            if poll_interval < 0.6:
+                                poll_interval = min(max_poll_interval, poll_interval * 1.3)  # Fast increase initially
+                            else:
+                                poll_interval = min(max_poll_interval, poll_interval * 1.1)  # Slower increase later
                             await asyncio.sleep(poll_interval)
                             continue
                         
@@ -870,7 +982,7 @@ class ProteinAPIClient:
                         elif "Status=FAILURE" in check_text or "Status=ERROR" in check_text:
                             return {
                                 "available": False,
-                                "error": "BLAST job failed on NCBI server. Try again."
+                                "error": f"{database.upper()} BLAST job failed on NCBI server. Trying fallback..."
                             }
                         
                         # Unknown status - keep polling
@@ -893,14 +1005,103 @@ class ProteinAPIClient:
             
             return {
                 "available": False,
-                "error": "BLAST search timed out. NCBI servers may be busy - try again later."
+                "error": f"{database.upper()} BLAST search took too long. Trying fallback..."
             }
             
         except Exception as e:
             return {
                 "available": False,
-                "error": f"BLAST error: {str(e)}"
+                "error": f"{database.upper()} BLAST error: {str(e)}"
             }
+
+    async def search_protein_ncbi(self, sequence: str) -> Dict:
+        """
+        Search NCBI protein databases for an anonymous amino acid sequence.
+
+        Uses BLASTp against SwissProt with short polling and returns a
+        simplified annotation object for the best matching hit.
+
+        Match criteria:
+        - Prefer first hit with identity ≥95% and coverage ≥90%
+        - Otherwise fall back to the top-ranked hit (if any)
+        """
+        # Normalize sequence
+        if not sequence:
+            return {
+                "available": False,
+                "match_found": False,
+                "error": "Empty sequence provided"
+            }
+
+        seq_clean = "".join(sequence.split()).upper()
+        if not seq_clean:
+            return {
+                "available": False,
+                "match_found": False,
+                "error": "Sequence contains no valid characters"
+            }
+
+        # Cache per unique sequence (SHA1 hash, truncated)
+        seq_hash = hashlib.sha1(seq_clean.encode("utf-8")).hexdigest()[:16]
+        cache_key = f"protein_ncbi_lookup_{seq_hash}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+
+        try:
+            # Reuse optimized BLAST polling pipeline against SwissProt
+            blast_result = await self._run_blast_search_against_db(
+                seq_clean,
+                seq_hash,
+                database="swissprot"
+            )
+
+            hits = blast_result.get("hits", []) if blast_result.get("available") else []
+
+            best_hit = None
+            # First, try to find a high-confidence match
+            for hit in hits:
+                if hit.get("identity_percent", 0) >= 95 and hit.get("coverage_percent", 0) >= 90:
+                    best_hit = hit
+                    break
+
+            # If no high-confidence hit, fall back to the top hit (if any)
+            if best_hit is None and hits:
+                best_hit = hits[0]
+
+            if best_hit:
+                result = {
+                    "available": True,
+                    "match_found": True,
+                    "protein_name": best_hit.get("title", "Unknown protein"),
+                    "accession_id": best_hit.get("accession"),
+                    "organism": best_hit.get("organism", "Unknown"),
+                    "identity_percent": best_hit.get("identity_percent", 0.0),
+                    "coverage_percent": best_hit.get("coverage_percent", 0.0),
+                    "e_value": best_hit.get("e_value", 1.0),
+                    "ncbi_url": best_hit.get("ncbi_url"),
+                    "raw_hits": hits,
+                }
+            else:
+                # No suitable hit – likely novel or unannotated
+                result = {
+                    "available": True,
+                    "match_found": False,
+                    "message": "Protein name not found (novel or unannotated sequence)",
+                    "raw_hits": hits,
+                }
+
+            self.cache.set(cache_key, result)
+            return result
+
+        except Exception as e:
+            result = {
+                "available": False,
+                "match_found": False,
+                "error": f"NCBI protein lookup failed: {str(e)}",
+            }
+            self.cache.set(cache_key, result)
+            return result
 
     def _parse_blast_xml(self, xml_text: str, query_sequence: str) -> list:
         """
@@ -983,6 +1184,97 @@ class ProteinAPIClient:
             
         except Exception as e:
             return []
+
+    async def predict_structure(self, sequence: str) -> Dict:
+        """
+        Predict 3D protein structure for an amino acid sequence using ESMFold.
+
+        Uses a remote, CPU-friendly API (no local models, no GPU required).
+        Returns predicted PDB text and an optional average pLDDT confidence score.
+        
+        Important: HTTP 413 errors usually indicate the API request format is wrong,
+        not the sequence size. This method handles the request correctly.
+        """
+        # Basic validation and normalization
+        if not sequence:
+            return {
+                "available": False,
+                "error": "Empty sequence provided for structure prediction"
+            }
+
+        seq_clean = "".join(sequence.split()).upper()
+        if not seq_clean:
+            return {
+                "available": False,
+                "error": "Sequence contains no valid characters"
+            }
+
+        # Cache per unique sequence
+        seq_hash = hashlib.sha1(seq_clean.encode("utf-8")).hexdigest()[:16]
+        cache_key = f"esmfold_structure_{seq_hash}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+
+        # Public ESMFold endpoint hosted by Meta / ESM Atlas
+        esmfold_url = "https://api.esmatlas.com/foldSequence/v1/pdb/"
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                # The ESM Atlas API expects the raw sequence as the request body
+                # Using data parameter with plain text encoding instead of content
+                response = await client.post(
+                    esmfold_url,
+                    data=seq_clean,
+                    headers={"Content-Type": "text/plain"},
+                )
+                
+                # Check for HTTP 413 specifically
+                if response.status_code == 413:
+                    result = {
+                        "available": False,
+                        "error": f"Protein sequence too large for prediction (HTTP 413). Sequence: {len(seq_clean)} amino acids. Try a shorter sequence or domain.",
+                    }
+                    self.cache.set(cache_key, result)
+                    return result
+                
+                response.raise_for_status()
+                pdb_text = response.text
+
+            # Attempt to derive an average pLDDT from B-factor column if present
+            avg_plddt = None
+            try:
+                values = []
+                for line in pdb_text.splitlines():
+                    if line.startswith("ATOM") or line.startswith("HETATM"):
+                        # B-factor in PDB is columns 61–66 (0-based 60:66)
+                        if len(line) >= 66:
+                            b_str = line[60:66].strip()
+                            if b_str:
+                                values.append(float(b_str))
+                if values:
+                    avg_plddt = sum(values) / len(values)
+            except Exception:
+                avg_plddt = None
+
+            result = {
+                "available": True,
+                "pdb": pdb_text,
+                "sequence_length": len(seq_clean),
+                "source": "ESMFold",
+                "avg_plddt": avg_plddt,
+            }
+
+            self.cache.set(cache_key, result)
+            return result
+
+        except Exception as e:
+            result = {
+                "available": False,
+                "error": f"Structure prediction failed or is unavailable: {str(e)}",
+            }
+            self.cache.set(cache_key, result)
+            return result
 
     def get_fasta_sequence(self, uniprot_data: Dict) -> str:
         """
@@ -1087,7 +1379,7 @@ class ProteinAPIClient:
             
             # Correct parameters based on EBI documentation
             submit_data = {
-                "email": "omnibiomol@example.com",
+                "email": "omshrivastava01927@gmail.com",
                 "title": f"Alignment_{id1}_vs_{id2}",
                 "asequence": fasta1,
                 "bsequence": fasta2,
@@ -1492,53 +1784,80 @@ class ProteinAPIClient:
         }
 
     def simulate_docking_score(self, protein_length: int, ligand_mw: float, 
-                          activity_value: float = None) -> Dict:
+                          activity_value: float = None, ligand_smiles: str = None) -> Dict:
         """
-        Simulate docking results (since running actual AutoDock Vina requires backend server)
-        In production, this would call a backend API running AutoDock Vina
+        Simulate docking results with 3D pose information
         
-        NOTE: This is a SIMPLIFIED SIMULATION for demonstration
-        Real docking would use: python subprocess to run vina --receptor protein.pdbqt --ligand ligand.pdbqt
+        In production: Would call AutoDock Vina with:
+        - vina --receptor protein.pdbqt --ligand ligand.pdbqt --out result.pdbqt
+        - Parse PDBQT output for coordinates and orientations
+        
+        Returns binding modes with simulated 3D coordinates
         """
+        import random
+        import math
         
-        # Simulate binding affinity based on known activity data
+        # Simulate binding affinity based on known activity
         if activity_value:
-            # Convert IC50/Ki to approximate binding affinity
-            # Lower IC50 = better binding = more negative affinity
             base_affinity = -math.log10(activity_value / 1000000) * 1.5
+            base_affinity = max(-12, min(-4, base_affinity))  # Realistic range
         else:
-            # Random score for unknown compounds
-            base_affinity = random.uniform(-4, -9)
+            base_affinity = random.uniform(-6, -9)
         
-        # Add some variation
-        noise = random.uniform(-0.5, 0.5)
+        # Molecular complexity factor
+        if ligand_smiles:
+            complexity = len(ligand_smiles) / 50
+            base_affinity -= complexity * 0.5
+        
+        noise = random.uniform(-0.8, 0.8)
         binding_affinity = base_affinity + noise
         
-        # Simulate multiple binding modes
+        # Generate multiple binding modes with 3D coordinates
         modes = []
-        for i in range(min(5, random.randint(3, 7))):
-            mode_affinity = binding_affinity + random.uniform(0, 2)
+        num_modes = random.randint(5, 9)
+        
+        for i in range(num_modes):
+            mode_affinity = binding_affinity + random.uniform(0, 2.5)
+            
+            # Simulate 3D coordinates (center of binding site)
+            center_x = random.uniform(-10, 10)
+            center_y = random.uniform(-10, 10)
+            center_z = random.uniform(-10, 10)
+            
+            # Simulate rotation (Euler angles)
+            rotation_x = random.uniform(0, 360)
+            rotation_y = random.uniform(0, 360)
+            rotation_z = random.uniform(0, 360)
+            
             modes.append({
                 "mode": i + 1,
                 "affinity": round(mode_affinity, 2),
                 "rmsd_lb": round(random.uniform(0, 2), 2),
-                "rmsd_ub": round(random.uniform(0, 3), 2)
+                "rmsd_ub": round(random.uniform(0, 3), 2),
+                "center": {
+                    "x": round(center_x, 3),
+                    "y": round(center_y, 3),
+                    "z": round(center_z, 3)
+                },
+                "rotation": {
+                    "x": round(rotation_x, 2),
+                    "y": round(rotation_y, 2),
+                    "z": round(rotation_z, 2)
+                },
+                "orientation": f"α={rotation_x:.1f}° β={rotation_y:.1f}° γ={rotation_z:.1f}°"
             })
         
-        # Sort by affinity (most negative = best)
         modes = sorted(modes, key=lambda x: x['affinity'])
         
         return {
             "available": True,
             "binding_affinity": round(modes[0]['affinity'], 2),
             "modes": modes,
+            "best_mode": modes[0],
             "exhaustiveness": 8,
-            "simulated": True  # Flag indicating this is simulated
+            "simulated": True,
+            "has_coordinates": True
         }
-
-
-
-
 
     async def fetch_string_ppi(self, gene_name: str, uniprot_id: str, limit: int = 10) -> Dict:
         """
@@ -1678,3 +1997,827 @@ class ProteinAPIClient:
                 "interactions": [],
                 "error": str(e)
             }
+
+    async def fetch_similar_compounds(self, reference_smiles: str, similarity_threshold: float = 0.7) -> Dict:
+        """
+        Fetch structurally similar compounds from PubChem
+        Can identify unknown/novel ligands with binding potential
+        """
+        cache_key = f"similar_{hash(reference_smiles)}_{similarity_threshold}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # PubChem similarity search
+                base_url = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/fastsimilarity_2d/smiles"
+                
+                params = {
+                    "smiles": reference_smiles,
+                    "Threshold": int(similarity_threshold * 100),  # Convert 0.7 to 70
+                    "MaxRecords": 20
+                }
+                
+                # Get similar compound CIDs
+                search_url = f"{base_url}/cids/JSON"
+                response = await client.post(search_url, data=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                cids = data.get("IdentifierList", {}).get("CID", [])
+                
+                if not cids:
+                    return {"available": False, "compounds": []}
+                
+                # Get compound properties
+                compounds = []
+                for cid in cids[:10]:  # Limit to top 10
+                    try:
+                        prop_url = f"https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/{cid}/property/MolecularFormula,MolecularWeight,IUPACName,CanonicalSMILES/JSON"
+                        prop_response = await client.get(prop_url)
+                        prop_data = prop_response.json()
+                        
+                        props = prop_data.get("PropertyTable", {}).get("Properties", [{}])[0]
+                        
+                        compounds.append({
+                            "cid": cid,
+                            "name": props.get("IUPACName", f"PubChem-{cid}"),
+                            "smiles": props.get("CanonicalSMILES", ""),
+                            "molecular_weight": props.get("MolecularWeight", 0),
+                            "formula": props.get("MolecularFormula", ""),
+                            "pubchem_url": f"https://pubchem.ncbi.nlm.nih.gov/compound/{cid}",
+                            "similarity": "Unknown",  # Would need fingerprint comparison
+                            "source": "PubChem Similar"
+                        })
+                    except:
+                        continue
+                
+                result = {
+                    "available": len(compounds) > 0,
+                    "compounds": compounds,
+                    "reference_smiles": reference_smiles
+                }
+                
+                self.cache.set(cache_key, result)
+                return result
+                
+        except Exception as e:
+            st.warning(f"Similar compound search error: {str(e)}")
+            return {"available": False, "compounds": []}
+
+
+    async def predict_drug_candidates(self, protein_sequence: str, gene_name: str) -> Dict:
+        """
+        Predict novel drug candidates using protein sequence/structure
+        Uses DrugBank, PubChem, and literature mining
+        """
+        cache_key = f"drug_candidates_{gene_name}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            candidates = []
+            
+            # Strategy 1: Find compounds targeting similar proteins
+            # Using protein family/domain information
+            
+            # Strategy 2: Literature-based discovery (PubMed)
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Search PubMed for drug discovery papers
+                pubmed_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+                params = {
+                    "db": "pubmed",
+                    "term": f"{gene_name} AND (inhibitor OR drug OR compound OR ligand)",
+                    "retmax": 5,
+                    "retmode": "json"
+                }
+                
+                response = await client.get(pubmed_url, params=params)
+                data = response.json()
+                
+                pmids = data.get("esearchresult", {}).get("idlist", [])
+                
+                # Extract compound mentions from abstracts
+                for pmid in pmids:
+                    try:
+                        fetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+                        fetch_params = {
+                            "db": "pubmed",
+                            "id": pmid,
+                            "retmode": "xml"
+                        }
+                        
+                        abstract_response = await client.get(fetch_url, params=fetch_params)
+                        # Simple parsing - in production use proper XML parser
+                        text = abstract_response.text.lower()
+                        
+                        # Look for common drug/compound indicators
+                        compound_indicators = ['inhibitor', 'compound', 'drug', 'molecule']
+                        if any(indicator in text for indicator in compound_indicators):
+                            candidates.append({
+                                "name": f"Literature compound (PMID:{pmid})",
+                                "source": "PubMed",
+                                "pmid": pmid,
+                                "pubmed_url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
+                                "evidence": "Literature mention"
+                            })
+                    except:
+                        continue
+            
+            # Strategy 3: Recommend FDA-approved drugs for repurposing
+            # Based on protein family
+            try:
+                repurposing_candidates = self.suggest_repurposing_drugs(gene_name)
+                candidates.extend(repurposing_candidates)
+            except Exception as repurposing_error:
+                import sys
+                print(f"Warning: Drug repurposing failed: {repurposing_error}", file=sys.stderr)
+                # Continue without repurposing candidates
+            
+            result = {
+                "available": len(candidates) > 0,
+                "candidates": candidates[:10],  # Top 10
+                "gene_name": gene_name,
+                "strategies": ["Literature mining", "Drug repurposing", "Similarity search"]
+            }
+            
+            self.cache.set(cache_key, result)
+            return result
+            
+        except Exception as e:
+            return {"available": False, "candidates": [], "error": str(e)}
+
+    @staticmethod
+    def suggest_repurposing_drugs(gene_name: str) -> list:
+        """
+        Suggest FDA-approved drugs for repurposing based on target class
+        """
+        # Drug repurposing database (simplified)
+        REPURPOSING_DB = {
+            # Kinases
+            "kinase": [
+                {"name": "Imatinib", "target_class": "Tyrosine kinase", "indication": "CML"},
+                {"name": "Gefitinib", "target_class": "EGFR", "indication": "NSCLC"},
+                {"name": "Sorafenib", "target_class": "Multi-kinase", "indication": "RCC"}
+            ],
+            # Proteases
+            "protease": [
+                {"name": "Darunavir", "target_class": "HIV protease", "indication": "HIV"},
+                {"name": "Bortezomib", "target_class": "Proteasome", "indication": "Myeloma"}
+            ],
+            # DNA repair
+            "repair": [
+                {"name": "Olaparib", "target_class": "PARP", "indication": "BRCA cancer"},
+                {"name": "Talazoparib", "target_class": "PARP", "indication": "Breast cancer"}
+            ],
+            # Receptors
+            "receptor": [
+                {"name": "Erlotinib", "target_class": "EGFR", "indication": "NSCLC"},
+                {"name": "Cetuximab", "target_class": "EGFR", "indication": "Colorectal"}
+            ]
+        }
+        
+        suggestions = []
+        gene_lower = gene_name.lower()
+        
+        # Simple keyword matching (in production: use protein family classification)
+        for category, drugs in REPURPOSING_DB.items():
+            if category in gene_lower or gene_lower in category:
+                for drug in drugs:
+                    suggestions.append({
+                        "name": drug["name"],
+                        "source": "Drug Repurposing",
+                        "target_class": drug["target_class"],
+                        "original_indication": drug["indication"],
+                        "evidence": "Target class similarity",
+                        "status": "FDA Approved"
+                    })
+        
+        return suggestions
+
+    async def fetch_drugbank_targets(self, uniprot_id: str, gene_name: str) -> Dict:
+        """
+        Fetch FDA-approved drugs and clinical trials targeting this protein
+        Integrates data from ChEMBL, ClinicalTrials.gov, and DrugBank
+        """
+        cache_key = f"drugbank_{uniprot_id}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                drugs = {
+                    "fda_approved": [],
+                    "clinical_trials": [],
+                    "investigational": []
+                }
+                
+                # Source 1: ChEMBL for FDA-approved drugs
+                chembl_url = f"https://www.ebi.ac.uk/chembl/api/data/target/search.json?q={uniprot_id}"
+                
+                try:
+                    chembl_response = await client.get(chembl_url)
+                    chembl_response.raise_for_status()
+                    chembl_data = chembl_response.json()
+                    
+                    if chembl_data.get("targets"):
+                        target_id = chembl_data["targets"][0].get("target_chembl_id")
+                        
+                        # Get drugs for this target
+                        drug_url = f"https://www.ebi.ac.uk/chembl/api/data/drug_indication.json?target_chembl_id={target_id}"
+                        drug_response = await client.get(drug_url)
+                        drug_data = drug_response.json()
+                        
+                        for indication in drug_data.get("drug_indications", []):
+                            mol_chembl_id = indication.get("molecule_chembl_id")
+                            
+                            # Get drug details
+                            mol_url = f"https://www.ebi.ac.uk/chembl/api/data/molecule/{mol_chembl_id}.json"
+                            mol_response = await client.get(mol_url)
+                            mol_info = mol_response.json()
+                            
+                            drug_name = mol_info.get("pref_name", mol_chembl_id)
+                            max_phase = mol_info.get("max_phase", 0)
+                            
+                            drug_entry = {
+                                "name": drug_name,
+                                "chembl_id": mol_chembl_id,
+                                "indication": indication.get("mesh_heading", "N/A"),
+                                "max_phase": max_phase,
+                                "molecule_type": mol_info.get("molecule_type", "Small molecule"),
+                                "first_approval": mol_info.get("first_approval", "N/A"),
+                                "chembl_url": f"https://www.ebi.ac.uk/chembl/compound_report_card/{mol_chembl_id}/"
+                            }
+                            
+                            if max_phase == 4:
+                                drugs["fda_approved"].append(drug_entry)
+                            elif max_phase >= 2:
+                                drugs["clinical_trials"].append(drug_entry)
+                            else:
+                                drugs["investigational"].append(drug_entry)
+                except:
+                    pass
+                
+                # Source 2: ClinicalTrials.gov for ongoing trials
+                trial_url = "https://clinicaltrials.gov/api/v2/studies"
+                
+                try:
+                    trial_params = {
+                        "query.term": f"{gene_name} OR {uniprot_id}",
+                        "filter.overallStatus": "RECRUITING,ACTIVE_NOT_RECRUITING,COMPLETED",
+                        "pageSize": 20
+                    }
+                    
+                    trial_response = await client.get(trial_url, params=trial_params)
+                    trial_data = trial_response.json()
+                    
+                    for study in trial_data.get("studies", []):
+                        protocol = study.get("protocolSection", {})
+                        identification = protocol.get("identificationModule", {})
+                        status = protocol.get("statusModule", {})
+                        design = protocol.get("designModule", {})
+                        
+                        nct_id = identification.get("nctId", "")
+                        title = identification.get("briefTitle", "")
+                        phase = design.get("phases", ["N/A"])[0] if design.get("phases") else "N/A"
+                        status_val = status.get("overallStatus", "Unknown")
+                        
+                        # Extract intervention (drug name)
+                        interventions = protocol.get("armsInterventionsModule", {}).get("interventions", [])
+                        drug_names = [i.get("name", "") for i in interventions if i.get("type") == "DRUG"]
+                        
+                        if drug_names:
+                            trial_entry = {
+                                "nct_id": nct_id,
+                                "title": title[:100],
+                                "drugs": ", ".join(drug_names[:3]),
+                                "phase": phase,
+                                "status": status_val,
+                                "url": f"https://clinicaltrials.gov/study/{nct_id}"
+                            }
+                            
+                            # Categorize by phase
+                            if phase in ["PHASE3", "PHASE2_PHASE3"]:
+                                if trial_entry not in drugs["clinical_trials"]:
+                                    drugs["clinical_trials"].append(trial_entry)
+                except:
+                    pass
+                
+                # Add manual curated database for common targets
+                manual_drugs = get_manual_drug_database(gene_name, uniprot_id)
+                if manual_drugs:
+                    drugs["fda_approved"].extend(manual_drugs.get("fda_approved", []))
+                    drugs["clinical_trials"].extend(manual_drugs.get("clinical_trials", []))
+                
+                result = {
+                    "available": any([drugs["fda_approved"], drugs["clinical_trials"], drugs["investigational"]]),
+                    "gene_name": gene_name,
+                    "uniprot_id": uniprot_id,
+                    "fda_approved": drugs["fda_approved"][:20],
+                    "clinical_trials": drugs["clinical_trials"][:20],
+                    "investigational": drugs["investigational"][:10],
+                    "total_fda": len(drugs["fda_approved"]),
+                    "total_trials": len(drugs["clinical_trials"]),
+                    "total_investigational": len(drugs["investigational"])
+                }
+                
+                self.cache.set(cache_key, result)
+                return result
+                
+        except Exception as e:
+            st.warning(f"Drug-target fetch error: {str(e)}")
+
+    async def fetch_clinical_trials_by_drug(self, drug_name: str, max_results: int = 20) -> List[Dict]:
+        """
+        Fetch clinical trials from ClinicalTrials.gov using a drug name query.
+        Returns raw study metadata including NCT ID, title, phase, status, etc.
+        """
+        cache_key = f"clinical_trials_drug_{drug_name.lower()}"
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
+
+        results: List[Dict] = []
+        trial_url = "https://clinicaltrials.gov/api/v2/studies"
+        nct_pattern = re.compile(r"^NCT\d{8}$", re.IGNORECASE)
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                query_term = f"AREA[InterventionName] \"{drug_name}\" OR AREA[Condition] \"{drug_name}\""
+                trial_params = {
+                    "query.term": query_term,
+                    "filter.overallStatus": "RECRUITING,ACTIVE_NOT_RECRUITING,COMPLETED",
+                    "pageSize": max_results,
+                }
+
+                trial_response = await client.get(trial_url, params=trial_params)
+                trial_response.raise_for_status()
+                trial_data = trial_response.json()
+
+                for study in trial_data.get("studies", []):
+                    protocol = study.get("protocolSection", {})
+                    identification = protocol.get("identificationModule", {})
+                    status = protocol.get("statusModule", {})
+                    design = protocol.get("designModule", {})
+                    conditions = protocol.get("conditionsModule", {})
+                    sponsors = protocol.get("sponsorsModule", {})
+                    locations_module = protocol.get("contactsLocationsModule", {})
+                    interventions_module = protocol.get("armsInterventionsModule", {})
+
+                    nct_id = identification.get("nctId", "")
+                    if not nct_pattern.match(str(nct_id)):
+                        print(
+                            f"ClinicalTrials.gov: invalid NCT ID skipped: {nct_id}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    title = identification.get("briefTitle", "")
+                    phase = "N/A"
+                    if design.get("phases"):
+                        phase = design.get("phases", ["N/A"])[0]
+                    status_val = status.get("overallStatus", "Unknown")
+
+                    condition_list = conditions.get("conditions", [])
+                    conditions_value = condition_list if condition_list else []
+
+                    interventions = interventions_module.get("interventions", [])
+                    intervention_names = [i.get("name", "") for i in interventions if i.get("name")]
+                    drug_names = [i.get("name", "") for i in interventions if i.get("type") == "DRUG" and i.get("name")]
+
+                    sponsor_name = sponsors.get("leadSponsor", {}).get("name", "N/A")
+
+                    enrollment = "N/A"
+                    enrollment_info = design.get("enrollmentInfo", {})
+                    if enrollment_info.get("count") is not None:
+                        enrollment = enrollment_info.get("count")
+
+                    start_date = "N/A"
+                    start_struct = status.get("startDateStruct", {})
+                    if start_struct.get("date"):
+                        start_date = start_struct.get("date")
+
+                    location_summary = "N/A"
+                    locations = locations_module.get("locations", [])
+                    if locations:
+                        location_summary = ", ".join(
+                            filter(None, [
+                                locations[0].get("city"),
+                                locations[0].get("state"),
+                                locations[0].get("country"),
+                            ])
+                        ) or "N/A"
+
+                    results.append({
+                        "nct_id": str(nct_id).upper(),
+                        "title": title,
+                        "status": status_val,
+                        "phase": phase,
+                        "conditions": conditions_value,
+                        "clinicaltrials_url": f"https://clinicaltrials.gov/study/{str(nct_id).upper()}",
+                        "interventions": intervention_names,
+                        "drugs": ", ".join(drug_names),
+                        "sponsor": sponsor_name,
+                        "locations": location_summary,
+                        "enrollment": enrollment,
+                        "start_date": start_date,
+                    })
+        except Exception as e:
+            print(f"ClinicalTrials.gov fetch error: {str(e)}", file=sys.stderr)
+
+        self.cache.set(cache_key, results)
+        return results
+    
+    def predict_ligand_binding(self, smiles_list: List[str], molecule_names: List[str] = None) -> Dict:
+        """
+        Predict binding affinity and likelihood for drug molecules (SMILES format)
+        
+        Args:
+            smiles_list: List of SMILES strings
+            molecule_names: Optional list of molecule names
+            
+        Returns:
+            Dictionary with predictions, rankings, and recommendations
+        """
+        try:
+            from ligand_binding_predictor import LigandBindingPredictor
+            
+            predictor = LigandBindingPredictor()
+            
+            # Predict for all molecules
+            predictions = predictor.predict_batch(smiles_list, molecule_names)
+            
+            # Rank and recommend
+            recommendations = predictor.recommend_top_candidates(predictions, n=min(10, len(smiles_list)))
+            
+            return {
+                "available": True,
+                "predictions": predictions,
+                "ranked_molecules": recommendations.get("top_candidates", []),
+                "statistics": {
+                    "total_molecules": recommendations.get("total_molecules", 0),
+                    "valid_molecules": recommendations.get("valid_molecules", 0),
+                    "average_affinity": recommendations.get("average_affinity"),
+                    "average_likelihood": recommendations.get("average_likelihood")
+                },
+                "recommendations": recommendations.get("top_candidates", [])
+            }
+            
+        except ImportError:
+            return {
+                "available": False,
+                "error": "Ligand binding predictor module not available. Install required dependencies."
+            }
+        except Exception as e:
+            return {
+                "available": False,
+                "error": f"Binding prediction error: {str(e)}"
+            }
+    
+    def validate_smiles(self, smiles: str) -> Dict:
+        """
+        Validate a SMILES string
+        
+        Args:
+            smiles: SMILES string to validate
+            
+        Returns:
+            Dictionary with validation results
+        """
+        try:
+            from ligand_binding_predictor import SMILESValidator
+            
+            validator = SMILESValidator()
+            is_valid, error = validator.is_valid_smiles(smiles)
+            preprocessed = validator.preprocess_smiles(smiles)
+            
+            return {
+                "is_valid": is_valid,
+                "error": error,
+                "canonical_smiles": preprocessed.get("canonical_smiles"),
+                "atom_count": preprocessed.get("atom_count", 0),
+                "bond_count": preprocessed.get("bond_count", 0)
+            }
+            
+        except ImportError:
+            return {
+                "is_valid": False,
+                "error": "SMILES validator not available. Install required dependencies."
+            }
+        except Exception as e:
+            return {
+                "is_valid": False,
+                "error": f"Validation error: {str(e)}"
+            }
+
+
+def get_manual_drug_database(gene_name: str, uniprot_id: str) -> Dict:
+    """
+    Curated database of known drug-target relationships
+    Covers major therapeutic targets
+    """
+    DATABASE = {
+        # EGFR
+        "EGFR": {
+            "fda_approved": [
+                {"name": "Erlotinib", "indication": "Non-small cell lung cancer (NSCLC)", "year": 2004, "type": "Small molecule TKI"},
+                {"name": "Gefitinib", "indication": "NSCLC with EGFR mutations", "year": 2003, "type": "Small molecule TKI"},
+                {"name": "Afatinib", "indication": "NSCLC", "year": 2013, "type": "Irreversible TKI"},
+                {"name": "Osimertinib", "indication": "NSCLC (T790M mutation)", "year": 2015, "type": "3rd-gen TKI"},
+                {"name": "Cetuximab", "indication": "Colorectal cancer, Head & neck", "year": 2004, "type": "Monoclonal antibody"},
+                {"name": "Panitumumab", "indication": "Colorectal cancer", "year": 2006, "type": "Monoclonal antibody"}
+            ],
+            "clinical_trials": [
+                {"name": "Mobocertinib", "phase": "Phase 3", "indication": "NSCLC (Exon 20 insertion)", "status": "Active"},
+                {"name": "Amivantamab", "phase": "Phase 3", "indication": "NSCLC", "status": "Recruiting"}
+            ]
+        },
+        
+        # TP53
+        "TP53": {
+            "fda_approved": [],
+            "clinical_trials": [
+                {"name": "APR-246 (Eprenetapopt)", "phase": "Phase 3", "indication": "AML with TP53 mutation", "status": "Active"},
+                {"name": "PC14586", "phase": "Phase 1/2", "indication": "Solid tumors with TP53 mutation", "status": "Recruiting"},
+                {"name": "Kevetrin", "phase": "Phase 2", "indication": "Ovarian cancer", "status": "Active"}
+            ]
+        },
+        
+        # BRCA1
+        "BRCA1": {
+            "fda_approved": [
+                {"name": "Olaparib", "indication": "BRCA-mutated breast/ovarian cancer", "year": 2014, "type": "PARP inhibitor"},
+                {"name": "Talazoparib", "indication": "BRCA-mutated breast cancer", "year": 2018, "type": "PARP inhibitor"},
+                {"name": "Rucaparib", "indication": "BRCA-mutated ovarian cancer", "year": 2016, "type": "PARP inhibitor"},
+                {"name": "Niraparib", "indication": "Ovarian cancer", "year": 2017, "type": "PARP inhibitor"}
+            ],
+            "clinical_trials": [
+                {"name": "Veliparib", "phase": "Phase 3", "indication": "BRCA-mutated breast cancer", "status": "Active"}
+            ]
+        },
+        
+        # ALB (Albumin)
+        "ALB": {
+            "fda_approved": [
+                {"name": "Albumin (Human)", "indication": "Hypovolemia, hypoalbuminemia", "year": 1944, "type": "Replacement therapy"}
+            ],
+            "clinical_trials": []
+        },
+        
+        # INS (Insulin)
+        "INS": {
+            "fda_approved": [
+                {"name": "Insulin glargine", "indication": "Type 1 & 2 diabetes", "year": 2000, "type": "Long-acting insulin"},
+                {"name": "Insulin lispro", "indication": "Diabetes mellitus", "year": 1996, "type": "Rapid-acting insulin"},
+                {"name": "Insulin aspart", "indication": "Diabetes mellitus", "year": 2000, "type": "Rapid-acting insulin"},
+                {"name": "Insulin degludec", "indication": "Diabetes mellitus", "year": 2015, "type": "Ultra-long acting"}
+            ],
+            "clinical_trials": []
+        }
+    }
+    
+    gene_upper = gene_name.upper()
+    return DATABASE.get(gene_upper, {"fda_approved": [], "clinical_trials": []})
+
+
+# ===== PREDICTIVE RISK CALCULATOR =====
+
+def calculate_disease_risk(protein_expression: pd.DataFrame, gene_name: str, 
+                        user_factors: Dict = None) -> Dict:
+    """
+    Calculate disease risk based on protein expression and user factors
+    
+    Risk formula:
+    Risk = (Expression_score × 0.4) + (Age × 0.2) + 
+        (Family_history × 0.25) + (Lifestyle × 0.15)
+    
+    Returns risk level and recommendations
+    """
+    risk_data = {
+        "gene": gene_name,
+        "risk_score": 0.0,
+        "risk_level": "Unknown",
+        "components": {},
+        "recommendations": [],
+        "detection_advantage": "",
+        "confidence": "Medium"
+    }
+    
+    # Component 1: Protein expression score (0-40 points)
+    expression_score = calculate_expression_score(protein_expression, gene_name)
+    risk_data["components"]["expression"] = {
+        "score": expression_score,
+        "weight": 0.4,
+        "contribution": (expression_score / 40.0) * 0.4 * 100
+    }
+    
+    # Component 2: Age factor (0-20 points)
+    age_score = 0
+    if user_factors and user_factors.get("age"):
+        age = user_factors["age"]
+        if age < 40:
+            age_score = 5
+        elif age < 50:
+            age_score = 10
+        elif age < 60:
+            age_score = 15
+        else:
+            age_score = 20
+    
+    risk_data["components"]["age"] = {
+        "score": age_score,
+        "weight": 0.2,
+        "contribution": (age_score / 20.0) * 0.2 * 100
+    }
+    
+    # Component 3: Family history (0-25 points)
+    family_score = 0
+    if user_factors and user_factors.get("family_history"):
+        if user_factors["family_history"] == "first_degree":
+            family_score = 25
+        elif user_factors["family_history"] == "second_degree":
+            family_score = 15
+        elif user_factors["family_history"] == "none":
+            family_score = 0
+    
+    risk_data["components"]["family_history"] = {
+        "score": family_score,
+        "weight": 0.25,
+        "contribution": (family_score / 25.0) * 0.25 * 100
+    }
+    
+    # Component 4: Lifestyle factors (0-15 points)
+    lifestyle_score = calculate_lifestyle_score(user_factors)
+    risk_data["components"]["lifestyle"] = {
+        "score": lifestyle_score,
+        "weight": 0.15,
+        "contribution": (lifestyle_score / 15.0) * 0.15 * 100
+    }
+    
+    # Calculate total risk score (0-100)
+    # Normalize component scores to 0-1 range, then apply weights and scale to 0-100
+    normalized_expression = (expression_score / 40.0) * 0.4  # 0-40 normalized by 40
+    normalized_age = (age_score / 20.0) * 0.2              # 0-20 normalized by 20
+    normalized_family = (family_score / 25.0) * 0.25       # 0-25 normalized by 25
+    normalized_lifestyle = (lifestyle_score / 15.0) * 0.15 # 0-15 normalized by 15
+    
+    total_risk = (normalized_expression + normalized_age + normalized_family + normalized_lifestyle) * 100
+    
+    risk_data["risk_score"] = round(total_risk, 1)
+    
+    # Determine risk level
+    if total_risk >= 70:
+        risk_data["risk_level"] = "High Risk"
+        risk_data["risk_color"] = "#dc3545"
+        risk_data["detection_advantage"] = "Early detection possible 6-12 months earlier"
+        risk_data["recommendations"] = get_high_risk_recommendations(gene_name)
+    elif total_risk >= 40:
+        risk_data["risk_level"] = "Medium Risk"
+        risk_data["risk_color"] = "#ffc107"
+        risk_data["detection_advantage"] = "Regular monitoring recommended"
+        risk_data["recommendations"] = get_medium_risk_recommendations(gene_name)
+    else:
+        risk_data["risk_level"] = "Low Risk"
+        risk_data["risk_color"] = "#28a745"
+        risk_data["detection_advantage"] = "Routine screening sufficient"
+        risk_data["recommendations"] = get_low_risk_recommendations(gene_name)
+    
+    return risk_data
+
+
+def calculate_expression_score(expression_df: pd.DataFrame, gene_name: str) -> float:
+    """
+    Calculate risk score from protein expression patterns
+    Higher/abnormal expression = higher risk
+    """
+    if expression_df.empty:
+        return 20  # Default moderate score
+    
+    # Gene-specific risk associations
+    RISK_GENES = {
+        "TP53": {"risk_type": "low_expression", "threshold": 1.0},  # Loss of function
+        "BRCA1": {"risk_type": "low_expression", "threshold": 1.0},  # Loss increases cancer risk
+        "EGFR": {"risk_type": "high_expression", "threshold": 2.0},  # Overexpression in cancer
+        "HER2": {"risk_type": "high_expression", "threshold": 2.0},
+        "MYC": {"risk_type": "high_expression", "threshold": 2.0},
+        "RAS": {"risk_type": "high_expression", "threshold": 1.5}
+    }
+    
+    gene_config = RISK_GENES.get(gene_name.upper(), {"risk_type": "high_expression", "threshold": 1.5})
+    
+    # Calculate mean expression across tissues
+    if 'level_numeric' in expression_df.columns:
+        mean_expression = expression_df['level_numeric'].mean()
+        high_expr_count = len(expression_df[expression_df['level'] == 'High'])
+        
+        if gene_config["risk_type"] == "high_expression":
+            # High expression = high risk
+            if mean_expression >= 2.5 or high_expr_count >= 5:
+                return 40  # Very high
+            elif mean_expression >= 2.0 or high_expr_count >= 3:
+                return 30  # High
+            elif mean_expression >= 1.0:
+                return 20  # Moderate
+            else:
+                return 10  # Low
+        else:
+            # Low expression = high risk (tumor suppressors)
+            if mean_expression <= 0.5:
+                return 40  # Very high risk
+            elif mean_expression <= 1.0:
+                return 30  # High risk
+            elif mean_expression <= 1.5:
+                return 20  # Moderate
+            else:
+                return 10  # Low risk
+    
+    return 20  # Default
+
+
+def calculate_lifestyle_score(user_factors: Dict) -> float:
+    """Calculate risk from lifestyle factors"""
+    if not user_factors:
+        return 7.5  # Default moderate
+    
+    score = 0
+    
+    # Smoking
+    if user_factors.get("smoking") == "current":
+        score += 5
+    elif user_factors.get("smoking") == "former":
+        score += 3
+    
+    # BMI
+    bmi = user_factors.get("bmi", 25)
+    if bmi >= 30:
+        score += 4
+    elif bmi >= 25:
+        score += 2
+    
+    # Exercise
+    if user_factors.get("exercise") == "none":
+        score += 3
+    elif user_factors.get("exercise") == "occasional":
+        score += 1
+    
+    # Diet
+    if user_factors.get("diet") == "poor":
+        score += 3
+    
+    return min(score, 15)
+
+
+def get_high_risk_recommendations(gene_name: str) -> list:
+    """Recommendations for high-risk individuals"""
+    base_recommendations = [
+        "Immediate consultation with oncologist/specialist recommended",
+        "Enhanced screening protocol: Every 3-6 months",
+        "Consider genetic counseling and testing",
+        "Discuss preventive treatment options with physician"
+    ]
+    
+    gene_specific = {
+        "TP53": [
+            "Li-Fraumeni syndrome evaluation recommended",
+            "Multi-cancer early detection (MCED) testing",
+            "Annual whole-body MRI screening"
+        ],
+        "BRCA1": [
+            "Risk-reducing surgery discussion",
+            "MRI + mammography every 6 months",
+            "Consider prophylactic oophorectomy after age 40",
+            "PARP inhibitor eligibility assessment"
+        ],
+        "EGFR": [
+            "Low-dose CT screening for lung cancer",
+            "Targeted therapy eligibility assessment",
+            "Smoking cessation program (if applicable)"
+        ]
+    }
+    
+    return base_recommendations + gene_specific.get(gene_name.upper(), [])
+
+
+def get_medium_risk_recommendations(gene_name: str) -> list:
+    """Recommendations for medium-risk individuals"""
+    return [
+        "Annual screening with specialist",
+        "Biomarker monitoring every 6-12 months",
+        "Lifestyle modification consultation",
+        "Consider participation in prevention trials",
+        "Regular self-examination and symptom awareness"
+    ]
+
+
+def get_low_risk_recommendations(gene_name: str) -> list:
+    """Recommendations for low-risk individuals"""
+    return [
+        "Standard age-appropriate screening",
+        "Annual health check-up",
+        "Maintain healthy lifestyle habits",
+        "Be aware of warning signs and symptoms",
+        "Re-assess if family history changes"
+    ]
+
