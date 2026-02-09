@@ -5299,71 +5299,114 @@ def _generate_repurposing_report_data(drug_name, api_client=None):
     
     # ========== GENERATE DYNAMIC APPROVED DRUGS SECTION ==========
     # Create a generic approved drug entry based on the searched drug name
+    
+    # Fetch drug metadata (DrugBank ID, PubChem ID, status) from database/ChEMBL
+    from api_client import get_drug_metadata
+    drug_metadata = get_drug_metadata(drug_name)
+    
+    # Determine confidence score based on data availability
+    base_confidence = 0
+    if drug_metadata.get('drugbank_id') != 'N/A':
+        base_confidence += 25  # Has DrugBank ID
+    if drug_metadata.get('pubchem_id') != 'N/A':
+        base_confidence += 25  # Has PubChem ID
+    if drug_metadata.get('status') != 'Status Unknown - Query FDA Database':
+        base_confidence += 25  # Has known status
+    if report_data['clinical_trials']:
+        base_confidence += 25  # Has clinical trials
+    
     approved_entry = {
         'name': drug_name,
-        'drug_id': 'UNKNOWN',
-        'drugbank_id': 'UNKNOWN',
-        'pubchem_id': 'UNKNOWN',
+        'drug_id': 'N/A',
+        'drugbank_id': drug_metadata.get('drugbank_id', 'N/A'),
+        'pubchem_id': drug_metadata.get('pubchem_id', 'N/A'),
         'indication': f'Search Results for {drug_name}',
         'approval_date': 'Contact DrugBank for details',
         'mechanism': f'Consult FDA and DrugBank databases for {drug_name} mechanism of action',
         'target_proteins': [],
-        'evidence_source': 'ClinicalTrials.gov + FDA Database',
-        'confidence_score': 50 if report_data['clinical_trials'] else 30,  # Higher confidence if trials exist
-        'status': 'Status Unknown - Query FDA Database'
+        'evidence_source': 'ChEMBL + ClinicalTrials.gov + DrugBank',
+        'confidence_score': min(100, base_confidence),  # Cap at 100%
+        'status': drug_metadata.get('status', 'Status Unknown - Query FDA Database')
     }
     
-    # If we found clinical trials, increase confidence and add them as approved
+    # If we found clinical trials, update indication
     if report_data['clinical_trials']:
-        approved_entry['confidence_score'] = 75
-        approved_entry['status'] = 'Under Investigation'
         approved_entry['indication'] = f'{len(report_data["clinical_trials"])} active clinical trials found'
     
     report_data['approved_drugs'] = [approved_entry]
     
     # ========== GENERATE DYNAMIC REPURPOSING OPPORTUNITIES ==========
-    # NOTE: Without actual biomedical network data, we show a message prompting user
-    # to use actual drug repurposing algorithms or databases
-    report_data['repurposing_opportunities'] = [
-        {
-            'disease': 'Clinical Trial Conditions Available',
-            'confidence': 60.0 if report_data['clinical_trials'] else 0,
-            'mechanism': f'Review the clinical trials above for {drug_name} to understand current research directions',
-            'evidence': [
-                f'Total clinical trials found: {len(report_data["clinical_trials"])}',
-                'Consult PubMed for peer-reviewed literature on repurposing potential',
-                'Check DrugBank for known interactions and mechanisms',
-                'Visit KEGG database for pathway analysis',
-                'Analyze protein target data for novel indications'
-            ],
-            'status': 'Data-Driven Analysis Required',
-            'clinical_rationale': 'Use clinical trial data above and external databases for repurposing analysis',
-            'priority': 'High' if report_data['clinical_trials'] else 'Low',
-            'affected_pathways': ['Multiple - See trial conditions'],
-            'shared_targets': len(report_data['clinical_trials']),
-            'supporting_publications': 0
-        }
-    ]
-    
-    # Add a note about data availability
-    if not report_data['clinical_trials']:
-        report_data['repurposing_opportunities'].append({
-            'disease': 'No Clinical Trials Found',
-            'confidence': 0,
-            'mechanism': f'No active clinical trials located for {drug_name}',
-            'evidence': [
-                'This drug may not have active clinical trials',
-                'Check spelling or try alternative drug names',
-                'Visit ClinicalTrials.gov directly for manual search',
-                'Contact drug manufacturers for trial information'
-            ],
-            'status': 'Insufficient Data',
-            'clinical_rationale': 'More research needed to assess repurposing potential',
-            'priority': 'Low',
-            'affected_pathways': [],
-            'shared_targets': 0,
-            'supporting_publications': 0
-        })
+    # Create opportunities based on actual data
+    if report_data['clinical_trials'] and len(report_data['clinical_trials']) > 0:
+        # If we have clinical trials, create opportunities from trial conditions
+        trial_conditions = set()
+        for trial in report_data['clinical_trials'][:3]:  # Use first 3 trials
+            condition = trial.get('condition', '')
+            if condition and condition != 'N/A':
+                trial_conditions.add(condition)
+        
+        opportunities = []
+        for condition in list(trial_conditions)[:2]:  # Show up to 2 conditions
+            opportunities.append({
+                'disease': condition,
+                'confidence': 65.0,
+                'mechanism': f'{drug_name} is currently being investigated for {condition} in clinical trials',
+                'evidence': [
+                    f'Active clinical trials for {condition}',
+                    'See FDA-Approved Drugs & Clinical Trials tab for trial details',
+                    f'Consult PubMed for literature on {drug_name} and {condition}',
+                    'Contact trial sponsors for enrollment information'
+                ],
+                'status': 'Clinical Investigation',
+                'clinical_rationale': f'Drug is being actively studied for this indication',
+                'priority': 'High',
+                'affected_pathways': ['Multiple - See trial protocols'],
+                'shared_targets': 1,
+                'supporting_publications': 0
+            })
+        
+        # If no conditions extracted, show generic message
+        if not opportunities:
+            opportunities.append({
+                'disease': 'Clinical Trial Conditions Available',
+                'confidence': 60.0,
+                'mechanism': f'Review the clinical trials above for {drug_name} to understand current research directions',
+                'evidence': [
+                    f'Total clinical trials found: {len(report_data["clinical_trials"])}',
+                    'Consult PubMed for peer-reviewed literature on repurposing potential',
+                    'Check DrugBank for known interactions and mechanisms',
+                    'Visit KEGG database for pathway analysis',
+                ],
+                'status': 'Data-Driven Analysis Required',
+                'clinical_rationale': 'Use clinical trial data above and external databases for repurposing analysis',
+                'priority': 'High',
+                'affected_pathways': ['Multiple - See trial conditions'],
+                'shared_targets': len(report_data['clinical_trials']),
+                'supporting_publications': 0
+            })
+        
+        report_data['repurposing_opportunities'] = opportunities
+    else:
+        # No clinical trials found
+        report_data['repurposing_opportunities'] = [
+            {
+                'disease': 'No Clinical Trials Found',
+                'confidence': 0,
+                'mechanism': f'No active clinical trials located for {drug_name}',
+                'evidence': [
+                    'This drug may not have active clinical trials',
+                    'Check spelling or try alternative drug names',
+                    'Visit ClinicalTrials.gov directly for manual search',
+                    'Contact drug manufacturers for trial information'
+                ],
+                'status': 'Insufficient Data',
+                'clinical_rationale': 'More research needed to assess repurposing potential',
+                'priority': 'Low',
+                'affected_pathways': [],
+                'shared_targets': 0,
+                'supporting_publications': 0
+            }
+        ]
     
     return report_data
 

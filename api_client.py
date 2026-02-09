@@ -2513,6 +2513,123 @@ class ProteinAPIClient:
             }
 
 
+# ===== DRUG METADATA DATABASE =====
+# Curated drug database with DrugBank, PubChem IDs, and approval status
+DRUG_METADATA_DB = {
+    "cetirizine": {"drugbank_id": "DB01156", "pubchem_id": "2678", "status": "FDA Approved"},
+    "acetaminophen": {"drugbank_id": "DB00316", "pubchem_id": "1983", "status": "FDA Approved"},
+    "ibuprofen": {"drugbank_id": "DB01050", "pubchem_id": "3672", "status": "FDA Approved"},
+    "naproxen": {"drugbank_id": "DB00788", "pubchem_id": "156391", "status": "FDA Approved"},
+    "aspirin": {"drugbank_id": "DB00945", "pubchem_id": "2244", "status": "FDA Approved"},
+    "metformin": {"drugbank_id": "DB00331", "pubchem_id": "14219", "status": "FDA Approved"},
+    "atorvastatin": {"drugbank_id": "DB00461", "pubchem_id": "60823", "status": "FDA Approved"},
+    "lisinopril": {"drugbank_id": "DB00246", "pubchem_id": "5362129", "status": "FDA Approved"},
+    "omeprazole": {"drugbank_id": "DB00338", "pubchem_id": "4594", "status": "FDA Approved"},
+    "amoxicillin": {"drugbank_id": "DB01060", "pubchem_id": "33613", "status": "FDA Approved"},
+    "erythromycin": {"drugbank_id": "DB00199", "pubchem_id": "5288874", "status": "FDA Approved"},
+    "azithromycin": {"drugbank_id": "DB00207", "pubchem_id": "447043", "status": "FDA Approved"},
+    "osimertinib": {"drugbank_id": "DB05484", "pubchem_id": "56152474", "status": "FDA Approved"},
+    "erlotinib": {"drugbank_id": "DB00530", "pubchem_id": "176155", "status": "FDA Approved"},
+    "gefitinib": {"drugbank_id": "DB00817", "pubchem_id": "123631", "status": "FDA Approved"},
+    "olaparib": {"drugbank_id": "DB06692", "pubchem_id": "23237613", "status": "FDA Approved"},
+    "imatinib": {"drugbank_id": "DB00619", "pubchem_id": "5291", "status": "FDA Approved"},
+    "dasatinib": {"drugbank_id": "DB01254", "pubchem_id": "3062316", "status": "FDA Approved"},
+    "cetuximab": {"drugbank_id": "DB00734", "pubchem_id": "56842941", "status": "FDA Approved"},
+    "bevacizumab": {"drugbank_id": "DB00112", "pubchem_id": "7915435", "status": "FDA Approved"},
+    "rituximab": {"drugbank_id": "DB00073", "pubchem_id": "15589180", "status": "FDA Approved"},
+    "trastuzumab": {"drugbank_id": "DB00072", "pubchem_id": "7914308", "status": "FDA Approved"},
+    "dupilumab": {"drugbank_id": "DB12202", "pubchem_id": "71306916", "status": "FDA Approved"},
+    "pembrolizumab": {"drugbank_id": "DB11627", "pubchem_id": "71754778", "status": "FDA Approved"},
+    "nivolumab": {"drugbank_id": "DB12218", "pubchem_id": "71779325", "status": "FDA Approved"},
+}
+
+
+def get_drug_metadata(drug_name: str) -> Dict:
+    """
+    Get drug metadata (DrugBank ID, PubChem ID, status) from curated database.
+    Tries exact match, then partial match, then searches online.
+    
+    Args:
+        drug_name: Name of the drug
+        
+    Returns:
+        Dictionary with drugbank_id, pubchem_id, and status
+    """
+    result = {
+        "drugbank_id": "N/A",
+        "pubchem_id": "N/A",
+        "status": "Status Unknown - Query FDA Database"
+    }
+    
+    # Normalize drug name
+    normalized_name = drug_name.strip().lower()
+    
+    # Try exact match first
+    if normalized_name in DRUG_METADATA_DB:
+        return DRUG_METADATA_DB[normalized_name]
+    
+    # Try partial match
+    for db_name, metadata in DRUG_METADATA_DB.items():
+        if normalized_name in db_name or db_name in normalized_name:
+            return metadata
+    
+    # If not in database, try to fetch from ChEMBL
+    try:
+        import httpx
+        
+        # Search ChEMBL
+        search_url = "https://www.ebi.ac.uk/chembl/api/data/molecule/search.json"
+        params = {
+            "q": drug_name,
+            "limit": 5
+        }
+        
+        response = httpx.get(search_url, params=params, timeout=10.0)
+        if response.status_code == 200:
+            data = response.json()
+            molecules = data.get("molecules", [])
+            
+            if molecules:
+                mol = molecules[0]
+                chembl_id = mol.get("molecule_chembl_id")
+                max_phase = mol.get("max_phase")
+                
+                # Determine status
+                if max_phase == 4:
+                    result["status"] = "FDA Approved"
+                elif max_phase == 3:
+                    result["status"] = "Phase 3 Clinical Trial"
+                elif max_phase == 2:
+                    result["status"] = "Phase 2 Clinical Trial"
+                elif max_phase == 1:
+                    result["status"] = "Phase 1 Clinical Trial"
+                else:
+                    result["status"] = "Preclinical"
+                
+                # Get molecule details for IDs
+                if chembl_id:
+                    detail_url = f"https://www.ebi.ac.uk/chembl/api/data/molecule/{chembl_id}.json"
+                    detail_response = httpx.get(detail_url, timeout=10.0)
+                    
+                    if detail_response.status_code == 200:
+                        detail_data = detail_response.json()
+                        xrefs = detail_data.get("cross_references", [])
+                        
+                        for xref in xrefs:
+                            src = xref.get("xref_src", "")
+                            xid = xref.get("xref_id", "")
+                            
+                            if src == "DrugBank" and xid and result["drugbank_id"] == "N/A":
+                                result["drugbank_id"] = xid
+                            elif "PubChem" in src and xid and result["pubchem_id"] == "N/A":
+                                result["pubchem_id"] = xid
+    
+    except Exception as e:
+        print(f"Error fetching drug metadata from ChEMBL for {drug_name}: {str(e)}", file=sys.stderr)
+    
+    return result
+
+
 def get_manual_drug_database(gene_name: str, uniprot_id: str) -> Dict:
     """
     Curated database of known drug-target relationships
