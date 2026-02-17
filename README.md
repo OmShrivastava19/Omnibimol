@@ -1,217 +1,171 @@
-# 🧬 OmniBiMol - Protein Analysis Platform
+# 🧬 OmniBiMol
 
 **Operations on Medicinally Navigated Information for Biological Molecules**
 
-## Project Overview
+OmniBiMol is a Streamlit-based bioinformatics platform that unifies protein discovery, sequence analytics, 3D structure visualization, docking workflows, drug repurposing insights, and genome-level risk assessment. It aggregates data from leading public resources while keeping results fast with a built-in cache layer.
 
-OmniBiMol is a Phase 1 MVP (Minimum Viable Product) Streamlit application designed for comprehensive protein analysis and visualization. It integrates data from multiple bioinformatics sources to provide researchers with a unified platform for exploring protein properties, tissue expression patterns, subcellular localization, and gene ontology information.
+## Highlights
 
-## Features
+- End-to-end protein exploration: UniProt, GO terms, tissue expression, and subcellular localization.
+- Sequence analysis suite for DNA/RNA/proteins, including alignment, motifs, and phylogenetics.
+- 3D structures from PDB and AlphaFold with interactive viewers and confidence plots.
+- KEGG pathway mapping with interactive overlays and export.
+- STRING PPI networks and interaction tables.
+- Ligand binding prediction, docking simulation, and SAR-style insights.
+- Drug search, clinical trials lookup, and repurposing recommendations.
+- Whole genome analysis for mutations, biomarkers, and risk scoring.
 
-### 1. **Protein Search**
-- Search proteins by name or gene symbol
-- Integration with UniProt API for protein discovery
-- Display multiple matches with UniProt IDs and organism information
-- Support for human proteins (Homo sapiens)
+## What the App Can Do
 
-### 2. **Protein Information Display**
-- **UniProt Data**: Comprehensive protein annotations including:
-  - Protein name and gene name
-  - UniProt ID and length
-  - Protein function and cellular information
-  - Gene ontology (GO) terms categorized by:
-    - Biological Process
-    - Molecular Function
-    - Cellular Component
+### 1) Protein Discovery & Annotation
+- UniProt search by protein or gene name.
+- Detailed protein profile: function summary, sequence length, mass, and GO terms.
+- FASTA extraction and formatting for downstream analysis.
 
-### 3. **Tissue Expression Analysis**
-- Interactive bar charts showing protein expression levels across tissues
-- Color-coded expression levels: High (red), Medium (orange), Low (yellow), Not detected (gray)
-- Data sourced from local TSV files (normal_tissue.tsv)
+### 2) Tissue Expression & Subcellular Localization (HPA)
+- Tissue expression bar charts with expression level scoring.
+- Subcellular localization heatmaps with reliability grading.
+- Summary tables of tissue and localization coverage.
 
-### 4. **Subcellular Localization**
-- Heatmap visualization of protein subcellular locations
-- Main and additional location information
-- Reliability scoring for predictions
-- Data sourced from local TSV files (subcellular_location.tsv)
+### 3) Protein Sequence Analysis (UniProt + EMBL-EBI)
+- Protein FASTA output.
+- Amino acid composition analysis.
+- BLAST homology search.
+- EMBL-EBI features exploration and Needle pairwise alignment.
 
-### 5. **Gene Ontology Visualization**
-- Stacked bar charts for GO term distribution
-- Categorized by biological process, molecular function, and cellular component
+### 4) 3D Protein Structure
+- Experimental PDB structures with NGL viewer.
+- AlphaFold predicted structures with pLDDT confidence plots.
+- Optional py3Dmol rendering if available.
 
-### 6. **Caching System**
-- 24-hour cache expiration for API responses
-- SQLite-based local database for performance optimization
-- Thread-safe caching to prevent concurrent access issues
+### 5) Pathway Exploration (KEGG)
+- Primary pathway map with interactive KGML overlays.
+- Next 5 related pathways and full list of associated pathways.
+- Exportable pathway summaries.
+
+### 6) Protein-Protein Interaction Networks (STRING)
+- Interactive PPI network graph.
+- Ranked interaction table with confidence and evidence.
+
+### 7) Molecular Docking & Ligand Analysis
+- Known ligands from ChEMBL.
+- Binding predictor with molecular descriptors and Lipinski checks.
+- Similar compound search and ranking.
+- Custom docking simulation with predicted binding scores.
+- 3D protein-ligand complex visualization.
+- Docking results export.
+
+### 8) Drug Search, Trials & Repurposing
+- Drug profile search with external database links.
+- FDA approval status and clinical trial discovery.
+- Repurposing engine built on drug-protein-disease-pathway networks.
+- Ranked repurposing opportunities with evidence summaries.
+
+### 9) Whole Genome Sequencing Analysis
+- FASTA genome input with metadata (age, gender, etc.).
+- Mutation analysis and biomarker detection.
+- Disease risk assessment with confidence grading.
+- Personalized insights and pharmacogenomic notes.
+- Predictive risk calculator and recommendations.
+
+## Tech Stack
+
+- Streamlit (UI)
+- Pandas, NumPy (data processing)
+- Plotly + Matplotlib (visualizations)
+- httpx (API calls)
+- Biopython (sequence analysis)
+- NetworkX (graph analytics)
+- SQLite (persistent caching)
+
+## Data & APIs Used
+
+- UniProt (protein annotations, sequences)
+- Human Protein Atlas (tissue expression, subcellular localization)
+- KEGG (pathways)
+- STRING (PPI)
+- AlphaFold DB (predicted structures)
+- PDB (experimental structures)
+- ChEMBL (ligands and targets)
+- PubChem (compound structures)
+- PubMed (literature summaries)
+- NCBI (sequence lookup)
+- EMBL-EBI (sequence analysis services)
+- ClinicalTrials.gov (trial discovery)
 
 ## Project Structure
 
 ```
 omnibimol/
 ├── app.py                      # Main Streamlit application
-├── api_client.py               # UniProt API integration and data fetching
-├── cache_manager.py            # SQLite caching system
-├── data_processor.py           # Data transformation utilities
-├── visualizations.py           # Plotly chart generation
-├── requirements.txt            # Python dependencies
-├── README.md                   # This file
-└── data/
-    ├── normal_tissue.tsv       # Tissue expression data
-    └── subcellular_location.tsv # Subcellular localization data
+├── api_client.py               # API integrations and data fetching
+├── cache_manager.py            # SQLite + Streamlit caching utilities
+├── drug_repurposing_engine.py  # Repurposing network analysis
+├── genome_analysis_engine.py   # Genome risk and biomarker analysis
+├── ligand_binding_predictor.py # SMILES validation and ML predictors
+├── sequence_analysis.py        # Sequence analytics suite
+├── visualizations.py           # Plotly and NGL visualization helpers
+├── data/
+│   ├── normal_tissue.tsv
+│   └── subcellular_location.tsv
+├── examples/
+│   ├── example_dna.fasta
+│   └── example_protein.fasta
+└── requirements.txt
 ```
 
 ## Installation
 
 ### Prerequisites
-- Python 3.8+
-- pip (Python package manager)
+- Python 3.9+ recommended
+- pip
 
-### Setup Instructions
+### Setup
 
-1. **Clone or download the project**:
-```bash
-cd omnibimol
-```
-
-2. **Create a virtual environment** (recommended):
 ```bash
 python -m venv .venv
-.venv\Scripts\activate  # On Windows
-# or
-source .venv/bin/activate  # On macOS/Linux
-```
-
-3. **Install dependencies**:
-```bash
+.venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Usage
-
-### Running the Application
+## Run the App
 
 ```bash
 streamlit run app.py
 ```
 
-The application will open in your default web browser at `http://localhost:8501`.
+Then open: http://localhost:8501
 
-### Workflow
+## Usage Tips
 
-1. **Search for a Protein**: Enter a protein name or gene symbol (e.g., "TP53", "BRCA1")
-2. **Select Protein**: Choose from the search results
-3. **View Analysis**: Explore:
-   - Protein function and annotations
-   - Gene ontology terms
-   - Tissue expression patterns
-   - Subcellular localization
-   - Summary statistics
+- Start with a protein search (e.g., TP53, BRCA1, EGFR).
+- Use the sequence analysis suite for FASTA uploads and alignment.
+- For docking, begin with known ligands and switch to custom SMILES when ready.
+- Use the genome analysis tool for high-level risk insights and biomarkers.
 
-## Data Sources
+## Caching
 
-### Local Data Files
-- **normal_tissue.tsv**: Human Protein Atlas tissue expression data
-  - Columns: Gene, Tissue, Level (High/Medium/Low/Not detected), Level_numeric
-  
-- **subcellular_location.tsv**: Human Protein Atlas subcellular localization data
-  - Columns: Gene, Main_location, Additional_location, Reliability
+- SQLite cache persists results for 24 hours.
+- Streamlit cache accelerates repeated computations within sessions.
+- Clear cache from the UI if external data has been updated.
 
-### APIs
-- **UniProt API**: Used for protein discovery and comprehensive annotations
-  - Base URL: https://rest.uniprot.org
-  - Provides UniProt IDs, gene names, protein functions, and GO terms
+## Known Limitations
 
-## Architecture
+- Some docking results are simulated to provide rapid feedback.
+- Public APIs may have rate limits or intermittent availability.
+- Genome analysis uses curated pattern matching for demo-level insights.
 
-### Components
+## Roadmap Ideas
 
-1. **ProteinAPIClient** (`api_client.py`)
-   - Handles UniProt API communication
-   - Loads and filters local TSV data
-   - Manages asynchronous API calls
-   - Implements caching with thread-safe SQLite
-
-2. **CacheManager** (`cache_manager.py`)
-   - SQLite-based caching with 24-hour TTL
-   - Thread-safe connection management
-   - Automatic cache expiration
-
-3. **DataProcessor** (`data_processor.py`)
-   - Transforms raw API/TSV data into visualization-ready formats
-   - Filters and sorts tissue expression data
-   - Prepares heatmap and chart data
-
-4. **ProteinVisualizer** (`visualizations.py`)
-   - Creates interactive Plotly visualizations
-   - Generates tissue expression bar charts
-   - Builds subcellular localization heatmaps
-   - Creates GO term distribution charts
-
-## Technologies Used
-
-- **Streamlit**: Web application framework
-- **Pandas**: Data manipulation and analysis
-- **Plotly**: Interactive data visualization
-- **httpx**: Asynchronous HTTP client for APIs
-- **SQLite3**: Local caching database
-- **Python asyncio**: Asynchronous programming
-
-## Performance Considerations
-
-- **Caching**: 24-hour TTL on API responses reduces network calls
-- **Local TSV Files**: Eliminates network latency for tissue/localization data
-- **Thread-Safe SQLite**: Prevents concurrent access issues in Streamlit
-- **Lazy Loading**: Data loaded only when requested
-
-## Error Handling
-
-- Network error handling for API calls
-- Graceful fallbacks for missing data
-- Input validation for protein searches
-- Thread-safe database operations
-
-## Future Enhancements
-
-- [ ] Additional protein databases (NCBI, ENSEMBL)
-- [ ] Multiple organism support
-- [ ] Advanced filtering options
-- [ ] Protein interaction networks
-- [ ] Disease association data
-- [ ] Literature mining integration
-
-## Troubleshooting
-
-### Common Issues
-
-**Application won't start**:
-- Ensure Python 3.8+ is installed
-- Verify all dependencies are installed: `pip install -r requirements.txt`
-- Check that you're in the correct directory
-
-**Data not loading**:
-- Verify `data/normal_tissue.tsv` and `data/subcellular_location.tsv` exist
-- Ensure TSV files have correct column names
-- Check file encoding (should be UTF-8)
-
-**API errors**:
-- Check internet connection
-- Verify UniProt API is accessible
-- Check cache file permissions
-
-**Performance issues**:
-- Clear cache: Delete `omnibiomol_cache.db`
-- Check system resources
-- Restart Streamlit application
+- Expand multi-organism support.
+- Integrate real docking engines (AutoDock, Vina).
+- Add pathway enrichment analytics.
+- Enable export bundles (PDF reports, batch CSV).
 
 ## License
 
-This project is provided as-is for research and educational purposes.
+Provided for research and educational use. See [LICENSE](LICENSE).
 
-## Support
+## Repository
 
-For issues or questions, please check the deployment_instructions.txt file or review the inline code comments for more details on specific components.
-
----
-
-**Last Updated**: January 27, 2026  
-**Version**: 1.0 (Phase 1 MVP)
+GitHub: https://github.com/OmShrivastava19/Omnibimol
