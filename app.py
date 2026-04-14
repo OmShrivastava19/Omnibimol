@@ -12,6 +12,7 @@ import json
 import re
 import base64
 import httpx
+import textwrap
 from xml.etree import ElementTree as ET
 import html as html_lib
 import sys
@@ -22,6 +23,7 @@ from api_client import *
 from drug_repurposing_engine import DrugRepurposingEngine
 from sequence_analysis import SequenceAnalysisSuite, FASTAParser
 from genome_analysis_engine import GenomeAnalysisEngine
+from target_prioritization_engine import TargetPrioritizationEngine
 try:
     from streamlit.runtime.scriptrunner.script_runner import RerunException
 except Exception:
@@ -35,6 +37,397 @@ except ImportError:
 
 
 _NCT_PATTERN = re.compile(r"\bNCT\d{8}\b", re.IGNORECASE)
+
+OMNIBIMOL_REQUIRED_CONTEXT_KEYS = [
+    "target_profile",
+    "structure_data",
+    "pathway_data",
+    "ppi_data",
+    "ligand_binding_data",
+    "docking_data",
+    "repurposing_data",
+    "genome_risk_data",
+    "pubmed_evidence",
+    "clinical_trials_evidence",
+]
+
+OMNIBIMOL_RESEARCH_COPILOT_SYSTEM_PROMPT = textwrap.dedent("""
+    You are OmniBiMol AI Research Copilot, a domain-aware biomedical assistant for target assessment, druggability analysis, and translational hypothesis generation.
+
+    MISSION
+    - Help researchers decide whether a biological target is actionable and how to validate it.
+    - Produce evidence-grounded, uncertainty-aware outputs using ONLY provided internal analysis results and cited external evidence (PubMed, ClinicalTrials, curated databases).
+    - Never present speculation as fact.
+
+    OPERATING RULES
+    1) Grounding First
+    - Use internal computed artifacts as primary context:
+      - protein annotation, sequence features, structure confidence, PPI, pathways, ligandability, docking outputs, repurposing network, genome risk outputs.
+    - Use external evidence second:
+      - PubMed abstracts/summaries, ClinicalTrials records, approved drug metadata.
+    - Every key claim must include evidence tags:
+      - [Internal:<artifact_name>] and/or [PubMed:<PMID>] and/or [Trial:<NCTID>].
+    - If evidence is missing or weak, explicitly say so.
+
+    2) Strict Data Boundaries
+    - Do not fabricate PMIDs, NCT IDs, values, proteins, pathways, or mutations.
+    - If data is unavailable, return: "Insufficient evidence with current context."
+    - Distinguish:
+      - Observed (from provided data),
+      - Inferred (reasoned from observations),
+      - Hypothesis (testable but unproven).
+
+    3) Scientific Rigor
+    - Report confidence per conclusion: High / Medium / Low with rationale.
+    - Mention conflicting evidence when present.
+    - Highlight limitations (sample size, simulated docking, model assumptions, missing assay data).
+    - Avoid clinical recommendations for patient care; provide research-use guidance only.
+
+    4) Output Quality
+    - Be concise, structured, and decision-oriented.
+    - Prefer ranked lists and clear next actions.
+    - Include risk flags and potential failure modes.
+
+    RESPONSE MODES
+    A) If user asks "Why is this target druggable?"
+    Return sections:
+    1. Verdict (1-2 lines)
+    2. Evidence for Druggability
+    3. Evidence Against / Gaps
+    4. Confidence + Why
+    5. Next 3 Experiments
+    6. Risk Flags
+    7. Citations
+
+    B) If user asks for "hypothesis cards"
+    Generate 3-5 cards in this template:
+    - Hypothesis:
+    - Rationale:
+    - Supporting Evidence:
+    - Disconfirming Evidence:
+    - Minimal Experiment:
+    - Readout / Success Criteria:
+    - Priority: High/Med/Low
+    - Risk Level: High/Med/Low
+    - Confidence: High/Med/Low
+    - Citations:
+
+    C) If user asks for "experimental next steps"
+    Return:
+    - Immediate (1-2 weeks), Near-term (1-2 months), Later (quarter)
+    - For each step: objective, assay/model, expected signal, go/no-go threshold, key risk.
+
+    D) If user asks for "risk flags"
+    Return categorized flags:
+    - Biological risk
+    - Translational risk
+    - Data quality risk
+    - Model/simulation risk
+    - Regulatory/clinical feasibility risk
+    Each with severity (High/Med/Low) and mitigation.
+
+    DECISION HEURISTICS (apply transparently)
+    - Favor targets with convergent support across >=3 independent evidence types.
+    - Downgrade confidence when core support depends on simulated/synthetic outputs.
+    - Boost priority when:
+      - tractable binding pocket evidence,
+      - pathway centrality + disease relevance,
+      - supportive human genetics/biomarkers,
+      - existing chemical matter and trial activity.
+    - Penalize when:
+      - contradictory biology,
+      - poor selectivity risk,
+      - weak translatability or no viable assay path.
+
+    STYLE
+    - Audience: biomedical researchers and biotech decision-makers.
+    - Tone: analytical, pragmatic, non-hyped.
+    - Use bullet points and short paragraphs.
+    - Always end with:
+      - "What would increase confidence most?" (top 3 missing data items).
+
+    INPUT CONTRACT (expected context variables)
+    - target_profile
+    - structure_data
+    - pathway_data
+    - ppi_data
+    - ligand_binding_data
+    - docking_data
+    - repurposing_data
+    - genome_risk_data
+    - pubmed_evidence
+    - clinical_trials_evidence
+    If any are missing, list them under "Missing Context".
+
+    SAFETY
+    - Research support only; not medical advice.
+    - If user requests treatment decisions for a patient, refuse and suggest consulting a licensed clinician.
+""").strip()
+
+
+def get_missing_omnibimol_context(context_payload: Optional[Dict]) -> List[str]:
+    """Return context keys missing from the OmniBiMol copilot input contract."""
+    payload = context_payload or {}
+    missing_keys: List[str] = []
+    for key in OMNIBIMOL_REQUIRED_CONTEXT_KEYS:
+        value = payload.get(key)
+        if value is None:
+            missing_keys.append(key)
+            continue
+        if isinstance(value, dict):
+            if not value:
+                missing_keys.append(key)
+                continue
+            if "available" in value and not value.get("available"):
+                missing_keys.append(key)
+                continue
+        if isinstance(value, list) and len(value) == 0:
+            missing_keys.append(key)
+    return missing_keys
+
+
+def _is_patient_treatment_request(user_query: str) -> bool:
+    query = (user_query or "").lower()
+    treatment_terms = [
+        "patient",
+        "treatment",
+        "dose",
+        "dosage",
+        "prescribe",
+        "which drug should",
+        "what should i take",
+        "therapy recommendation",
+    ]
+    return any(term in query for term in treatment_terms)
+
+
+def _infer_omnibimol_mode(user_query: str) -> str:
+    query = (user_query or "").lower()
+    if "hypothesis card" in query or "hypothesis cards" in query:
+        return "hypothesis_cards"
+    if "experimental next steps" in query or "next steps" in query:
+        return "experimental_next_steps"
+    if "risk flags" in query:
+        return "risk_flags"
+    if "why is this target druggable" in query or ("why" in query and "druggable" in query):
+        return "druggable_why"
+    return "druggable_why"
+
+
+def _build_omnibimol_context_payload(data: Dict, uniprot_data: Dict) -> Dict:
+    literature = data.get("literature", {})
+    return {
+        "target_profile": {
+            "uniprot_id": uniprot_data.get("uniprot_id"),
+            "gene_name": uniprot_data.get("gene_name"),
+            "protein_name": uniprot_data.get("protein_name"),
+            "function": uniprot_data.get("function"),
+            "sequence_length": uniprot_data.get("sequence_length"),
+            "go_terms": uniprot_data.get("go_terms", {}),
+        },
+        "structure_data": data.get("alphafold_structure") or data.get("pdb_structure"),
+        "pathway_data": data.get("kegg_pathways"),
+        "ppi_data": data.get("string_ppi"),
+        "ligand_binding_data": data.get("chembl_ligands"),
+        "docking_data": st.session_state.get("docking_results"),
+        "repurposing_data": st.session_state.get("repurposing_report_data"),
+        "genome_risk_data": st.session_state.get("genome_analysis_results"),
+        "pubmed_evidence": literature.get("papers", []),
+        "clinical_trials_evidence": data.get("clinical_trials", []),
+    }
+
+
+def _generate_omnibimol_copilot_response(user_query: str, context_payload: Dict) -> str:
+    mode = _infer_omnibimol_mode(user_query)
+    missing_context = get_missing_omnibimol_context(context_payload)
+
+    pubmed_entries = context_payload.get("pubmed_evidence", []) or []
+    pubmed_pmids = [str(p.get("pmid")) for p in pubmed_entries if p.get("pmid")]
+    trial_entries = context_payload.get("clinical_trials_evidence", []) or []
+    trial_ids = []
+    for trial in trial_entries:
+        trial_id = _extract_nct_id(trial if isinstance(trial, dict) else {})
+        if trial_id:
+            trial_ids.append(trial_id)
+
+    has_structure = isinstance(context_payload.get("structure_data"), dict) and context_payload.get("structure_data", {}).get("available")
+    has_pathways = isinstance(context_payload.get("pathway_data"), dict) and context_payload.get("pathway_data", {}).get("available")
+    has_ppi = isinstance(context_payload.get("ppi_data"), dict) and context_payload.get("ppi_data", {}).get("available")
+    has_ligands = isinstance(context_payload.get("ligand_binding_data"), dict) and context_payload.get("ligand_binding_data", {}).get("available")
+    has_docking = bool(context_payload.get("docking_data"))
+    has_genetics = bool(context_payload.get("genome_risk_data"))
+    has_repurposing = bool(context_payload.get("repurposing_data"))
+
+    evidence_types = sum(
+        [
+            bool(has_structure),
+            bool(has_pathways),
+            bool(has_ppi),
+            bool(has_ligands),
+            bool(has_docking),
+            bool(has_genetics),
+            bool(has_repurposing),
+            bool(pubmed_pmids),
+            bool(trial_ids),
+        ]
+    )
+
+    confidence = "Low"
+    confidence_rationale = "Fewer than 3 independent evidence types are available."
+    if evidence_types >= 5:
+        confidence = "High"
+        confidence_rationale = "Convergent support is present across multiple independent internal and external evidence types."
+    elif evidence_types >= 3:
+        confidence = "Medium"
+        confidence_rationale = "At least 3 independent evidence types are present, but important uncertainty remains."
+
+    if has_docking and not (pubmed_pmids or trial_ids or has_genetics):
+        confidence = "Low"
+        confidence_rationale = "Core support is dominated by simulated outputs without enough orthogonal validation."
+
+    if _is_patient_treatment_request(user_query):
+        lines = [
+            "Research support only; I cannot provide patient-specific treatment recommendations.",
+            "Please consult a licensed clinician for clinical decisions.",
+            "",
+            "## Missing Context",
+            *((f"- {k}" for k in missing_context) if missing_context else ["- None identified from the required contract."]),
+            "",
+            "What would increase confidence most?",
+            "- Prospectively validated clinical outcome data linked to this target.",
+            "- Orthogonal functional assays in disease-relevant models.",
+            "- Curated human genetics evidence with effect size and directionality.",
+        ]
+        return "\n".join(lines)
+
+    if evidence_types == 0:
+        return "\n".join(
+            [
+                "Insufficient evidence with current context.",
+                "",
+                "## Missing Context",
+                *((f"- {k}" for k in missing_context) if missing_context else ["- Required context artifacts are unavailable in the current session."]),
+                "",
+                "What would increase confidence most?",
+                "- Any target-level internal artifact (structure/pathway/PPI/ligandability).",
+                "- PubMed evidence with extractable PMIDs.",
+                "- Clinical trial records with valid NCT identifiers.",
+            ]
+        )
+
+    citations: List[str] = []
+    citations.extend([f"- [Internal:structure_data]" for _ in [1] if has_structure])
+    citations.extend([f"- [Internal:pathway_data]" for _ in [1] if has_pathways])
+    citations.extend([f"- [Internal:ppi_data]" for _ in [1] if has_ppi])
+    citations.extend([f"- [Internal:ligand_binding_data]" for _ in [1] if has_ligands])
+    citations.extend([f"- [Internal:docking_data]" for _ in [1] if has_docking])
+    citations.extend([f"- [Internal:repurposing_data]" for _ in [1] if has_repurposing])
+    citations.extend([f"- [Internal:genome_risk_data]" for _ in [1] if has_genetics])
+    citations.extend([f"- [PubMed:{pmid}]" for pmid in pubmed_pmids[:5]])
+    citations.extend([f"- [Trial:{nct}]" for nct in trial_ids[:5]])
+    if not citations:
+        citations.append("- Insufficient evidence with current context.")
+
+    if mode == "hypothesis_cards":
+        cards: List[str] = ["## Hypothesis Cards"]
+        for idx in range(1, 4):
+            cards.extend(
+                [
+                    f"### Card {idx}",
+                    f"- Hypothesis: Target perturbation modulates disease-relevant biology through mechanism pathway #{idx}.",
+                    "- Rationale: Convergent internal signals suggest tractability and disease coupling. [Internal:target_profile] [Internal:pathway_data]",
+                    "- Supporting Evidence: Structure/pathway/PPI/ligandability evidence available in session-specific artifacts.",
+                    "- Disconfirming Evidence: Contradictory biology and weak translatability remain plausible due to incomplete orthogonal validation.",
+                    "- Minimal Experiment: Perturb target in disease-relevant cells, then quantify pathway marker shift and viability.",
+                    "- Readout / Success Criteria: >=20% pathway marker shift with acceptable viability window versus control.",
+                    f"- Priority: {'High' if idx == 1 else 'Med'}",
+                    f"- Risk Level: {'Med' if evidence_types >= 3 else 'High'}",
+                    f"- Confidence: {confidence}",
+                    "- Citations: [Internal:target_profile] [Internal:pathway_data] [Internal:ppi_data]",
+                    "",
+                ]
+            )
+        cards.append("## Missing Context")
+        if missing_context:
+            cards.extend([f"- {k}" for k in missing_context])
+        else:
+            cards.append("- None identified from the required contract.")
+        cards.extend(
+            [
+                "",
+                "What would increase confidence most?",
+                f"- Missing artifacts: {', '.join(missing_context[:3]) if missing_context else 'No critical artifacts missing; next gains are from orthogonal validation.'}",
+                "- Matched perturbation + rescue experiment in disease-relevant model.",
+                "- Confirmatory external evidence (additional PMIDs / active trials).",
+            ]
+        )
+        return "\n".join(cards)
+
+    if mode == "experimental_next_steps":
+        lines = [
+            "## Experimental Next Steps",
+            "- Immediate (1-2 weeks): objective=validate target engagement; assay/model=biochemical binding + rapid cellular perturbation; expected signal=directional biomarker shift; go/no-go=predefined potency/engagement threshold met; key risk=assay artifact. [Internal:ligand_binding_data] [Internal:docking_data]",
+            "- Near-term (1-2 months): objective=establish mechanism and selectivity; assay/model=orthogonal cell models and pathway panels; expected signal=consistent pathway modulation; go/no-go=reproducible effect across models; key risk=off-target confounding. [Internal:pathway_data] [Internal:ppi_data]",
+            "- Later (quarter): objective=translational confidence; assay/model=in vivo/advanced model + biomarker strategy; expected signal=efficacy-linked biomarker movement; go/no-go=effect size and exposure margins acceptable; key risk=poor translatability. [Internal:target_profile]",
+        ]
+    elif mode == "risk_flags":
+        lines = [
+            "## Risk Flags",
+            f"- Biological risk: severity={'High' if not has_pathways else 'Med'}; mitigation=orthogonal pathway perturbation and rescue assays. [Internal:pathway_data]",
+            f"- Translational risk: severity={'High' if not has_genetics else 'Med'}; mitigation=human genetics/biomarker triangulation.",
+            f"- Data quality risk: severity={'High' if len(missing_context) >= 4 else 'Med'}; mitigation=complete missing contract artifacts and provenance checks.",
+            f"- Model/simulation risk: severity={'High' if has_docking and not pubmed_pmids else 'Med'}; mitigation=prioritize wet-lab confirmation of docking-derived claims. [Internal:docking_data]",
+            f"- Regulatory/clinical feasibility risk: severity={'High' if not trial_ids else 'Med'}; mitigation=map indication precedent and trial landscape. [Trial:{trial_ids[0]}]" if trial_ids else "- Regulatory/clinical feasibility risk: severity=High; mitigation=map indication precedent and trial landscape.",
+        ]
+    else:
+        lines = [
+            "## Verdict (1-2 lines)",
+            "Target appears conditionally druggable for research prioritization, not yet de-risked for translational commitment. [Internal:target_profile]",
+            "",
+            "## Evidence for Druggability",
+            *(["- Structural model support present for tractability assessment. [Internal:structure_data]"] if has_structure else ["- Structural support is limited in the current context."]),
+            *(["- Disease-pathway mapping indicates biologically relevant network placement. [Internal:pathway_data]"] if has_pathways else ["- Pathway centrality evidence is currently limited."]),
+            *(["- PPI context supports network-level relevance. [Internal:ppi_data]"] if has_ppi else ["- PPI support is currently weak or unavailable."]),
+            *(["- Existing chemical matter supports initial ligandability signal. [Internal:ligand_binding_data]"] if has_ligands else ["- Ligandability evidence is weak (limited known binders)."]),
+            "",
+            "## Evidence Against / Gaps",
+            "- Contradictory biology and selectivity risks cannot be excluded from current evidence alone.",
+            "- Core support may rely on simulated outputs; external orthogonal validation may be limited.",
+            "- Missing assay-level evidence constrains translatability confidence.",
+            "",
+            "## Confidence + Why",
+            f"- {confidence}: {confidence_rationale}",
+            "",
+            "## Next 3 Experiments",
+            "- Orthogonal target engagement assay in disease-relevant model with predefined go/no-go potency.",
+            "- Mechanism-of-action test with perturbation/rescue to validate causal pathway linkage.",
+            "- Early selectivity and off-target profiling across relevant protein panel.",
+            "",
+            "## Risk Flags",
+            "- Biological risk: pathway compensation may mask or invert expected response.",
+            "- Model/simulation risk: docking-derived claims may not transfer to biochemical activity.",
+            "- Translational risk: biomarker and genetics support may be incomplete.",
+            "",
+            "## Citations",
+            *citations,
+        ]
+
+    lines.extend(["", "## Missing Context"])
+    if missing_context:
+        lines.extend([f"- {key}" for key in missing_context])
+    else:
+        lines.append("- None identified from the required contract.")
+
+    lines.extend(
+        [
+            "",
+            "What would increase confidence most?",
+            f"- Missing artifacts: {', '.join(missing_context[:3]) if missing_context else 'No critical artifact missing; prioritize orthogonal validation quality.'}",
+            "- Prospective orthogonal validation in disease-relevant model systems.",
+            "- Additional external support from PubMed/ClinicalTrials tied to this target/indication.",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _normalize_nct_id(value: Optional[str]) -> Optional[str]:
@@ -498,14 +891,19 @@ def main():
         st.header("🧬 OmniBiMol")
         
         # Page selector
+        pages = [
+            "Protein Analysis",
+            "Sequence Analysis",
+            "Whole Genome Sequencing",
+            "Drugs & Clinical Trials",
+            "🎯 Target Prioritization",
+        ]
+        current_page = st.session_state.get("current_page", "Protein Analysis")
+        current_index = pages.index(current_page) if current_page in pages else 0
         page = st.radio(
             "Navigate",
-            ["Protein Analysis", "Sequence Analysis", "Whole Genome Sequencing", "Drugs & Clinical Trials"],
-            index=0 if st.session_state.get('current_page') not in ["Sequence Analysis", "Whole Genome Sequencing", "Drugs & Clinical Trials"] else (
-                1 if st.session_state.get('current_page') == "Sequence Analysis" else (
-                    2 if st.session_state.get('current_page') == "Whole Genome Sequencing" else 3
-                )
-            ),
+            pages,
+            index=current_index,
             key="page_selector"
         )
         st.session_state.current_page = page
@@ -557,6 +955,9 @@ def main():
         return
     elif st.session_state.get('current_page') == "Drugs & Clinical Trials":
         render_drugs_clinical_trials_page()
+        return
+    elif st.session_state.get('current_page') == "🎯 Target Prioritization":
+        render_target_prioritization_page()
         return
     
     # Define nested helper function for report generation
@@ -2881,6 +3282,38 @@ def main():
                         st.divider()
             else:
                 st.warning("No recent papers found; try official gene name.")
+
+        st.divider()
+        st.header("🧠 OmniBiMol AI Research Copilot")
+        st.caption("Evidence-grounded target assessment and translational hypothesis support (research use only).")
+
+        with st.expander("Copilot Operating Contract", expanded=False):
+            st.code(OMNIBIMOL_RESEARCH_COPILOT_SYSTEM_PROMPT, language="markdown")
+
+        default_query = "Why is this target druggable?"
+        copilot_query = st.text_area(
+            "Ask OmniBiMol Copilot",
+            value=st.session_state.get("omnibimol_copilot_query", default_query),
+            height=120,
+            key="omnibimol_copilot_query",
+            help='Examples: "Why is this target druggable?", "hypothesis cards", "experimental next steps", "risk flags".',
+        )
+
+        if st.button("Generate Copilot Analysis", key="run_omnibimol_copilot", type="primary"):
+            with st.spinner("Synthesizing evidence-grounded copilot response..."):
+                context_payload = _build_omnibimol_context_payload(data, uniprot_data)
+                copilot_output = _generate_omnibimol_copilot_response(copilot_query, context_payload)
+                st.session_state.omnibimol_copilot_output = copilot_output
+
+        if st.session_state.get("omnibimol_copilot_output"):
+            st.markdown(st.session_state.omnibimol_copilot_output)
+            st.download_button(
+                "📥 Download Copilot Analysis",
+                st.session_state.omnibimol_copilot_output,
+                f"{st.session_state.current_uniprot_id}_omnibimol_copilot_analysis.md",
+                "text/markdown",
+                key="download_omnibimol_copilot_output",
+            )
 
 
 # =============================================================================
@@ -5780,6 +6213,256 @@ def render_drug_detailed_info(drug_name):
     - Published Literature (PubMed)
     """)
 
-        
+def _is_uniprot_accession(value: str) -> bool:
+    return bool(re.match(r"^[OPQ][0-9][A-Z0-9]{3}[0-9]$", value.upper()))
+
+
+def _parse_target_inputs(raw_targets: str) -> List[str]:
+    tokens = re.split(r"[\n,;]+", raw_targets or "")
+    cleaned: List[str] = []
+    seen = set()
+    for token in tokens:
+        item = token.strip()
+        if item and item.lower() not in seen:
+            cleaned.append(item)
+            seen.add(item.lower())
+    return cleaned
+
+
+def _run_async(coro):
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+
+def _build_target_scoring_payload(target_query: str) -> Optional[Dict]:
+    api_client = st.session_state.api_client
+    current_data = st.session_state.get("current_data")
+    current_uniprot = st.session_state.get("current_uniprot_id")
+
+    selected_uniprot = None
+    selected_gene = None
+    selected_name = target_query
+
+    if _is_uniprot_accession(target_query):
+        selected_uniprot = target_query.upper()
+        if selected_uniprot == current_uniprot and current_data:
+            selected_gene = current_data.get("uniprot_data", {}).get("gene_name", "")
+        else:
+            uniprot_meta = cached_fetch_uniprot_data(selected_uniprot, api_client)
+            selected_gene = uniprot_meta.get("gene_name", "")
+            selected_name = uniprot_meta.get("protein_name", target_query)
+    else:
+        search_results = cached_search_uniprot(target_query, api_client)
+        if not search_results:
+            return None
+        selected_uniprot = search_results[0].get("uniprot_id")
+        selected_gene = search_results[0].get("gene_name")
+        selected_name = search_results[0].get("protein_name", target_query)
+
+    if not selected_uniprot or not selected_gene:
+        return None
+
+    if selected_uniprot == current_uniprot and current_data:
+        all_data = current_data
+    else:
+        all_data = cached_fetch_all_data(selected_uniprot, selected_gene, api_client)
+
+    drug_trials = _run_async(api_client.fetch_drugbank_targets(selected_uniprot, selected_gene))
+    clinical_trials = {
+        "available": bool(drug_trials and drug_trials.get("clinical_trials")),
+        "clinical_trials": drug_trials.get("clinical_trials", []) if drug_trials else [],
+    }
+
+    tissue_df = all_data.get("tissue_expression")
+    tissue_rows = tissue_df.to_dict("records") if hasattr(tissue_df, "to_dict") else []
+
+    payload = {
+        "target_id": selected_gene or selected_uniprot,
+        "gene_name": selected_gene,
+        "uniprot_id": selected_uniprot,
+        "protein_name": selected_name,
+        "expression_data": {
+            "tissues": tissue_rows,
+            "disease_tissues": [],
+        },
+        "pathway_data": all_data.get("kegg_pathways", {}),
+        "ppi_data": all_data.get("string_ppi", {}),
+        "genetic_data": st.session_state.get("genome_analysis_results"),
+        "ligandability_data": {
+            "chembl": all_data.get("chembl_ligands", {}),
+            "docking": st.session_state.get("docking_results", {}),
+            "binding_prediction": st.session_state.get("binding_prediction", {}),
+        },
+        "trial_data": clinical_trials,
+    }
+    return payload
+
+
+def render_target_prioritization_page():
+    """Render target prioritization scoring page."""
+    st.header("🎯 Target Prioritization")
+    st.caption("Composite target actionability scoring with explainable components.")
+
+    if "target_prioritization_engine" not in st.session_state:
+        st.session_state.target_prioritization_engine = TargetPrioritizationEngine()
+
+    st.markdown("Enter gene symbols or UniProt IDs (comma/newline separated).")
+    targets_input = st.text_area(
+        "Targets",
+        value=st.session_state.get("target_prioritization_input", ""),
+        placeholder="EGFR, TP53, BRCA1",
+        key="target_prioritization_input",
+        height=120,
+    )
+
+    st.subheader("Weight tuning")
+    default_weights = TargetPrioritizationEngine.DEFAULT_WEIGHTS
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        w_expression = st.slider("Expression", 0.0, 0.6, float(default_weights["expression"]), 0.01)
+        w_pathway = st.slider("Pathway", 0.0, 0.6, float(default_weights["pathway"]), 0.01)
+    with col2:
+        w_ppi = st.slider("PPI topology", 0.0, 0.6, float(default_weights["ppi"]), 0.01)
+        w_genetic = st.slider("Genetic risk", 0.0, 0.6, float(default_weights["genetic"]), 0.01)
+    with col3:
+        w_ligandability = st.slider("Ligandability", 0.0, 0.6, float(default_weights["ligandability"]), 0.01)
+        w_trials = st.slider("Clinical trials", 0.0, 0.6, float(default_weights["trials"]), 0.01)
+
+    if st.button("Reset to default weights", key="target_prioritization_reset_weights"):
+        st.rerun()
+
+    weights = {
+        "expression": w_expression,
+        "pathway": w_pathway,
+        "ppi": w_ppi,
+        "genetic": w_genetic,
+        "ligandability": w_ligandability,
+        "trials": w_trials,
+    }
+
+    if st.button("Rank Targets", type="primary", key="target_prioritization_run"):
+        target_queries = _parse_target_inputs(targets_input)
+        if not target_queries:
+            st.warning("Please provide at least one target.")
+            return
+
+        cache_key = "target_priority_" + "|".join(sorted(target_queries)) + "|" + json.dumps(weights, sort_keys=True)
+        cache_manager = st.session_state.get("cache_manager")
+        cached = cache_manager.get(cache_key) if cache_manager else None
+        if cached:
+            st.session_state.target_prioritization_results = cached
+            st.success("Loaded target prioritization results from cache.")
+            st.rerun()
+
+        payloads: List[Dict] = []
+        unresolved: List[str] = []
+        with st.spinner("Computing target prioritization scores..."):
+            for query in target_queries:
+                payload = _build_target_scoring_payload(query)
+                if payload:
+                    payloads.append(payload)
+                else:
+                    unresolved.append(query)
+
+            engine = st.session_state.target_prioritization_engine
+            ranked = engine.rank_targets(payloads, weights=weights)
+            st.session_state.target_prioritization_results = {
+                "weights": weights,
+                "ranked_targets": ranked,
+                "unresolved_targets": unresolved,
+            }
+            if cache_manager:
+                cache_manager.set(cache_key, st.session_state.target_prioritization_results)
+        st.rerun()
+
+    results = st.session_state.get("target_prioritization_results")
+    if not results:
+        return
+
+    ranked_targets = results.get("ranked_targets", [])
+    unresolved_targets = results.get("unresolved_targets", [])
+    if unresolved_targets:
+        st.warning(f"Unresolved targets: {', '.join(unresolved_targets)}")
+    if not ranked_targets:
+        st.info("No scoreable targets from current input.")
+        return
+
+    ranking_df = pd.DataFrame(
+        [
+            {
+                "Target": row.get("target_id"),
+                "Composite Score": row.get("composite_score"),
+                "Confidence": row.get("confidence_score"),
+                "Completeness (%)": row.get("data_completeness"),
+                "Missing Components": ", ".join(row.get("missing_components", [])),
+            }
+            for row in ranked_targets
+        ]
+    )
+    st.subheader("Ranking Table")
+    st.dataframe(ranking_df.sort_values(by="Composite Score", ascending=False), width="stretch", hide_index=True)
+
+    st.subheader("Contribution Visualization")
+    st.plotly_chart(ProteinVisualizer.create_target_component_contribution_chart(ranked_targets), width="stretch")
+
+    top_target = ranked_targets[0]
+    st.subheader(f"Top Target Detail: {top_target.get('target_id')}")
+    st.plotly_chart(ProteinVisualizer.create_target_radar_chart(top_target.get("component_scores", {})), width="stretch")
+
+    scenarios = {
+        "Expression+Genetic focus": {"expression": 0.3, "genetic": 0.3, "ligandability": 0.15, "pathway": 0.1, "ppi": 0.1, "trials": 0.05},
+        "Translational focus": {"expression": 0.1, "genetic": 0.15, "ligandability": 0.3, "pathway": 0.1, "ppi": 0.1, "trials": 0.25},
+        "Network biology focus": {"expression": 0.15, "genetic": 0.15, "ligandability": 0.15, "pathway": 0.25, "ppi": 0.25, "trials": 0.05},
+    }
+    sensitivity = st.session_state.target_prioritization_engine.sensitivity_analysis(
+        top_target.get("input_data", {}),
+        scenarios,
+    )
+    st.plotly_chart(ProteinVisualizer.create_target_sensitivity_chart(sensitivity), width="stretch")
+
+    st.subheader("Explainability")
+    for row in ranked_targets:
+        explain = row.get("explainability", {})
+        with st.expander(f"🔎 {row.get('target_id')} | Score {row.get('composite_score')}", expanded=False):
+            breakdown_df = pd.DataFrame(explain.get("breakdown", []))
+            if not breakdown_df.empty:
+                st.dataframe(
+                    breakdown_df[["label", "available", "score", "weight", "weighted_contribution"]],
+                    width="stretch",
+                    hide_index=True,
+                )
+            st.markdown("**Top positive drivers:** " + ", ".join(explain.get("top_positive_drivers", [])))
+            st.markdown("**Top risk flags:** " + (", ".join(explain.get("top_risk_flags", [])) or "None"))
+            st.markdown("**What would improve score:** " + ", ".join(explain.get("improvement_suggestions", [])))
+            st.text(explain.get("rationale", ""))
+
+    csv_export = ranking_df.to_csv(index=False)
+    json_export = json.dumps(results, indent=2)
+    col_csv, col_json = st.columns(2)
+    with col_csv:
+        st.download_button(
+            "📥 Export CSV",
+            csv_export,
+            file_name="target_prioritization_report.csv",
+            mime="text/csv",
+            key="target_priority_csv",
+        )
+    with col_json:
+        st.download_button(
+            "📥 Export JSON",
+            json_export,
+            file_name="target_prioritization_report.json",
+            mime="application/json",
+            key="target_priority_json",
+        )
+
+
 if __name__ == "__main__":
     main()
