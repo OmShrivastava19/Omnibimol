@@ -71,6 +71,9 @@ OmniBiMol is a Streamlit-based bioinformatics platform that unifies protein disc
 ## Tech Stack
 
 - Streamlit (UI)
+- FastAPI (backend API)
+- PostgreSQL + SQLAlchemy + Alembic (data and migrations)
+- Redis (async job broker/state backend)
 - Pandas, NumPy (data processing)
 - Plotly + Matplotlib (visualizations)
 - httpx (API calls)
@@ -98,6 +101,10 @@ OmniBiMol is a Streamlit-based bioinformatics platform that unifies protein disc
 ```
 omnibimol/
 ├── app.py                      # Main Streamlit application
+├── backend/                    # FastAPI backend (auth, RBAC, tenancy, audit, jobs)
+├── alembic/                    # DB migrations
+├── .github/workflows/          # CI quality gates
+├── docker/                     # Dockerfiles for streamlit + backend
 ├── api_client.py               # API integrations and data fetching
 ├── cache_manager.py            # SQLite + Streamlit caching utilities
 ├── drug_repurposing_engine.py  # Repurposing network analysis
@@ -113,6 +120,31 @@ omnibimol/
 │   └── example_protein.fasta
 └── requirements.txt
 ```
+
+## Architecture (Current)
+
+- **UI:** Streamlit keeps user-facing scientific workflows intact.
+- **API:** FastAPI handles identity, RBAC, tenant isolation, audit events, and async job metadata.
+- **Data:** PostgreSQL stores multi-tenant system records; SQLite cache remains for existing local workflow acceleration.
+- **Async:** Job lifecycle is persisted and polled through backend endpoints (`queued`, `running`, `completed`/`failed`).
+- **Observability:** request IDs + structured logs + audit event trail.
+
+## Environment Variables
+
+Core backend variables (see `.env.example`):
+
+- `ENVIRONMENT` - runtime mode (`development` by default)
+- `APP_NAME` - API service name
+- `API_PREFIX` - path prefix (default `/api/v1`)
+- `DEBUG` - FastAPI debug mode
+- `LOG_LEVEL` - logging level
+- `DATABASE_URL` - Postgres connection string
+- `REDIS_URL` - Redis connection string
+- `AUTH_ENABLED` - enable strict JWT auth flow
+- `AUTH0_DOMAIN` - Auth0 tenant domain
+- `AUTH0_AUDIENCE` - expected token audience
+- `AUTH_JWT_ALGORITHMS` - accepted JWT algorithm list
+- `AUTH_TENANT_CLAIM` - claim key for tenant slug
 
 ## Installation
 
@@ -136,6 +168,52 @@ streamlit run app.py
 
 Then open: http://localhost:8501
 
+## Backend API (FastAPI)
+
+```bash
+uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+API base URL: `http://localhost:8000/api/v1`
+
+### Useful API groups
+
+- `/api/v1/auth/*` identity + RBAC helpers
+- `/api/v1/projects/*` tenant-scoped project access
+- `/api/v1/jobs/*` async workload lifecycle
+- `/api/v1/audit/events` privileged audit browsing
+- `/api/v1/reliability/*` upstream/degradation and upload validation
+
+## Quality Gates
+
+Run local checks before merging:
+
+```bash
+python -m ruff check backend alembic tests
+python -m mypy backend
+python -m pytest --cov=backend --cov-report=term --cov-fail-under=70
+```
+
+CI workflow is defined in `.github/workflows/ci.yml` and runs the same gates on pushes/PRs.
+
+## Docker Compose (App + API + DB + Redis)
+
+```bash
+docker compose up --build
+```
+
+Services:
+- Streamlit UI: http://localhost:8501
+- FastAPI: http://localhost:8000
+- Postgres: localhost:5432
+- Redis: localhost:6379
+
+## Operations and Security Docs
+
+- Security policy: `SECURITY.md`
+- Incident + operations runbook: `docs/OPERATIONS_RUNBOOK.md`
+- Legacy migration guide: `docs/MIGRATION_GUIDE.md`
+
 ## Usage Tips
 
 - Start with a protein search (e.g., TP53, BRCA1, EGFR).
@@ -154,6 +232,12 @@ Then open: http://localhost:8501
 - Some docking results are simulated to provide rapid feedback.
 - Public APIs may have rate limits or intermittent availability.
 - Genome analysis uses curated pattern matching for demo-level insights.
+
+## Scientific Use Notice
+
+- This platform is for research, educational, and exploratory workflows.
+- It is **not** intended for clinical diagnosis or patient-care decisions.
+- Existing in-app research-use disclaimers are intentionally preserved.
 
 ## Roadmap Ideas
 

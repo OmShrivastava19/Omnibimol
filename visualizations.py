@@ -3,6 +3,7 @@ import plotly.express as px
 from typing import Dict, List
 import pandas as pd
 import numpy as np
+from collections import defaultdict
 import matplotlib
 matplotlib.use('Agg')  # Use non-interactive backend for Streamlit
 import matplotlib.pyplot as plt
@@ -3035,3 +3036,636 @@ class ProteinVisualizer:
                     title="Phylogenetic Tree"
                 )
                 return fig
+
+    @staticmethod
+    def create_target_component_contribution_chart(ranked_results: List[Dict]) -> go.Figure:
+        """Create stacked bar chart of weighted component contributions."""
+        if not ranked_results:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No target prioritization results available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="gray")
+            )
+            fig.update_layout(height=320, template="plotly_white")
+            return fig
+
+        component_order = ["expression", "pathway", "ppi", "genetic", "ligandability", "trials"]
+        labels = [str(row.get("target_id", "Unknown")) for row in ranked_results]
+        fig = go.Figure()
+
+        for component in component_order:
+            y_values = []
+            for row in ranked_results:
+                contrib = row.get("component_contributions", {}).get(component, {})
+                y_values.append(float(contrib.get("weighted_contribution", 0.0)))
+            fig.add_trace(
+                go.Bar(
+                    name=component.title(),
+                    x=labels,
+                    y=y_values,
+                )
+            )
+
+        fig.update_layout(
+            barmode="stack",
+            title="Target Score Contributions by Component",
+            xaxis_title="Target",
+            yaxis_title="Weighted Contribution",
+            template="plotly_white",
+            height=420,
+            legend_title="Component",
+        )
+        return fig
+
+    @staticmethod
+    def create_target_radar_chart(component_scores: Dict[str, Dict]) -> go.Figure:
+        """Create radar chart for six target components."""
+        component_order = ["expression", "pathway", "ppi", "genetic", "ligandability", "trials"]
+        values = [float(component_scores.get(k, {}).get("score", 0.0)) for k in component_order]
+        labels = [k.title() for k in component_order]
+        values.append(values[0])
+        labels.append(labels[0])
+
+        fig = go.Figure(
+            data=[
+                go.Scatterpolar(
+                    r=values,
+                    theta=labels,
+                    fill="toself",
+                    name="Component score",
+                    line=dict(color="#1f77b4"),
+                )
+            ]
+        )
+        fig.update_layout(
+            title="Component Score Radar",
+            polar=dict(
+                radialaxis=dict(visible=True, range=[0, 100]),
+            ),
+            showlegend=False,
+            template="plotly_white",
+            height=420,
+        )
+        return fig
+
+    @staticmethod
+    def create_target_sensitivity_chart(sensitivity_result: Dict[str, Dict]) -> go.Figure:
+        """Create bar chart of sensitivity deltas by scenario."""
+        deltas = sensitivity_result.get("scenario_deltas", {})
+        if not deltas:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No sensitivity scenarios available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="gray")
+            )
+            fig.update_layout(height=320, template="plotly_white")
+            return fig
+
+        scenario_names = list(deltas.keys())
+        delta_values = [float(deltas[name]) for name in scenario_names]
+        colors = ["#2ca02c" if val >= 0 else "#d62728" for val in delta_values]
+
+        fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=scenario_names,
+                    y=delta_values,
+                    marker_color=colors,
+                    text=[f"{v:+.2f}" for v in delta_values],
+                    textposition="auto",
+                )
+            ]
+        )
+        fig.update_layout(
+            title="Sensitivity Analysis (Delta vs Baseline)",
+            xaxis_title="Scenario",
+            yaxis_title="Composite Score Delta",
+            template="plotly_white",
+            height=360,
+            showlegend=False,
+        )
+        return fig
+
+    @staticmethod
+    def create_variant_impact_distribution_chart(annotated_variants: List[Dict]) -> go.Figure:
+        """Create impact-class distribution chart for annotated variants."""
+        if not annotated_variants:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No annotated variants available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="gray"),
+            )
+            fig.update_layout(height=320, template="plotly_white")
+            return fig
+
+        counts: Dict[str, int] = defaultdict(int)
+        for row in annotated_variants:
+            counts[str(row.get("predicted_effect_class", "unknown")).lower()] += 1
+        order = ["high", "moderate", "low", "unknown"]
+        x_vals = [label.title() for label in order]
+        y_vals = [counts.get(label, 0) for label in order]
+        colors = ["#d62728", "#ff7f0e", "#2ca02c", "#9e9e9e"]
+        fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=x_vals,
+                    y=y_vals,
+                    marker_color=colors,
+                    text=y_vals,
+                    textposition="auto",
+                )
+            ]
+        )
+        fig.update_layout(
+            title="Variant Impact Distribution",
+            xaxis_title="Impact class",
+            yaxis_title="Variant count",
+            template="plotly_white",
+            height=340,
+            showlegend=False,
+        )
+        return fig
+
+    @staticmethod
+    def create_top_gene_impact_chart(gene_impact: Dict, top_n: int = 10) -> go.Figure:
+        """Create bar chart of top impacted genes."""
+        genes = list(gene_impact.get("genes", {}).values())[:top_n]
+        if not genes:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No gene impact data available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="gray"),
+            )
+            fig.update_layout(height=320, template="plotly_white")
+            return fig
+
+        names = [g.get("gene", "UNK") for g in genes]
+        scores = [float(g.get("score", 0.0)) for g in genes]
+        fig = go.Figure(
+            data=[go.Bar(x=names, y=scores, marker_color="#1f77b4", text=[f"{s:.1f}" for s in scores], textposition="auto")]
+        )
+        fig.update_layout(
+            title="Top Gene Impact Scores",
+            xaxis_title="Gene",
+            yaxis_title="Impact score (0-100)",
+            template="plotly_white",
+            height=360,
+            showlegend=False,
+        )
+        return fig
+
+    @staticmethod
+    def create_pathway_perturbation_chart(pathway_impact: Dict, top_n: int = 10) -> go.Figure:
+        """Create horizontal bar chart of pathway perturbation."""
+        pathways = pathway_impact.get("pathways", [])[:top_n]
+        if not pathways:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No pathway impact data available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="gray"),
+            )
+            fig.update_layout(height=320, template="plotly_white")
+            return fig
+
+        names = [p.get("pathway_name", "Unknown") for p in pathways][::-1]
+        scores = [float(p.get("impact_score", 0.0)) for p in pathways][::-1]
+        confidences = [p.get("confidence", "Low") for p in pathways][::-1]
+        fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=scores,
+                    y=names,
+                    orientation="h",
+                    text=[f"{s:.1f}" for s in scores],
+                    textposition="auto",
+                    customdata=confidences,
+                    hovertemplate="<b>%{y}</b><br>Impact: %{x:.1f}<br>Confidence: %{customdata}<extra></extra>",
+                    marker_color="#6a3d9a",
+                )
+            ]
+        )
+        fig.update_layout(
+            title="Pathway Perturbation Scores",
+            xaxis_title="Pathway score (0-100)",
+            yaxis_title="Pathway",
+            template="plotly_white",
+            height=max(360, len(pathways) * 28),
+            showlegend=False,
+        )
+        return fig
+
+    @staticmethod
+    def create_therapy_contribution_chart(ranked_candidates: List[Dict], top_n: int = 8) -> go.Figure:
+        """Create stacked contribution chart for therapy ranking components."""
+        top = ranked_candidates[:top_n]
+        if not top:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No therapy candidates available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="gray"),
+            )
+            fig.update_layout(height=320, template="plotly_white")
+            return fig
+
+        labels = [c.get("drug_name", "Unknown") for c in top]
+        components = {
+            "Target match": [float(c.get("target_gene_match", 0.0)) * 100.0 for c in top],
+            "Pathway relevance": [float(c.get("pathway_relevance", 0.0)) * 100.0 for c in top],
+            "Evidence quality": [float(c.get("evidence_quality", 0.0)) * 100.0 for c in top],
+            "Clinical maturity": [float(c.get("clinical_maturity", 0.0)) * 100.0 for c in top],
+            "Safety penalty": [-float(c.get("safety_risk_penalty", 0.0)) * 100.0 for c in top],
+        }
+
+        fig = go.Figure()
+        palette = ["#1f77b4", "#9467bd", "#2ca02c", "#ff7f0e", "#d62728"]
+        for idx, (label, values) in enumerate(components.items()):
+            fig.add_trace(go.Bar(x=labels, y=values, name=label, marker_color=palette[idx]))
+        fig.update_layout(
+            barmode="relative",
+            title="Therapy Candidate Score Contributions",
+            xaxis_title="Drug candidate",
+            yaxis_title="Component contribution (scaled)",
+            template="plotly_white",
+            height=420,
+            legend_title="Components",
+        )
+        return fig
+
+    @staticmethod
+    def create_confidence_completeness_chart(ranked_candidates: List[Dict], top_n: int = 8) -> go.Figure:
+        """Create bubble chart of confidence vs completeness for top therapies."""
+        top = ranked_candidates[:top_n]
+        if not top:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No confidence/completeness data available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="gray"),
+            )
+            fig.update_layout(height=320, template="plotly_white")
+            return fig
+
+        x_vals = [float(c.get("completeness_pct", 0.0)) for c in top]
+        y_vals = [float(c.get("ranking_confidence", 0.0)) for c in top]
+        names = [c.get("drug_name", "Unknown") for c in top]
+        scores = [float(c.get("composite_score", 0.0)) for c in top]
+
+        fig = go.Figure(
+            data=[
+                go.Scatter(
+                    x=x_vals,
+                    y=y_vals,
+                    mode="markers+text",
+                    text=names,
+                    textposition="top center",
+                    marker=dict(
+                        size=[max(10.0, min(40.0, s / 2.5)) for s in scores],
+                        color=scores,
+                        colorscale="Blues",
+                        showscale=True,
+                        colorbar=dict(title="Composite"),
+                    ),
+                    hovertemplate="<b>%{text}</b><br>Completeness=%{x:.1f}%<br>Confidence=%{y:.1f}<extra></extra>",
+                )
+            ]
+        )
+        fig.update_layout(
+            title="Confidence vs Data Completeness",
+            xaxis_title="Completeness (%)",
+            yaxis_title="Confidence (0-100)",
+            template="plotly_white",
+            height=380,
+            showlegend=False,
+        )
+        return fig
+
+    @staticmethod
+    def create_assay_ranking_comparison_chart(assays: List[Dict], top_n: int = 8) -> go.Figure:
+        """Create ranked assay score chart with confidence coloring."""
+        top = assays[:top_n]
+        if not top:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No assay ranking data available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="gray"),
+            )
+            fig.update_layout(height=320, template="plotly_white")
+            return fig
+
+        names = [row.get("assay_name", "Assay") for row in top][::-1]
+        scores = [float(row.get("rank_score", 0.0)) for row in top][::-1]
+        confidence = [row.get("confidence", "Low") for row in top][::-1]
+        color_map = {"High": "#2ca02c", "Med": "#ff7f0e", "Low": "#d62728"}
+        colors = [color_map.get(c, "#636efa") for c in confidence]
+
+        fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=scores,
+                    y=names,
+                    orientation="h",
+                    marker_color=colors,
+                    text=[f"{s:.1f}" for s in scores],
+                    textposition="auto",
+                    customdata=confidence,
+                    hovertemplate="<b>%{y}</b><br>Score=%{x:.1f}<br>Confidence=%{customdata}<extra></extra>",
+                )
+            ]
+        )
+        fig.update_layout(
+            title="Assay Ranking Comparison",
+            xaxis_title="Heuristic score (0-100)",
+            yaxis_title="Assay",
+            template="plotly_white",
+            height=max(340, len(top) * 36),
+            showlegend=False,
+        )
+        return fig
+
+    @staticmethod
+    def create_crispr_candidate_score_plot(candidates: List[Dict], top_n: int = 30) -> go.Figure:
+        """Create position-vs-score scatter for CRISPR candidates."""
+        top = candidates[:top_n]
+        if not top:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No CRISPR candidate scores available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="gray"),
+            )
+            fig.update_layout(height=320, template="plotly_white")
+            return fig
+
+        risk_color = {"Low": "#2ca02c", "Medium": "#ff7f0e", "High": "#d62728"}
+        x_vals = [int(row.get("target_position", 0)) for row in top]
+        y_vals = [float(row.get("heuristic_score", 0.0)) for row in top]
+        labels = [row.get("off_target_risk_level", "Medium") for row in top]
+        colors = [risk_color.get(lbl, "#636efa") for lbl in labels]
+        text = [row.get("spacer_sequence", "")[:12] + "..." for row in top]
+
+        fig = go.Figure(
+            data=[
+                go.Scatter(
+                    x=x_vals,
+                    y=y_vals,
+                    mode="markers",
+                    marker=dict(size=10, color=colors, line=dict(width=0.5, color="#333333")),
+                    text=text,
+                    customdata=labels,
+                    hovertemplate="Position=%{x}<br>Score=%{y:.1f}<br>Risk=%{customdata}<br>Spacer=%{text}<extra></extra>",
+                )
+            ]
+        )
+        fig.update_layout(
+            title="CRISPR Candidate Score Plot",
+            xaxis_title="Target position",
+            yaxis_title="Heuristic score (0-100)",
+            template="plotly_white",
+            height=360,
+            showlegend=False,
+        )
+        return fig
+
+    @staticmethod
+    def create_primer_quality_comparison_chart(primers: List[Dict], top_n: int = 10) -> go.Figure:
+        """Create grouped chart for primer quality and amplicon size."""
+        top = primers[:top_n]
+        if not top:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="No primer quality data available",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="gray"),
+            )
+            fig.update_layout(height=320, template="plotly_white")
+            return fig
+
+        labels = [f"Pair {idx+1}" for idx in range(len(top))]
+        quality = [float(row.get("quality_score", 0.0)) for row in top]
+        amplicon = [int(row.get("expected_amplicon_size", 0)) for row in top]
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(x=labels, y=quality, name="Quality score", marker_color="#1f77b4"))
+        fig.add_trace(go.Scatter(x=labels, y=amplicon, name="Amplicon size (bp)", yaxis="y2", mode="lines+markers", marker_color="#ff7f0e"))
+        fig.update_layout(
+            title="Primer Quality Comparison",
+            xaxis_title="Primer pair",
+            yaxis=dict(title="Quality score (0-100)"),
+            yaxis2=dict(title="Amplicon size (bp)", overlaying="y", side="right"),
+            template="plotly_white",
+            height=380,
+            legend=dict(orientation="h"),
+        )
+        return fig
+
+    @staticmethod
+    def create_wet_lab_readiness_dashboard(confidence_payload: Dict, assays: List[Dict], crispr_candidates: List[Dict]) -> go.Figure:
+        """Create compact readiness dashboard with confidence and risk distribution."""
+        conf = float(confidence_payload.get("plan_confidence_score", 0.0))
+        completeness = float(confidence_payload.get("data_completeness", 0.0))
+        readiness = str(confidence_payload.get("readiness_label", "red")).lower()
+        readiness_color = {"green": "#2ca02c", "yellow": "#ffbf00", "red": "#d62728"}.get(readiness, "#d62728")
+
+        assay_risks = sum(len(row.get("risk_flags", [])) for row in assays[:8])
+        crispr_risks = {
+            "High": sum(1 for row in crispr_candidates[:20] if row.get("off_target_risk_level") == "High"),
+            "Medium": sum(1 for row in crispr_candidates[:20] if row.get("off_target_risk_level") == "Medium"),
+            "Low": sum(1 for row in crispr_candidates[:20] if row.get("off_target_risk_level") == "Low"),
+        }
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Indicator(
+                mode="gauge+number",
+                value=conf,
+                title={"text": "Plan confidence"},
+                gauge={
+                    "axis": {"range": [0, 100]},
+                    "bar": {"color": readiness_color},
+                    "steps": [
+                        {"range": [0, 50], "color": "#fde2e2"},
+                        {"range": [50, 75], "color": "#fff6cc"},
+                        {"range": [75, 100], "color": "#e0f2e0"},
+                    ],
+                },
+                domain={"x": [0.0, 0.45], "y": [0.0, 1.0]},
+            )
+        )
+        fig.add_trace(
+            go.Bar(
+                x=["Assay risk flags", "CRISPR High", "CRISPR Medium", "CRISPR Low"],
+                y=[assay_risks, crispr_risks["High"], crispr_risks["Medium"], crispr_risks["Low"]],
+                marker_color=["#d62728", "#d62728", "#ff7f0e", "#2ca02c"],
+                name="Risk distribution",
+                xaxis="x2",
+                yaxis="y2",
+            )
+        )
+        fig.update_layout(
+            title=f"Wet-Lab Readiness Dashboard ({readiness.title()} | completeness {completeness:.1f}%)",
+            template="plotly_white",
+            height=400,
+            xaxis2=dict(domain=[0.52, 1.0], anchor="y2"),
+            yaxis2=dict(domain=[0.0, 1.0], anchor="x2", title="Count"),
+            showlegend=False,
+        )
+        return fig
+
+    @staticmethod
+    def create_portfolio_funnel(stage_distribution: List[Dict]) -> go.Figure:
+        """Create a stage distribution funnel for portfolio visibility."""
+        if not stage_distribution:
+            fig = go.Figure()
+            fig.add_annotation(text="No projects available", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+            fig.update_layout(template="plotly_white", height=320)
+            return fig
+        df = pd.DataFrame(stage_distribution)
+        fig = go.Figure(go.Funnel(y=df["stage"], x=df["count"], textinfo="value+percent initial"))
+        fig.update_layout(title="Portfolio Funnel by Stage", template="plotly_white", height=360)
+        return fig
+
+    @staticmethod
+    def create_candidate_comparison_radar(comparison_rows: List[Dict]) -> go.Figure:
+        """Render candidate comparison across normalized dimensions."""
+        categories = [
+            "biological_strength",
+            "pathway_ppi_relevance",
+            "ligandability_druggability",
+            "translational_evidence",
+            "clinical_evidence_maturity",
+            "data_quality_confidence",
+            "risk_burden_inverted",
+        ]
+        fig = go.Figure()
+        if not comparison_rows:
+            fig.add_annotation(text="No candidate comparison data", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+            fig.update_layout(template="plotly_white", height=380)
+            return fig
+        for row in comparison_rows[:8]:
+            values = [
+                row.get("biological_strength", 0.0),
+                row.get("pathway_ppi_relevance", 0.0),
+                row.get("ligandability_druggability", 0.0),
+                row.get("translational_evidence", 0.0),
+                row.get("clinical_evidence_maturity", 0.0),
+                row.get("data_quality_confidence", 0.0),
+                100.0 - row.get("risk_burden", 100.0),
+            ]
+            fig.add_trace(
+                go.Scatterpolar(
+                    r=values + [values[0]],
+                    theta=categories + [categories[0]],
+                    fill="toself",
+                    name=row.get("candidate", "candidate"),
+                )
+            )
+        fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), template="plotly_white", height=420)
+        return fig
+
+    @staticmethod
+    def create_score_confidence_timeline(snapshots: List[Dict]) -> go.Figure:
+        """Create dual-axis timeline for score and confidence evolution."""
+        fig = go.Figure()
+        if not snapshots:
+            fig.add_annotation(text="No snapshot timeline available", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+            fig.update_layout(template="plotly_white", height=340)
+            return fig
+        timestamps = [s.get("timestamp", "") for s in snapshots]
+        mean_scores = []
+        for s in snapshots:
+            comp = s.get("component_scores", {})
+            vals = [float(v.get("score", 0.0)) for v in comp.values() if isinstance(v, dict)]
+            mean_scores.append(float(np.mean(vals)) if vals else 0.0)
+        confidence = [float(s.get("confidence", 0.0)) * 100.0 for s in snapshots]
+        fig.add_trace(go.Scatter(x=timestamps, y=mean_scores, mode="lines+markers", name="Composite score", line=dict(color="#1f77b4")))
+        fig.add_trace(go.Scatter(x=timestamps, y=confidence, mode="lines+markers", name="Confidence %", yaxis="y2", line=dict(color="#ff7f0e")))
+        fig.update_layout(
+            title="Evidence Timeline",
+            xaxis_title="Snapshot time",
+            yaxis=dict(title="Composite score (0-100)"),
+            yaxis2=dict(title="Confidence (%)", overlaying="y", side="right"),
+            template="plotly_white",
+            height=380,
+            legend=dict(orientation="h"),
+        )
+        return fig
+
+    @staticmethod
+    def create_milestone_burndown(milestones: List[Dict]) -> go.Figure:
+        """Show milestone status and due-date completion trend."""
+        if not milestones:
+            fig = go.Figure()
+            fig.add_annotation(text="No milestones yet", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+            fig.update_layout(template="plotly_white", height=320)
+            return fig
+        df = pd.DataFrame(milestones)
+        status_counts = df["status"].value_counts().to_dict() if "status" in df.columns else {}
+        fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=list(status_counts.keys()),
+                    y=list(status_counts.values()),
+                    marker_color=["#9ca3af", "#3b82f6", "#ef4444", "#10b981"][: max(1, len(status_counts))],
+                )
+            ]
+        )
+        fig.update_layout(title="Milestone Completion / Blockers", yaxis_title="Count", template="plotly_white", height=340)
+        return fig
+
+    @staticmethod
+    def create_project_risk_heatmap(comparison_rows: List[Dict]) -> go.Figure:
+        """Heatmap of candidates versus risk and confidence."""
+        if not comparison_rows:
+            fig = go.Figure()
+            fig.add_annotation(text="No risk heatmap data", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+            fig.update_layout(template="plotly_white", height=320)
+            return fig
+        df = pd.DataFrame(comparison_rows)
+        z = np.array([[float(r.get("risk_burden", 0.0)), float(r.get("confidence", 0.0)) * 100.0] for r in comparison_rows])
+        fig = go.Figure(
+            data=go.Heatmap(
+                z=z,
+                x=["Risk burden", "Confidence %"],
+                y=df["candidate"],
+                colorscale="RdYlGn_r",
+                colorbar=dict(title="Value"),
+            )
+        )
+        fig.update_layout(title="Risk Heatmap by Candidate", template="plotly_white", height=max(320, len(comparison_rows) * 40))
+        return fig
+
+    @staticmethod
+    def create_go_no_go_matrix(checks: Dict[str, bool]) -> go.Figure:
+        """Visualize decision criteria pass/fail matrix."""
+        labels = list(checks.keys()) or ["No checks"]
+        vals = [1 if checks[k] else 0 for k in labels] if checks else [0]
+        fig = go.Figure(
+            data=go.Heatmap(
+                z=[vals],
+                x=labels,
+                y=["Criteria"],
+                colorscale=[[0, "#ef4444"], [1, "#10b981"]],
+                zmin=0,
+                zmax=1,
+                showscale=False,
+            )
+        )
+        fig.update_layout(title="Go/No-Go Criteria Matrix", template="plotly_white", height=260)
+        return fig

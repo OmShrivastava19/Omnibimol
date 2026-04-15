@@ -11,6 +11,8 @@ from datetime import datetime
 import json
 import re
 import base64
+import gzip
+import hashlib
 import httpx
 import textwrap
 from xml.etree import ElementTree as ET
@@ -24,6 +26,9 @@ from drug_repurposing_engine import DrugRepurposingEngine
 from sequence_analysis import SequenceAnalysisSuite, FASTAParser
 from genome_analysis_engine import GenomeAnalysisEngine
 from target_prioritization_engine import TargetPrioritizationEngine
+from variant_therapy_engine import VariantTherapyEngine
+from wet_lab_handoff_engine import WetLabHandoffEngine
+from portfolio_engine import PortfolioEngine
 try:
     from streamlit.runtime.scriptrunner.script_runner import RerunException
 except Exception:
@@ -885,6 +890,8 @@ def main():
     
     if 'api_client' not in st.session_state or not hasattr(st.session_state.api_client, "fetch_clinical_trials_by_drug"):
         st.session_state.api_client = ProteinAPIClient(st.session_state.cache_manager)
+    if "portfolio_engine" not in st.session_state:
+        st.session_state.portfolio_engine = PortfolioEngine()
     
     # Sidebar
     with st.sidebar:
@@ -896,7 +903,10 @@ def main():
             "Sequence Analysis",
             "Whole Genome Sequencing",
             "Drugs & Clinical Trials",
+            "📁 Portfolio Mode",
             "🎯 Target Prioritization",
+            "🧬 Variant-to-Therapy",
+            "🧪 Wet-Lab Handoff",
         ]
         current_page = st.session_state.get("current_page", "Protein Analysis")
         current_index = pages.index(current_page) if current_page in pages else 0
@@ -956,8 +966,17 @@ def main():
     elif st.session_state.get('current_page') == "Drugs & Clinical Trials":
         render_drugs_clinical_trials_page()
         return
+    elif st.session_state.get('current_page') == "📁 Portfolio Mode":
+        render_portfolio_mode_page()
+        return
     elif st.session_state.get('current_page') == "🎯 Target Prioritization":
         render_target_prioritization_page()
+        return
+    elif st.session_state.get('current_page') == "🧬 Variant-to-Therapy":
+        render_variant_to_therapy_page()
+        return
+    elif st.session_state.get('current_page') == "🧪 Wet-Lab Handoff":
+        render_wet_lab_handoff_page()
         return
     
     # Define nested helper function for report generation
@@ -6305,6 +6324,267 @@ def _build_target_scoring_payload(target_query: str) -> Optional[Dict]:
     return payload
 
 
+def render_portfolio_mode_page():
+    """Render multi-project portfolio operations cockpit."""
+    st.header("📁 Portfolio Mode for Biotech Teams")
+    st.caption("Research portfolio decision support only. Not for clinical or patient-care decisions.")
+    engine: PortfolioEngine = st.session_state.portfolio_engine
+
+    portfolios = engine.list_portfolios()
+    portfolio_labels = [f"{p['name']} ({p['owner'] or 'unassigned'})" for p in portfolios]
+    col_left, col_right = st.columns([2, 1])
+    with col_left:
+        selected_label = st.selectbox("Select portfolio", ["(none)"] + portfolio_labels, key="portfolio_selected_label")
+        selected_portfolio = None
+        if selected_label != "(none)":
+            selected_portfolio = portfolios[portfolio_labels.index(selected_label)]
+    with col_right:
+        with st.expander("Create portfolio"):
+            pf_name = st.text_input("Name", key="pf_name")
+            pf_owner = st.text_input("Owner", key="pf_owner")
+            pf_desc = st.text_area("Description", key="pf_desc", height=80)
+            if st.button("Create portfolio", key="create_portfolio_btn"):
+                if pf_name.strip():
+                    engine.create_portfolio(name=pf_name, owner=pf_owner, description=pf_desc)
+                    st.success("Portfolio created.")
+                    st.rerun()
+                else:
+                    st.warning("Portfolio name is required.")
+
+    tabs = st.tabs(
+        [
+            "Portfolio Home",
+            "Project Dashboard",
+            "Candidate Compare",
+            "Evidence Timeline",
+            "Decision Center",
+            "Exports",
+        ]
+    )
+
+    with tabs[0]:
+        st.subheader("Portfolio Home")
+        if not portfolios:
+            st.info("Create your first portfolio to start tracking programs.")
+        else:
+            all_projects = []
+            for pf in portfolios:
+                all_projects.extend(engine.list_projects(pf["id"]))
+            pipeline_health = {
+                "portfolios": len(portfolios),
+                "projects": len(all_projects),
+                "active": sum(1 for p in all_projects if (p.get("status") or "").lower() == "active"),
+                "on_hold": sum(1 for p in all_projects if "hold" in (p.get("status") or "").lower()),
+            }
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Portfolios", pipeline_health["portfolios"])
+            c2.metric("Projects", pipeline_health["projects"])
+            c3.metric("Active", pipeline_health["active"])
+            c4.metric("On Hold", pipeline_health["on_hold"])
+
+            for pf in portfolios:
+                st.markdown(f"**{pf['name']}** - owner: `{pf['owner'] or 'unassigned'}`")
+                projects = engine.list_projects(pf["id"])
+                st.dataframe(
+                    pd.DataFrame(projects)[["name", "indication", "modality", "stage", "status", "owner"]]
+                    if projects
+                    else pd.DataFrame(columns=["name", "indication", "modality", "stage", "status", "owner"]),
+                    use_container_width=True,
+                )
+                stage_dist = engine.get_stage_distribution(pf["id"])
+                st.plotly_chart(ProteinVisualizer.create_portfolio_funnel(stage_dist), use_container_width=True)
+
+        if selected_portfolio:
+            st.divider()
+            st.markdown("**Create project in selected portfolio**")
+            with st.form("create_project_form", clear_on_submit=True):
+                prj_name = st.text_input("Project name")
+                prj_indication = st.text_input("Indication")
+                prj_modality = st.text_input("Modality")
+                prj_stage = st.selectbox("Stage", ["discovery", "validation", "lead optimization", "translational", "clinical readiness"])
+                prj_owner = st.text_input("Project owner")
+                prj_status = st.selectbox("Status", ["active", "hold", "completed", "archived"])
+                submit_project = st.form_submit_button("Create project")
+                if submit_project and prj_name.strip():
+                    engine.create_project(
+                        portfolio_id=selected_portfolio["id"],
+                        name=prj_name,
+                        indication=prj_indication,
+                        modality=prj_modality,
+                        stage=prj_stage,
+                        owner=prj_owner,
+                        status=prj_status,
+                    )
+                    st.success("Project created.")
+                    st.rerun()
+
+    selected_project = None
+    if selected_portfolio:
+        projects = engine.list_projects(selected_portfolio["id"])
+        if projects:
+            prj_labels = [f"{p['name']} ({p['stage']})" for p in projects]
+            picked = st.selectbox("Project context", prj_labels, key="portfolio_project_context")
+            selected_project = projects[prj_labels.index(picked)]
+
+    with tabs[1]:
+        st.subheader("Project Dashboard")
+        if not selected_project:
+            st.info("Select a portfolio and project to view dashboard.")
+        else:
+            dash = engine.get_project_dashboard_data(selected_project["id"])
+            project = dash["project"]
+            st.write(f"**{project.get('name')}** | stage `{project.get('stage')}` | owner `{project.get('owner') or 'unassigned'}`")
+            st.caption(dash["disclaimer"])
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Candidates", dash["pipeline"]["candidate_count"])
+            col2.metric("Avg rank", dash["pipeline"]["average_rank_score"])
+            col3.metric("Milestone completion", f"{dash['milestone_metrics']['completion_pct']}%")
+            col4.metric("Blocked milestones", dash["milestone_metrics"]["blocker_count"])
+
+            st.markdown("**Target pipeline**")
+            st.dataframe(pd.DataFrame(dash["candidate_comparison"]["comparison_table"]), use_container_width=True)
+            st.plotly_chart(ProteinVisualizer.create_project_risk_heatmap(dash["candidate_comparison"]["comparison_table"]), use_container_width=True)
+            st.markdown("**Milestone tracker**")
+            st.dataframe(pd.DataFrame(dash["milestones"]), use_container_width=True)
+            st.plotly_chart(ProteinVisualizer.create_milestone_burndown(dash["milestones"]), use_container_width=True)
+            if dash["latest_decision_snapshot"]:
+                st.markdown("**Latest decision snapshot**")
+                st.json(dash["latest_decision_snapshot"])
+
+            with st.expander("Add candidate / milestone"):
+                c_col, m_col = st.columns(2)
+                with c_col:
+                    cand_target = st.text_input("Target ID", key="cand_target_id")
+                    cand_alias = st.text_input("Alias", key="cand_alias")
+                    cand_priority = st.slider("Priority", 0, 100, 50, key="cand_priority")
+                    if st.button("Add candidate", key="add_candidate_btn"):
+                        engine.add_target_candidate(
+                            project_id=selected_project["id"],
+                            target_id=cand_target,
+                            alias=cand_alias,
+                            priority=cand_priority,
+                        )
+                        st.success("Candidate added.")
+                        st.rerun()
+                with m_col:
+                    ms_title = st.text_input("Milestone title", key="ms_title")
+                    ms_type = st.selectbox(
+                        "Category",
+                        ["validation", "mechanism", "lead optimization", "translational", "clinical readiness"],
+                        key="ms_type",
+                    )
+                    ms_due = st.date_input("Due date", key="ms_due")
+                    ms_owner = st.text_input("Milestone owner", key="ms_owner")
+                    ms_status = st.selectbox("Status", ["not started", "in progress", "blocked", "complete"], key="ms_status")
+                    if st.button("Create milestone", key="create_ms_btn"):
+                        engine.create_milestone(
+                            project_id=selected_project["id"],
+                            title=ms_title,
+                            milestone_type=ms_type,
+                            due_date=ms_due.isoformat(),
+                            owner=ms_owner,
+                            status=ms_status,
+                            criteria={"acceptance": ["Attach objective evidence", "Reviewer sign-off"]},
+                        )
+                        st.success("Milestone created.")
+                        st.rerun()
+
+    with tabs[2]:
+        st.subheader("Candidate Compare")
+        if not selected_project:
+            st.info("Select a project first.")
+        else:
+            candidates = engine.list_target_candidates(selected_project["id"])
+            options = {f"{c['target_id']} ({c['alias'] or c['id']})": c["id"] for c in candidates}
+            selected = st.multiselect("Candidates", list(options.keys()), default=list(options.keys())[:4], key="compare_candidates_select")
+            selected_ids = [options[s] for s in selected]
+            compare = engine.compare_candidates(selected_project["id"], selected_ids if selected_ids else None)
+            st.dataframe(pd.DataFrame(compare["comparison_table"]), use_container_width=True)
+            st.plotly_chart(ProteinVisualizer.create_candidate_comparison_radar(compare["comparison_table"]), use_container_width=True)
+            if compare["ranked_summary"]:
+                best = compare["ranked_summary"][0]
+                st.success(f"Best candidate for current stage: {best['alias']} (score {best['rank_score']}, confidence {best['confidence']})")
+
+    with tabs[3]:
+        st.subheader("Evidence Timeline")
+        if not selected_project:
+            st.info("Select a project first.")
+        else:
+            candidates = engine.list_target_candidates(selected_project["id"])
+            if not candidates:
+                st.info("Add candidates to track evidence drift.")
+            else:
+                cand_map = {f"{c['target_id']} ({c['alias'] or c['id']})": c for c in candidates}
+                picked = st.selectbox("Candidate", list(cand_map.keys()), key="timeline_candidate_select")
+                selected_cand = cand_map[picked]
+                ts_payload = engine.get_target_time_series(selected_cand["id"])
+                st.plotly_chart(ProteinVisualizer.create_score_confidence_timeline(ts_payload["snapshots"]), use_container_width=True)
+                st.markdown("**Drift alerts**")
+                st.dataframe(pd.DataFrame(ts_payload["drift_events"]), use_container_width=True)
+                with st.expander("Add evidence snapshot"):
+                    expr = st.slider("Expression score", 0.0, 100.0, 50.0, 1.0, key="snap_expr")
+                    pathway = st.slider("Pathway score", 0.0, 100.0, 50.0, 1.0, key="snap_path")
+                    ppi = st.slider("PPI score", 0.0, 100.0, 50.0, 1.0, key="snap_ppi")
+                    genetic = st.slider("Genetic/translational score", 0.0, 100.0, 50.0, 1.0, key="snap_gen")
+                    ligand = st.slider("Ligandability score", 0.0, 100.0, 50.0, 1.0, key="snap_lig")
+                    trials = st.slider("Clinical maturity score", 0.0, 100.0, 50.0, 1.0, key="snap_trials")
+                    conf = st.slider("Evidence confidence", 0.0, 1.0, 0.65, 0.01, key="snap_conf")
+                    comp = st.slider("Data completeness", 0.0, 1.0, 0.75, 0.01, key="snap_comp")
+                    trial_status = st.text_input("Trial status", value="Phase 1", key="snap_trial_status")
+                    if st.button("Save snapshot", key="save_snapshot_btn"):
+                        component_scores = {
+                            "expression": {"available": True, "score": expr, "source_quality": conf},
+                            "pathway": {"available": True, "score": pathway, "source_quality": conf},
+                            "ppi": {"available": True, "score": ppi, "source_quality": conf},
+                            "genetic": {"available": True, "score": genetic, "source_quality": conf},
+                            "ligandability": {"available": True, "score": ligand, "source_quality": conf},
+                            "trials": {"available": True, "score": trials, "source_quality": conf},
+                        }
+                        result = engine.save_evidence_snapshot(
+                            target_candidate_id=selected_cand["id"],
+                            source_version="manual-ui-v1",
+                            component_scores=component_scores,
+                            confidence=conf,
+                            completeness=comp,
+                            key_findings={"highlights": ["Manual checkpoint entry"]},
+                            trial_status=trial_status,
+                        )
+                        st.success(f"Snapshot saved. Drift: {result['drift']['classification']}")
+                        st.rerun()
+
+    with tabs[4]:
+        st.subheader("Decision Center")
+        if not selected_project:
+            st.info("Select a project first.")
+        else:
+            if st.button("Generate / Refresh GO-NO-GO snapshot", type="primary", key="generate_decision_btn"):
+                snapshot = engine.generate_decision_snapshot(selected_project["id"])
+                st.session_state.latest_portfolio_decision = snapshot
+            snapshot = st.session_state.get("latest_portfolio_decision") or engine.get_project_dashboard_data(selected_project["id"]).get("latest_decision_snapshot")
+            if snapshot:
+                st.json(snapshot)
+                st.plotly_chart(ProteinVisualizer.create_go_no_go_matrix(snapshot.get("checks", {})), use_container_width=True)
+                st.caption("Research and portfolio decision support output only. Not for clinical use.")
+
+    with tabs[5]:
+        st.subheader("Exports")
+        if not selected_project:
+            st.info("Select a project first.")
+        else:
+            export_fmt = st.selectbox("Export format", ["json", "csv", "md"], key="portfolio_export_fmt")
+            if st.button("Generate decision packet", key="generate_packet_btn"):
+                packet = engine.export_project_packet(selected_project["id"], format=export_fmt)
+                st.session_state.portfolio_export_packet = packet
+            packet = st.session_state.get("portfolio_export_packet")
+            if packet:
+                st.write(f"Schema valid: {packet.get('schema_valid', False)}")
+                if export_fmt == "csv" and isinstance(packet.get("content"), dict):
+                    for section_name, csv_text in packet["content"].items():
+                        st.text_area(f"CSV - {section_name}", value=csv_text, height=160)
+                else:
+                    st.text_area("Export payload", value=packet.get("content", ""), height=320)
+
+
 def render_target_prioritization_page():
     """Render target prioritization scoring page."""
     st.header("🎯 Target Prioritization")
@@ -6462,6 +6742,596 @@ def render_target_prioritization_page():
             mime="application/json",
             key="target_priority_json",
         )
+
+
+def render_variant_to_therapy_page():
+    """Render precision medicine variant-to-therapy page."""
+    st.header("🧬 Variant-to-Therapy")
+    st.caption("Transparent variant-to-therapy ranking for research decision support.")
+    st.warning("For research use only. Not for clinical diagnosis/treatment decisions.")
+
+    if "variant_therapy_engine" not in st.session_state:
+        st.session_state.variant_therapy_engine = VariantTherapyEngine(
+            api_client=st.session_state.get("api_client"),
+            cache_manager=st.session_state.get("cache_manager"),
+        )
+    engine: VariantTherapyEngine = st.session_state.variant_therapy_engine
+
+    st.subheader("A) Upload & QC")
+    uploader = st.file_uploader(
+        "Upload patient VCF (.vcf or .vcf.gz)",
+        type=["vcf", "gz"],
+        key="variant_to_therapy_uploader",
+    )
+    sample_id = st.text_input("Sample ID (optional)", value="", key="variant_to_therapy_sample_id")
+    disease_context = st.text_input("Disease context (optional)", value="", key="variant_to_therapy_disease_context")
+
+    q1, q2 = st.columns(2)
+    with q1:
+        min_qual = st.number_input("Minimum QUAL filter", min_value=0.0, max_value=300.0, value=20.0, step=1.0)
+    with q2:
+        pass_only = st.checkbox("Retain PASS-only variants", value=False)
+
+    st.subheader("Therapy weight tuning")
+    default_weights = VariantTherapyEngine.DEFAULT_WEIGHTS
+    w1, w2, w3 = st.columns(3)
+    with w1:
+        w_target = st.slider("Target-gene match", 0.0, 0.8, float(default_weights["target_gene_match"]), 0.01)
+        w_pathway = st.slider("Pathway correction relevance", 0.0, 0.8, float(default_weights["pathway_correction_relevance"]), 0.01)
+    with w2:
+        w_evidence = st.slider("Evidence quality", 0.0, 0.8, float(default_weights["evidence_quality"]), 0.01)
+        w_maturity = st.slider("Clinical maturity", 0.0, 0.8, float(default_weights["clinical_maturity"]), 0.01)
+    with w3:
+        w_safety = st.slider("Safety/risk penalty", 0.0, 0.8, float(default_weights["safety_risk_penalty"]), 0.01)
+        include_repurposing = st.checkbox("Include repurposing candidates", value=True)
+
+    ranking_filters = st.columns(3)
+    with ranking_filters[0]:
+        approval_filter = st.multiselect("Approval status", ["FDA Approved", "Clinical Trial", "Repurposing Candidate"], default=["FDA Approved", "Clinical Trial", "Repurposing Candidate"])
+    with ranking_filters[1]:
+        min_evidence = st.slider("Minimum evidence quality", 0.0, 1.0, 0.0, 0.05)
+    with ranking_filters[2]:
+        trial_phase_filter = st.selectbox("Minimum trial phase", ["Any", "Phase 1", "Phase 2", "Phase 3", "Phase 4"], index=0)
+
+    run_clicked = st.button("Run Variant-to-Therapy Pipeline", type="primary", key="run_variant_therapy_pipeline")
+
+    if run_clicked and uploader is not None:
+        file_bytes = uploader.getvalue()
+        try:
+            if uploader.name.endswith(".gz"):
+                vcf_text = gzip.decompress(file_bytes).decode("utf-8", errors="replace")
+            else:
+                vcf_text = file_bytes.decode("utf-8", errors="replace")
+        except Exception as exc:
+            st.error(f"Could not read uploaded file: {exc}")
+            return
+
+        weights = {
+            "target_gene_match": w_target,
+            "pathway_correction_relevance": w_pathway,
+            "evidence_quality": w_evidence,
+            "clinical_maturity": w_maturity,
+            "safety_risk_penalty": w_safety,
+        }
+        cache_key = (
+            "variant_therapy_"
+            + hashlib.md5(vcf_text.encode("utf-8")).hexdigest()
+            + "_"
+            + hashlib.md5(json.dumps(weights, sort_keys=True).encode("utf-8")).hexdigest()
+            + f"_{int(min_qual)}_{int(pass_only)}"
+        )
+        cache_manager = st.session_state.get("cache_manager")
+        cached = cache_manager.get(cache_key) if cache_manager else None
+        if cached:
+            st.session_state.variant_therapy_results = cached
+            st.success("Loaded variant-to-therapy results from cache.")
+        else:
+            progress = st.progress(0, text="Parsing VCF...")
+            parsed = engine.parse_vcf(vcf_text)
+            progress.progress(20, text="Normalizing variants...")
+            normalized = engine.normalize_variants(parsed.get("variants", []))
+            filtered = []
+            for row in normalized:
+                qual = row.get("qual")
+                if qual is not None and float(qual) < float(min_qual):
+                    continue
+                if pass_only and row.get("filter") not in {"PASS", ".", ""}:
+                    continue
+                filtered.append(row)
+
+            progress.progress(40, text="Annotating variant effects...")
+            annotated = engine.annotate_variant_effects(filtered)
+            progress.progress(55, text="Aggregating gene impact...")
+            gene_impact = engine.aggregate_gene_impact(annotated)
+
+            progress.progress(70, text="Scoring pathway impact...")
+            pathway_map = {"pathways": []}
+            for gene in list(gene_impact.get("genes", {}).keys())[:10]:
+                try:
+                    search_results = cached_search_uniprot(gene, st.session_state.api_client, max_results=1)
+                    if search_results:
+                        top = search_results[0]
+                        kegg_data = cached_fetch_kegg_pathways(top.get("gene_name", gene), top.get("uniprot_id", ""), st.session_state.api_client)
+                        if kegg_data and kegg_data.get("pathways"):
+                            pathway_map["pathways"].extend(kegg_data.get("pathways", []))
+                except Exception:
+                    continue
+            pathway_impact = engine.score_pathway_impact(gene_impact, pathway_map)
+
+            progress.progress(85, text="Generating and ranking therapy candidates...")
+            context = {"gene_to_uniprot": {}}
+            for gene in list(gene_impact.get("genes", {}).keys())[:10]:
+                try:
+                    sr = cached_search_uniprot(gene, st.session_state.api_client, max_results=1)
+                    if sr:
+                        context["gene_to_uniprot"][gene] = sr[0].get("uniprot_id", "")
+                except Exception:
+                    continue
+            candidates = engine.generate_drug_candidates(gene_impact, pathway_impact, context=context)
+            if not include_repurposing:
+                candidates = [c for c in candidates if not c.get("repurposing_flag")]
+            ranked = engine.rank_therapy_options(candidates, weights=weights)
+
+            explainability = engine.build_explainability_payload(
+                ranked_candidates=ranked,
+                gene_impact=gene_impact,
+                pathway_impact=pathway_impact,
+                parsing_stats=parsed.get("stats", {}),
+            )
+            report_bundle = engine.export_case_report(
+                parsed_vcf=parsed,
+                annotated_variants=annotated,
+                gene_impact=gene_impact,
+                pathway_impact=pathway_impact,
+                ranked_candidates=ranked,
+                explainability=explainability,
+                sample_metadata={"sample_id": sample_id, "disease_context": disease_context},
+            )
+            progress.progress(100, text="Pipeline complete.")
+
+            st.session_state.variant_therapy_results = {
+                "parsed": parsed,
+                "annotated": annotated,
+                "gene_impact": gene_impact,
+                "pathway_impact": pathway_impact,
+                "candidates": candidates,
+                "ranked": ranked,
+                "explainability": explainability,
+                "report_bundle": report_bundle,
+                "weights": weights,
+                "sample_metadata": {"sample_id": sample_id, "disease_context": disease_context},
+            }
+            if cache_manager:
+                cache_manager.set(cache_key, st.session_state.variant_therapy_results)
+
+    results = st.session_state.get("variant_therapy_results")
+    if not results:
+        st.info("Upload a VCF and run the pipeline to see variant-to-therapy outputs.")
+        return
+
+    parsed = results["parsed"]
+    annotated = results["annotated"]
+    gene_impact = results["gene_impact"]
+    pathway_impact = results["pathway_impact"]
+    ranked = results["ranked"]
+    explainability = results["explainability"]
+    report_bundle = results["report_bundle"]
+
+    if parsed.get("errors"):
+        st.error("VCF parsing errors detected:")
+        for err in parsed.get("errors", [])[:8]:
+            st.write(f"- {err}")
+    if parsed.get("warnings"):
+        with st.expander("Parsing warnings", expanded=False):
+            for warn in parsed.get("warnings", [])[:20]:
+                st.write(f"- {warn}")
+
+    stats = parsed.get("stats", {})
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Variants parsed", stats.get("parsed", 0))
+    m2.metric("Variants flagged", stats.get("filtered", 0))
+    m3.metric("Variants retained", stats.get("retained", 0))
+
+    st.subheader("B) Variant Effects")
+    impact_filter = st.multiselect("Impact class filter", ["high", "moderate", "low", "unknown"], default=["high", "moderate", "low", "unknown"])
+    gene_filter = st.text_input("Gene filter", value="")
+    conf_filter = st.multiselect("Confidence filter", ["High", "Med", "Low"], default=["High", "Med", "Low"])
+    filtered_variants = [
+        row for row in annotated
+        if str(row.get("predicted_effect_class", "unknown")).lower() in impact_filter
+        and (not gene_filter or gene_filter.upper() in str(row.get("gene", "")).upper())
+        and str(row.get("confidence", "Low")) in conf_filter
+    ]
+    variant_df = pd.DataFrame(filtered_variants)
+    if not variant_df.empty:
+        show_cols = [c for c in ["variant_key", "gene", "predicted_effect_class", "impact_score", "confidence", "variant_type", "consequence", "genotype", "qual", "filter"] if c in variant_df.columns]
+        st.dataframe(variant_df[show_cols].sort_values(by=["impact_score", "gene"], ascending=[False, True]), width="stretch", hide_index=True)
+        st.plotly_chart(ProteinVisualizer.create_variant_impact_distribution_chart(filtered_variants), width="stretch")
+        st.download_button("📥 Download variant effects CSV", report_bundle["variants_csv"], file_name="variant_effects.csv", mime="text/csv")
+    else:
+        st.info("No variants match the current filters.")
+
+    st.subheader("C) Gene + Pathway Impact")
+    st.plotly_chart(ProteinVisualizer.create_top_gene_impact_chart(gene_impact), width="stretch")
+    st.plotly_chart(ProteinVisualizer.create_pathway_perturbation_chart(pathway_impact), width="stretch")
+    for row in pathway_impact.get("pathways", [])[:8]:
+        with st.expander(f"🧪 {row.get('pathway_name')} | score {row.get('impact_score')}", expanded=False):
+            st.write(f"Hit ratio: {row.get('hit_ratio')} | Confidence: {row.get('confidence')}")
+            st.write(row.get("mechanism_hypothesis"))
+
+    st.subheader("D) Candidate Therapies")
+    phase_rank = {"Any": 0, "Phase 1": 1, "Phase 2": 2, "Phase 3": 3, "Phase 4": 4}
+
+    def _phase_ok(value: str) -> bool:
+        if trial_phase_filter == "Any":
+            return True
+        txt = str(value).upper()
+        detected = 0
+        for ph, rank in [("PHASE1", 1), ("PHASE2", 2), ("PHASE3", 3), ("PHASE4", 4)]:
+            if ph in txt:
+                detected = max(detected, rank)
+        return detected >= phase_rank[trial_phase_filter]
+
+    filtered_ranked = [
+        row for row in ranked
+        if row.get("approval_status") in approval_filter
+        and float(row.get("evidence_quality", 0.0)) >= min_evidence
+        and _phase_ok(row.get("clinical_phase_or_status", ""))
+    ]
+    ranking_df = pd.DataFrame(filtered_ranked)
+    if not ranking_df.empty:
+        display_cols = [
+            "drug_name",
+            "composite_score",
+            "ranking_confidence",
+            "completeness_pct",
+            "approval_status",
+            "repurposing_flag",
+            "evidence_quality_summary",
+            "trial_evidence_summary",
+        ]
+        st.dataframe(ranking_df[display_cols].sort_values(by="composite_score", ascending=False), width="stretch", hide_index=True)
+        st.plotly_chart(ProteinVisualizer.create_therapy_contribution_chart(filtered_ranked), width="stretch")
+        st.plotly_chart(ProteinVisualizer.create_confidence_completeness_chart(filtered_ranked), width="stretch")
+        for row in filtered_ranked[:10]:
+            with st.expander(f"💊 {row.get('drug_name')} | score {row.get('composite_score')}", expanded=False):
+                st.write(f"Targets: {', '.join(row.get('target_genes', []))}")
+                st.write(f"Rationale: {row.get('mechanism_rationale')}")
+                st.write(f"Approval status: {row.get('approval_status')}")
+                st.write(f"Trial evidence: {row.get('trial_evidence_summary')}")
+                st.write(f"Risk note: {row.get('contraindication_or_risk_notes')}")
+                explain_rows = [e for e in explainability.get("therapy_options", []) if e.get("drug_name") == row.get("drug_name")]
+                if explain_rows:
+                    e = explain_rows[0]
+                    st.markdown("**Top 3 drivers**")
+                    for d in e.get("top_3_drivers", []):
+                        st.write(f"- {d}")
+                    st.markdown("**Top 3 risks**")
+                    for r in e.get("top_3_risks", []):
+                        st.write(f"- {r}")
+                    st.markdown("**Required next validation experiments/tests**")
+                    for nxt in e.get("required_next_validation_tests", []):
+                        st.write(f"- {nxt}")
+    else:
+        st.info("No therapy candidates match current filters.")
+
+    st.subheader("E) Report Export")
+    json_blob = json.dumps(report_bundle["json"], indent=2)
+    st.download_button("📥 Download JSON report", json_blob, file_name="variant_therapy_report.json", mime="application/json")
+    st.download_button("📥 Download therapies CSV", report_bundle["therapies_csv"], file_name="therapy_candidates.csv", mime="text/csv")
+    st.download_button("📥 Download narrative markdown", report_bundle["narrative_markdown"], file_name="variant_therapy_narrative.md", mime="text/markdown")
+    st.caption("For research use only. Not for clinical diagnosis/treatment decisions.")
+
+
+def render_wet_lab_handoff_page():
+    """Render bench-focused wet-lab handoff planning page."""
+    st.header("🧪 Wet-Lab Handoff")
+    st.caption("Convert computational findings into experiment-ready plans for bench execution.")
+    st.warning(
+        "Research-use only. Not for clinical diagnosis or treatment. "
+        "All recommendations are preliminary, uncertainty-labeled, and require human review."
+    )
+
+    if "wet_lab_handoff_engine" not in st.session_state:
+        st.session_state.wet_lab_handoff_engine = WetLabHandoffEngine()
+    engine: WetLabHandoffEngine = st.session_state.wet_lab_handoff_engine
+
+    objective = st.selectbox(
+        "Objective",
+        [
+            "target validation",
+            "knockout",
+            "overexpression",
+            "pathway perturbation",
+            "ligand-response validation",
+        ],
+        index=0,
+    )
+    sample_presets = ["Cell line", "Organoid", "Animal model", "Primary cells", "Custom"]
+    c1, c2 = st.columns(2)
+    with c1:
+        sample_preset = st.selectbox("Sample model preset", sample_presets, index=0)
+    with c2:
+        sample_model = st.text_input("Sample model (free text)", value=sample_preset)
+
+    c3, c4, c5 = st.columns(3)
+    with c3:
+        species = st.text_input("Species", value="Homo sapiens")
+    with c4:
+        throughput_preference = st.selectbox("Throughput preference", ["low", "medium", "high"], index=1)
+    with c5:
+        genome_build = st.text_input("Genome build (optional)", value="GRCh38")
+
+    instruments = st.multiselect(
+        "Available instruments",
+        ["qPCR", "flow", "western", "microscopy", "NGS", "plate reader"],
+        default=["qPCR", "western", "plate reader"],
+    )
+
+    c6, c7 = st.columns(2)
+    with c6:
+        timeline = st.selectbox("Timeline", ["rapid (<2 weeks)", "standard (2-8 weeks)", "extended (>8 weeks)"], index=1)
+    with c7:
+        budget_tier = st.selectbox("Budget tier", ["low", "medium", "high"], index=1)
+
+    st.subheader("Strictness toggles")
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        strict_crispr = st.checkbox("High-specificity CRISPR", value=True)
+    with s2:
+        strict_primer = st.checkbox("Conservative primer design", value=True)
+    with s3:
+        enforce_orthogonal = st.checkbox("Require orthogonal validation assays", value=True)
+
+    run = st.button("Generate Wet-Lab Package", type="primary", key="run_wet_lab_handoff")
+    if run:
+        current_data = st.session_state.get("current_data", {}) or {}
+        sequence_data = {
+            "sequence": current_data.get("fasta_sequence")
+            or current_data.get("sequence")
+            or st.session_state.get("sequence_input", ""),
+            "gene_name": current_data.get("gene_name") or st.session_state.get("current_gene_name", ""),
+        }
+        target_data = {
+            "gene_name": current_data.get("gene_name") or st.session_state.get("current_gene_name", ""),
+            "uniprot_id": current_data.get("uniprot_id") or st.session_state.get("current_uniprot_id", ""),
+            "protein_name": current_data.get("protein_name", ""),
+            "target_id": current_data.get("gene_name") or st.session_state.get("current_uniprot_id", ""),
+            "raw": current_data,
+        }
+        pathway_data = current_data.get("kegg_pathways") or {"pathways": []}
+        variant_data = st.session_state.get("variant_therapy_results")
+
+        lab_profile = {
+            "sample_model": sample_model,
+            "species": species,
+            "available_instruments": instruments,
+            "throughput_preference": throughput_preference,
+            "timeline": timeline,
+            "budget_tier": budget_tier,
+            "strictness": {
+                "high_specificity_crispr": strict_crispr,
+                "conservative_primer_design": strict_primer,
+                "orthogonal_assays": enforce_orthogonal,
+            },
+        }
+
+        strict_primer_constraints = {
+            "intended_use": "qPCR" if objective in {"target validation", "overexpression"} else "genotyping",
+            "min_len": 19 if strict_primer else 18,
+            "max_len": 23 if strict_primer else 25,
+            "min_gc": 42.0 if strict_primer else 38.0,
+            "max_gc": 58.0 if strict_primer else 65.0,
+            "min_tm": 58.0 if strict_primer else 55.0,
+            "max_tm": 63.0 if strict_primer else 66.0,
+            "amplicon_min": 90 if strict_primer else 70,
+            "amplicon_max": 220 if strict_primer else 700,
+        }
+
+        cache_payload = {
+            "objective": objective,
+            "lab_profile": lab_profile,
+            "sequence_hash": hashlib.md5((sequence_data.get("sequence") or "").encode("utf-8")).hexdigest(),
+            "target_id": target_data.get("target_id"),
+            "genome_build": genome_build,
+            "strict_primer_constraints": strict_primer_constraints,
+            "pathway_count": len(pathway_data.get("pathways", [])) if isinstance(pathway_data, dict) else 0,
+            "variant_available": bool(variant_data),
+        }
+        cache_key = "wet_lab_handoff_" + hashlib.md5(json.dumps(cache_payload, sort_keys=True).encode("utf-8")).hexdigest()
+        cache_manager = st.session_state.get("cache_manager")
+        cached = cache_manager.get(cache_key) if cache_manager else None
+        if cached:
+            st.session_state.wet_lab_handoff_results = cached
+            st.success("Loaded wet-lab handoff package from cache.")
+            st.rerun()
+
+        with st.spinner("Building wet-lab handoff plan..."):
+            context = engine.build_experiment_context(
+                target_data=target_data,
+                sequence_data=sequence_data,
+                pathway_data=pathway_data,
+                variant_data=variant_data,
+            )
+            assays = engine.suggest_assays(context=context, objective=objective, lab_profile=lab_profile)
+            crispr_candidates = engine.suggest_crispr_targets(
+                sequence=context.get("sequence", {}).get("sequence", ""),
+                gene_name=context.get("target", {}).get("gene_name", ""),
+                genome_build=genome_build or None,
+            )
+            if strict_crispr:
+                crispr_candidates = [row for row in crispr_candidates if row.get("off_target_risk_level") != "High"]
+
+            selected_regions = crispr_candidates[:6] if crispr_candidates else []
+            primers = engine.suggest_primers(
+                sequence=context.get("sequence", {}).get("sequence", ""),
+                regions=selected_regions,
+                primer_constraints=strict_primer_constraints,
+            )
+
+            plan = {
+                "objective": objective,
+                "lab_profile": lab_profile,
+                "context": context,
+                "assays": assays,
+                "crispr_candidates": crispr_candidates,
+                "primers": primers,
+            }
+            plan["validation_checklist"] = engine.generate_validation_checklist(plan=plan, objective=objective)
+            plan["confidence"] = engine.compute_plan_confidence(plan=plan)
+            exported = engine.export_wet_lab_package(plan=plan, format="json")
+
+            st.session_state.wet_lab_handoff_results = {
+                "plan": plan,
+                "exported": exported,
+            }
+            if cache_manager:
+                cache_manager.set(cache_key, st.session_state.wet_lab_handoff_results)
+
+        st.rerun()
+
+    results = st.session_state.get("wet_lab_handoff_results")
+    if not results:
+        st.info("Generate a package to view ranked assays, CRISPR candidates, primers, validation checklist, and exports.")
+        return
+
+    plan = results.get("plan", {})
+    exported = results.get("exported", {})
+    confidence = plan.get("confidence", {})
+    assays = plan.get("assays", [])
+    crispr_candidates = plan.get("crispr_candidates", [])
+    primers = plan.get("primers", [])
+    checklist = plan.get("validation_checklist", [])
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Plan confidence", confidence.get("plan_confidence_score", 0))
+    m2.metric("Data completeness (%)", confidence.get("data_completeness", 0))
+    m3.metric("Readiness", confidence.get("readiness_label", "unknown").upper())
+
+    if plan.get("context", {}).get("missing_inputs"):
+        st.warning("Missing inputs increasing uncertainty: " + ", ".join(plan["context"]["missing_inputs"]))
+
+    st.subheader("Assay Suggestions")
+    assay_df = pd.DataFrame(assays)
+    if not assay_df.empty:
+        cols = [
+            "assay_name",
+            "purpose",
+            "why_it_fits_this_target",
+            "readout_type",
+            "turnaround_estimate",
+            "cost_tier",
+            "confidence",
+            "rank_score",
+        ]
+        st.dataframe(assay_df[[c for c in cols if c in assay_df.columns]], width="stretch", hide_index=True)
+        st.plotly_chart(ProteinVisualizer.create_assay_ranking_comparison_chart(assays), width="stretch")
+
+    st.subheader("CRISPR Target Region Suggestions")
+    crispr_df = pd.DataFrame(crispr_candidates)
+    if not crispr_df.empty:
+        crispr_cols = [
+            "spacer_sequence",
+            "pam",
+            "target_position",
+            "strand",
+            "objective_fit",
+            "heuristic_score",
+            "off_target_risk_level",
+            "notes_for_manual_review",
+        ]
+        st.dataframe(crispr_df[[c for c in crispr_cols if c in crispr_df.columns]], width="stretch", hide_index=True)
+        st.plotly_chart(ProteinVisualizer.create_crispr_candidate_score_plot(crispr_candidates), width="stretch")
+    else:
+        st.info("No CRISPR candidates found from provided sequence.")
+
+    st.subheader("Primer Suggestions")
+    primer_df = pd.DataFrame(primers)
+    if not primer_df.empty:
+        primer_cols = [
+            "forward_sequence",
+            "reverse_sequence",
+            "forward_tm_c",
+            "reverse_tm_c",
+            "expected_amplicon_size",
+            "intended_use",
+            "quality_score",
+            "caveats",
+        ]
+        st.dataframe(primer_df[[c for c in primer_cols if c in primer_df.columns]], width="stretch", hide_index=True)
+        st.plotly_chart(ProteinVisualizer.create_primer_quality_comparison_chart(primers), width="stretch")
+    else:
+        st.info("No primer pairs met current constraints.")
+
+    st.subheader("Validation Checklist")
+    checklist_df = pd.DataFrame(checklist)
+    if not checklist_df.empty:
+        checklist_cols = ["section", "item_text", "severity_if_skipped", "owner_role_suggestion", "completion_status"]
+        st.dataframe(checklist_df[[c for c in checklist_cols if c in checklist_df.columns]], width="stretch", hide_index=True)
+
+    st.subheader("Readiness Dashboard")
+    st.plotly_chart(
+        ProteinVisualizer.create_wet_lab_readiness_dashboard(
+            confidence_payload=confidence,
+            assays=assays,
+            crispr_candidates=crispr_candidates,
+        ),
+        width="stretch",
+    )
+    st.markdown("**Top drivers:** " + ", ".join(confidence.get("top_3_drivers", [])))
+    st.markdown("**Top risks/assumptions:** " + ", ".join(confidence.get("top_3_risks_assumptions", [])))
+    st.markdown("**Missing inputs reducing uncertainty:** " + ", ".join(confidence.get("missing_inputs_reducing_uncertainty", [])))
+
+    st.subheader("Download Wet-Lab Package")
+    content = exported.get("content", {})
+    json_blob = json.dumps(content.get("json", plan), indent=2)
+    st.download_button(
+        "📥 Download JSON package",
+        json_blob,
+        file_name="wet_lab_handoff_package.json",
+        mime="application/json",
+    )
+    csv_payload = content.get("csv", {})
+    st.download_button(
+        "📥 Download assays CSV",
+        csv_payload.get("assays", ""),
+        file_name="wet_lab_assays.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "📥 Download CRISPR candidates CSV",
+        csv_payload.get("crispr_candidates", ""),
+        file_name="wet_lab_crispr_candidates.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "📥 Download primers CSV",
+        csv_payload.get("primers", ""),
+        file_name="wet_lab_primers.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "📥 Download checklist CSV",
+        csv_payload.get("validation_checklist", ""),
+        file_name="wet_lab_validation_checklist.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "📥 Download Markdown handoff brief",
+        content.get("markdown_brief", ""),
+        file_name="wet_lab_handoff_brief.md",
+        mime="text/markdown",
+    )
+    st.download_button(
+        "📥 Download TXT handoff brief",
+        content.get("txt_brief", ""),
+        file_name="wet_lab_handoff_brief.txt",
+        mime="text/plain",
+    )
+    st.caption(
+        "Research-use only. Not for clinical diagnosis or treatment. "
+        "Preliminary heuristic recommendations require human review and bench validation."
+    )
 
 
 if __name__ == "__main__":
