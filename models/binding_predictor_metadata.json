@@ -1,0 +1,101 @@
+{
+  "trained_date": "2026-04-16T19:43:08.917070",
+  "model_version": "2.0",
+  "data_source": "ChEMBL (high-confidence binding assays)",
+  "n_samples": 56096,
+  "split_strategy": "scaffold",
+  "split_sizes": {
+    "train": 44876,
+    "validation": 5610,
+    "test": 5610
+  },
+  "feature_order": [
+    "molecular_weight",
+    "logp",
+    "hbd",
+    "hba",
+    "rotatable_bonds",
+    "aromatic_rings",
+    "tpsa",
+    "num_atoms",
+    "num_heavy_atoms",
+    "num_rings",
+    "fraction_csp3",
+    "num_heteroatoms",
+    "num_aromatic_atoms"
+  ],
+  "label_definition": "pAffinity (-log10(M))",
+  "label_range": {
+    "min": 3.0,
+    "max": 12.0,
+    "mean": 7.618228477210185,
+    "std": 1.448059167743625
+  },
+  "best_model": {
+    "name": "random_forest",
+    "test_mae": 0.8524928055316637,
+    "test_rmse": 1.1144816450751918,
+    "test_r2": 0.41937795924112853,
+    "validation_r2": 0.42730061004539255
+  },
+  "model_comparison": {
+    "random_forest": {
+      "test_mae": 0.8524928055316637,
+      "test_rmse": 1.1144816450751918,
+      "test_r2": 0.41937795924112853
+    },
+    "gradient_boosting": {
+      "test_mae": 0.944355455120562,
+      "test_rmse": 1.2011441636587101,
+      "test_r2": 0.32556834177588845
+    },
+    "linear_regression": {
+      "test_mae": 1.10651688476302,
+      "test_rmse": 1.3801745930255556,
+      "test_r2": 0.10953729614865393
+    }
+  },
+  "performance_by_bin": {
+    "pAffinity_3-6": {
+      "samples": 788,
+      "mae": 1.6443819080356559,
+      "rmse": 1.8543029787177037,
+      "r2": -6.947035730137494
+    },
+    "pAffinity_6-9": {
+      "samples": 3826,
+      "mae": 0.602106213609759,
+      "rmse": 0.7685691314247578,
+      "r2": 0.11679214357392875
+    },
+    "pAffinity_9-12": {
+      "samples": 996,
+      "mae": 1.1878045403911628,
+      "rmse": 1.4165211813797682,
+      "r2": -4.949793189869591
+    }
+  },
+  "classifier_metrics": {
+    "threshold": 6.5,
+    "roc_auc": 0.7653656674650693,
+    "f1_score": 0.879933005338637,
+    "pr_auc": 0.9078796472037309
+  },
+  "residual_analysis": {
+    "mean": -0.034104280508865784,
+    "std": 1.1139597098910168,
+    "min": -4.669870913774833,
+    "max": 4.012263376243072
+  },
+  "overfitting_check": {
+    "train_mae": 0.6974348338746694,
+    "validation_mae": 0.8524044534218348,
+    "train_val_gap": -0.15496961954716537
+  },
+  "dependencies": {
+    "scikit-learn": "1.0+",
+    "numpy": "1.20+",
+    "pandas": "1.3+",
+    "rdkit": "not available"
+  }
+}

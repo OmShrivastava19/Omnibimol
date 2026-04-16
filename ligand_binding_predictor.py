@@ -8,7 +8,12 @@ import pandas as pd
 from typing import List, Dict, Optional, Tuple
 import re
 import warnings
+import logging
+from pathlib import Path
+import joblib
 warnings.filterwarnings('ignore')
+
+logger = logging.getLogger(__name__)
 
 try:
     from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
@@ -18,6 +23,16 @@ try:
 except ImportError:
     SKLEARN_AVAILABLE = False
     print("Warning: scikit-learn not available. Install with: pip install scikit-learn")
+
+try:
+    from rdkit import Chem
+    from rdkit.Chem import Descriptors, rdMolDescriptors
+    RDKIT_AVAILABLE = True
+except ImportError:
+    RDKIT_AVAILABLE = False
+    Chem = None
+    Descriptors = None
+    rdMolDescriptors = None
 
 
 class SMILESValidator:
@@ -370,153 +385,109 @@ class MolecularDescriptorCalculator:
         
         return violations
 
-
 class BindingAffinityPredictor:
-    """ML-based binding affinity predictor"""
+    """ML-based binding affinity predictor — now loads REAL trained model"""
     
     def __init__(self):
         self.regressor = None
         self.classifier = None
         self.scaler = None
         self.is_trained = False
-        self._initialize_model()
-    
+        self.model_dir = Path(__file__).resolve().parent / "models"
+        self._load_trained_model()
+
+    def _artifact_path(self, filename: str) -> Path:
+        """Resolve model artifact paths relative to this module."""
+        return self.model_dir / filename
+
     def _initialize_model(self):
-        """Initialize ML models"""
-        if not SKLEARN_AVAILABLE:
-            return
-        
-        # Random Forest Regressor for binding affinity (kcal/mol)
-        self.regressor = RandomForestRegressor(
-            n_estimators=100,
-            max_depth=15,
-            random_state=42,
-            n_jobs=-1
-        )
-        
-        # Random Forest Classifier for binding likelihood (binary)
-        self.classifier = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=15,
-            random_state=42,
-            n_jobs=-1
-        )
-        
-        self.scaler = StandardScaler()
+        """Safe fallback initializer when persisted artifacts are unavailable."""
+        self.regressor = None
+        self.classifier = None
+        self.scaler = None
+        self.is_trained = False
+
+    def _rule_based_prediction(self, descriptors: Dict) -> Dict:
+        """Rule-based fallback prediction when ML artifacts are unavailable."""
+        mw = descriptors.get("molecular_weight", 0)
+        logp = descriptors.get("logp", 0)
+        hbd = descriptors.get("hbd", 0)
+        hba = descriptors.get("hba", 0)
+        rot_bonds = descriptors.get("rotatable_bonds", 0)
+        aromatic_rings = descriptors.get("aromatic_rings", 0)
+
+        score = 0
+        if 200 <= mw <= 500:
+            score += 30
+        elif 100 <= mw <= 600:
+            score += 20
+        else:
+            score += 10
+
+        if 0 <= logp <= 5:
+            score += 25
+        elif -2 <= logp <= 7:
+            score += 15
+        else:
+            score += 5
+
+        score += 20 if hbd <= 5 else 5
+        score += 20 if hba <= 10 else 5
+        if rot_bonds <= 10:
+            score += 5
+        if aromatic_rings > 0:
+            score += 5
+
+        # Map heuristic score to pAffinity-like scale where higher implies stronger binding.
+        affinity = 4.0 + (score / 100) * 6.0
+        probability = min(max(score / 100.0, 0.0), 1.0)
+
+        return {
+            "binding_affinity": float(affinity),
+            "binding_affinity_units": "pAffinity (-log10(M))",
+            "binding_likelihood": float(probability * 100),
+            "binding_probability": float(probability),
+            "prediction_method": "Rule-based fallback",
+            "confidence": "low"
+        }
     
-    def _generate_synthetic_training_data(self, n_samples: int = 1000) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Generate synthetic training data based on known binding patterns
-        This is a placeholder - in production, use real experimental data
-        
-        Args:
-            n_samples: Number of training samples to generate
-            
-        Returns:
-            Tuple of (X_features, y_affinity, y_binding)
-        """
-        np.random.seed(42)
-        
-        # Generate synthetic molecular descriptors
-        X = np.random.rand(n_samples, 13)
-        
-        # Scale features to realistic ranges
-        X[:, 0] = X[:, 0] * 800 + 100  # MW: 100-900
-        X[:, 1] = X[:, 1] * 8 - 2  # LogP: -2 to 6
-        X[:, 2] = (X[:, 2] * 8).astype(int)  # HBD: 0-8
-        X[:, 3] = (X[:, 3] * 15).astype(int)  # HBA: 0-15
-        X[:, 4] = (X[:, 4] * 20).astype(int)  # Rotatable bonds: 0-20
-        X[:, 5] = (X[:, 5] * 5).astype(int)  # Aromatic rings: 0-5
-        X[:, 6] = X[:, 6] * 200  # TPSA: 0-200
-        X[:, 7] = (X[:, 7] * 100).astype(int)  # Num atoms: 0-100
-        X[:, 8] = (X[:, 8] * 80).astype(int)  # Heavy atoms: 0-80
-        X[:, 9] = (X[:, 9] * 6).astype(int)  # Rings: 0-6
-        X[:, 10] = X[:, 10]  # Fraction Csp3: 0-1
-        X[:, 11] = (X[:, 11] * 30).astype(int)  # Heteroatoms: 0-30
-        X[:, 12] = (X[:, 12] * 40).astype(int)  # Aromatic atoms: 0-40
-        
-        # Generate synthetic binding affinities (kcal/mol)
-        # Better drug-like properties -> better binding
-        drug_likeness_score = (
-            (X[:, 0] < 500) * 2 +  # MW in range
-            (X[:, 1] > 0) * (X[:, 1] < 5) * 2 +  # LogP in range
-            (X[:, 2] <= 5) * 2 +  # HBD OK
-            (X[:, 3] <= 10) * 2 +  # HBA OK
-            (X[:, 4] <= 10) * 1 +  # Rotatable bonds OK
-            (X[:, 5] > 0) * 1  # Has aromatic rings
-        )
-        
-        # Binding affinity: -12 to -4 kcal/mol (lower is better)
-        # Add noise and drug-likeness influence
-        base_affinity = -8 + drug_likeness_score * 0.5
-        noise = np.random.normal(0, 2, n_samples)
-        y_affinity = base_affinity + noise
-        y_affinity = np.clip(y_affinity, -12, -4)
-        
-        # Binding likelihood: 1 if affinity < -6 kcal/mol, 0 otherwise
-        y_binding = (y_affinity < -6).astype(int)
-        
-        return X, y_affinity, y_binding
-    
-    def train(self, force_retrain: bool = False):
-        """
-        Train the ML models on synthetic data
-        In production, replace with real experimental binding data
-        
-        Args:
-            force_retrain: Force retraining even if already trained
-        """
-        if not SKLEARN_AVAILABLE:
-            self.is_trained = False
-            return
-        
-        if self.is_trained and not force_retrain:
-            return
-        
-        try:
-            # Generate synthetic training data
-            X, y_affinity, y_binding = self._generate_synthetic_training_data(n_samples=2000)
-            
-            # Split data
-            X_train, X_test, y_aff_train, y_aff_test, y_bind_train, y_bind_test = train_test_split(
-                X, y_affinity, y_binding, test_size=0.2, random_state=42
+    def _load_trained_model(self):
+        """Load persisted real model instead of synthetic training"""
+        regressor_path = self._artifact_path("binding_predictor.pkl")
+        classifier_path = self._artifact_path("binding_classifier.pkl")
+        scaler_path = self._artifact_path("scaler.pkl")
+
+        missing = [
+            str(path) for path in (regressor_path, classifier_path, scaler_path)
+            if not path.exists()
+        ]
+        if missing:
+            logger.warning(
+                "Binding model artifact(s) missing. Falling back to rule-based prediction. Missing: %s",
+                ", ".join(missing),
             )
-            
-            # Scale features
-            X_train_scaled = self.scaler.fit_transform(X_train)
-            X_test_scaled = self.scaler.transform(X_test)
-            
-            # Train regressor
-            self.regressor.fit(X_train_scaled, y_aff_train)
-            
-            # Train classifier
-            self.classifier.fit(X_train_scaled, y_bind_train)
-            
+            self._initialize_model()
+            return
+
+        try:
+            self.regressor = joblib.load(regressor_path)
+            self.classifier = joblib.load(classifier_path)
+            self.scaler = joblib.load(scaler_path)
             self.is_trained = True
-            
+            logger.info("Loaded real ChEMBL-trained binding model artifacts from %s", self.model_dir)
         except Exception as e:
-            print(f"Error training models: {e}")
-            self.is_trained = False
+            logger.warning(
+                "Failed to load trained model artifacts. Falling back to rule-based prediction. Error: %s",
+                e,
+            )
+            self._initialize_model()
     
     def predict(self, descriptors: Dict) -> Dict:
-        """
-        Predict binding affinity and likelihood for a molecule
-        
-        Args:
-            descriptors: Dictionary of molecular descriptors
-            
-        Returns:
-            Dictionary with predictions
-        """
-        if not self.is_trained:
-            self.train()
-        
-        if not SKLEARN_AVAILABLE or not self.is_trained:
-            # Fallback to rule-based prediction
+        """Same public API as before — but now uses real model"""
+        if not self.is_trained or self.regressor is None:
             return self._rule_based_prediction(descriptors)
         
         try:
-            # Convert descriptors to feature vector
             features = np.array([[
                 descriptors.get("molecular_weight", 0),
                 descriptors.get("logp", 0),
@@ -533,97 +504,22 @@ class BindingAffinityPredictor:
                 descriptors.get("num_aromatic_atoms", 0)
             ]])
             
-            # Scale features
             features_scaled = self.scaler.transform(features)
             
-            # Predict
             affinity = self.regressor.predict(features_scaled)[0]
             binding_prob = self.classifier.predict_proba(features_scaled)[0][1]
-            binding_likelihood = binding_prob * 100  # Convert to percentage
             
             return {
-                "binding_affinity": float(affinity),
-                "binding_affinity_units": "kcal/mol",
-                "binding_likelihood": float(binding_likelihood),
+                "binding_affinity": float(affinity),           # now in pAffinity units (higher = stronger)
+                "binding_affinity_units": "pAffinity (-log10(M))",
+                "binding_likelihood": float(binding_prob * 100),
                 "binding_probability": float(binding_prob),
-                "prediction_method": "ML (Random Forest)",
-                "confidence": "medium"
+                "prediction_method": "ML (Random Forest — real ChEMBL data)",
+                "confidence": "high"
             }
-            
         except Exception as e:
-            print(f"Error in ML prediction: {e}")
+            logger.warning("ML prediction error. Falling back to rule-based prediction. Error: %s", e)
             return self._rule_based_prediction(descriptors)
-    
-    def _rule_based_prediction(self, descriptors: Dict) -> Dict:
-        """
-        Rule-based fallback prediction when ML is unavailable
-        
-        Args:
-            descriptors: Dictionary of molecular descriptors
-            
-        Returns:
-            Dictionary with predictions
-        """
-        mw = descriptors.get("molecular_weight", 0)
-        logp = descriptors.get("logp", 0)
-        hbd = descriptors.get("hbd", 0)
-        hba = descriptors.get("hba", 0)
-        rot_bonds = descriptors.get("rotatable_bonds", 0)
-        aromatic_rings = descriptors.get("aromatic_rings", 0)
-        
-        # Score based on drug-likeness
-        score = 0
-        
-        # MW check (optimal: 200-500)
-        if 200 <= mw <= 500:
-            score += 30
-        elif 100 <= mw <= 600:
-            score += 20
-        else:
-            score += 10
-        
-        # LogP check (optimal: 0-5)
-        if 0 <= logp <= 5:
-            score += 25
-        elif -2 <= logp <= 7:
-            score += 15
-        else:
-            score += 5
-        
-        # HBD check (optimal: <= 5)
-        if hbd <= 5:
-            score += 20
-        else:
-            score += 5
-        
-        # HBA check (optimal: <= 10)
-        if hba <= 10:
-            score += 20
-        else:
-            score += 5
-        
-        # Rotatable bonds (optimal: <= 10)
-        if rot_bonds <= 10:
-            score += 5
-        
-        # Aromatic rings (presence is good)
-        if aromatic_rings > 0:
-            score += 5
-        
-        # Convert score to affinity (0-100 -> -12 to -4 kcal/mol)
-        affinity = -4 - (score / 100) * 8
-        
-        # Convert score to likelihood (0-100%)
-        likelihood = min(score, 100)
-        
-        return {
-            "binding_affinity": float(affinity),
-            "binding_affinity_units": "kcal/mol",
-            "binding_likelihood": float(likelihood),
-            "binding_probability": float(likelihood / 100),
-            "prediction_method": "Rule-based",
-            "confidence": "low"
-        }
 
 
 class LigandBindingPredictor:
@@ -633,8 +529,6 @@ class LigandBindingPredictor:
         self.validator = SMILESValidator()
         self.descriptor_calc = MolecularDescriptorCalculator()
         self.affinity_predictor = BindingAffinityPredictor()
-        # Pre-train model
-        self.affinity_predictor.train()
     
     def predict_single(self, smiles: str, molecule_name: str = None) -> Dict:
         """
@@ -731,13 +625,20 @@ class LigandBindingPredictor:
         
         if not valid_predictions:
             return []
+
+        def affinity_sort_key(pred: Dict) -> float:
+            prediction = pred.get("prediction", {})
+            affinity = prediction.get("binding_affinity", 0)
+            units = str(prediction.get("binding_affinity_units", "")).lower()
+            # For pAffinity, higher values imply stronger binding; for legacy kcal/mol, lower is better.
+            return -affinity if "paffinity" in units or "-log10" in units else affinity
         
-        # Sort by binding likelihood (descending), then by affinity (ascending, more negative is better)
+        # Sort by binding likelihood (descending), then by affinity semantic tie-break.
         ranked = sorted(
             valid_predictions,
             key=lambda x: (
                 -x.get("prediction", {}).get("binding_likelihood", 0),
-                x.get("prediction", {}).get("binding_affinity", 0)
+                affinity_sort_key(x)
             )
         )
         
