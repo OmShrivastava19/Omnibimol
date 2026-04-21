@@ -13,10 +13,7 @@ services:
   - type: web
     name: omnibimol-api
     runtime: docker
-    repo: OmShrivastava19/Omnibimol
-    branch: main
     dockerfilePath: ./docker/backend.Dockerfile
-    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/v1/healthz
     envVars:
       - key: ENVIRONMENT
@@ -50,10 +47,7 @@ services:
   - type: worker
     name: omnibimol-docking-worker
     runtime: docker
-    repo: OmShrivastava19/Omnibimol
-    branch: main
-    dockerfilePath: ./docker/backend.Dockerfile
-    startCommand: python -m backend.workers.docking_worker
+    dockerfilePath: ./docker/worker.Dockerfile
     envVars:
       - key: ENVIRONMENT
         value: production
