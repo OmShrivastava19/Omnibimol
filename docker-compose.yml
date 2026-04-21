@@ -7,6 +7,7 @@ services:
       - "8501:8501"
     environment:
       AUTH_ENABLED: "false"
+      BACKEND_API_URL: http://api:8000
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/omnibimol
       REDIS_URL: redis://redis:6379/0
     depends_on:
@@ -23,9 +24,39 @@ services:
       AUTH_ENABLED: "false"
       DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/omnibimol
       REDIS_URL: redis://redis:6379/0
+      DOCKING_ENABLED: "true"
+      DOCKING_MODE_DEFAULT: real
+      DOCKING_ENGINE: vina
+      DOCKING_CACHE_DIR: /var/lib/omnibimol/docking-cache
+      DOCKING_TIMEOUT_SECONDS: "900"
+      DOCKING_VINA_BINARY: vina
+      DOCKING_WORKER_CONCURRENCY: "1"
     depends_on:
       - db
       - redis
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    command: python -m backend.workers.docking_worker
+    environment:
+      ENVIRONMENT: development
+      AUTH_ENABLED: "false"
+      DATABASE_URL: postgresql+psycopg://postgres:postgres@db:5432/omnibimol
+      REDIS_URL: redis://redis:6379/0
+      DOCKING_ENABLED: "true"
+      DOCKING_MODE_DEFAULT: real
+      DOCKING_ENGINE: vina
+      DOCKING_CACHE_DIR: /var/lib/omnibimol/docking-cache
+      DOCKING_TIMEOUT_SECONDS: "900"
+      DOCKING_VINA_BINARY: vina
+      DOCKING_WORKER_CONCURRENCY: "1"
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - docking_cache:/var/lib/omnibimol/docking-cache
 
   db:
     image: postgres:16
@@ -45,3 +76,4 @@ services:
 
 volumes:
   postgres_data:
+  docking_cache:

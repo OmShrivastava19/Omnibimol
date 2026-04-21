@@ -26,6 +26,8 @@ class JobService:
         )
 
     def advance(self, job: JobRun) -> JobRun:
+        if job.job_type.startswith("docking."):
+            return job
         if job.status in {"completed", "failed"}:
             return job
         if job.status == "queued":

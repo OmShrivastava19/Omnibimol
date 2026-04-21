@@ -1,0 +1,88 @@
+databases:
+  - name: omnibimol-postgres
+    databaseName: omnibimol
+    user: omnibimol
+    plan: starter
+
+services:
+  - type: redis
+    name: omnibimol-redis
+    plan: starter
+    ipAllowList: []
+
+  - type: web
+    name: omnibimol-api
+    runtime: docker
+    repo: OmShrivastava19/Omnibimol
+    branch: main
+    dockerfilePath: ./docker/backend.Dockerfile
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/v1/healthz
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: AUTH_ENABLED
+        value: "false"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: omnibimol-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: omnibimol-redis
+          property: connectionString
+      - key: DOCKING_ENABLED
+        value: "true"
+      - key: DOCKING_MODE_DEFAULT
+        value: real
+      - key: DOCKING_ENGINE
+        value: vina
+      - key: DOCKING_CACHE_DIR
+        value: /var/lib/omnibimol/docking-cache
+      - key: DOCKING_TIMEOUT_SECONDS
+        value: "900"
+      - key: DOCKING_VINA_BINARY
+        value: vina
+      - key: DOCKING_WORKER_CONCURRENCY
+        value: "1"
+
+  - type: worker
+    name: omnibimol-docking-worker
+    runtime: docker
+    repo: OmShrivastava19/Omnibimol
+    branch: main
+    dockerfilePath: ./docker/backend.Dockerfile
+    startCommand: python -m backend.workers.docking_worker
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: AUTH_ENABLED
+        value: "false"
+      - key: DATABASE_URL
+        fromDatabase:
+          name: omnibimol-postgres
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: omnibimol-redis
+          property: connectionString
+      - key: DOCKING_ENABLED
+        value: "true"
+      - key: DOCKING_MODE_DEFAULT
+        value: real
+      - key: DOCKING_ENGINE
+        value: vina
+      - key: DOCKING_CACHE_DIR
+        value: /var/lib/omnibimol/docking-cache
+      - key: DOCKING_TIMEOUT_SECONDS
+        value: "900"
+      - key: DOCKING_VINA_BINARY
+        value: vina
+      - key: DOCKING_WORKER_CONCURRENCY
+        value: "1"
+    disk:
+      name: docking-cache
+      mountPath: /var/lib/omnibimol/docking-cache
+      sizeGB: 10

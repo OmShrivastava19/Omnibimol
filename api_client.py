@@ -121,10 +121,11 @@ class ProteinAPIClient:
             return df
     """Handles all API interactions with UniProt and Human Protein Atlas"""
     
-    def __init__(self, cache_manager):
+    def __init__(self, cache_manager, backend_api_url: str | None = None):
         self.cache = cache_manager
         self.uniprot_base = "https://rest.uniprot.org"
         self.hpa_base = "https://www.proteinatlas.org/api"
+        self.backend_api_url = (backend_api_url or os.getenv("BACKEND_API_URL", "http://localhost:8000")).rstrip("/")
         
     async def search_uniprot(self, protein_name: str, max_results: int = 5) -> List[Dict]:
         """
@@ -1780,8 +1781,181 @@ class ProteinAPIClient:
             "structure_type": structure_type,
             "structure_id": structure_id,
             "pdb_url": pdb_url,
-            "sequence_length": uniprot_data.get('sequence_length', 0)
+            "sequence_length": uniprot_data.get('sequence_length', 0),
+            "uniprot_id": uniprot_data.get('uniprot_id'),
+            "source_url": pdb_url,
         }
+
+    def _build_backend_headers(self) -> Dict[str, str]:
+        try:
+            from backend.auth.streamlit_integration import build_backend_auth_headers
+
+            return build_backend_auth_headers(dict(st.session_state))
+        except Exception:
+            return {}
+
+    def _request_backend_json(self, method: str, path: str, *, json_body: Dict | None = None) -> Dict:
+        if not self.backend_api_url:
+            raise RuntimeError("Backend API URL is not configured")
+
+        url = f"{self.backend_api_url}{path}"
+        with httpx.Client(timeout=60.0) as client:
+            response = client.request(
+                method,
+                url,
+                json=json_body,
+                headers=self._build_backend_headers(),
+            )
+            response.raise_for_status()
+            return response.json()
+
+    def submit_real_docking_job(
+        self,
+        *,
+        protein_prep: Dict,
+        ligand_data: Dict,
+        ligand_name: str,
+        exhaustiveness: int,
+        num_modes: int,
+        energy_range: int,
+    ) -> Dict:
+        payload = {
+            "protein": protein_prep,
+            "ligand": {
+                **ligand_data,
+                "name": ligand_name,
+            },
+            "parameters": {
+                "exhaustiveness": exhaustiveness,
+                "num_modes": num_modes,
+                "energy_range": energy_range,
+            },
+        }
+        return self._request_backend_json(
+            "POST",
+            "/api/v1/jobs",
+            json_body={"job_type": "docking.vina", "payload": payload},
+        )
+
+    def poll_docking_job(self, job_id: int) -> Dict:
+        return self._request_backend_json("GET", f"/api/v1/jobs/{job_id}")
+
+    def normalize_docking_result(self, docking_result: Dict, *, fallback_reason: str | None = None) -> Dict:
+        normalized = dict(docking_result or {})
+        normalized.setdefault("available", True)
+        normalized.setdefault("mode", "simulation" if normalized.get("simulated") else "real")
+        normalized.setdefault("engine", "simulation" if normalized.get("simulated") else os.getenv("DOCKING_ENGINE", "vina"))
+        normalized.setdefault("simulated", normalized.get("mode") == "simulation")
+        normalized.setdefault("status", normalized.get("status", "completed" if normalized.get("available") else "queued"))
+        normalized.setdefault("modes", normalized.get("modes", []))
+        normalized.setdefault("best_mode", normalized.get("best_mode", normalized.get("modes", [{}])[0] if normalized.get("modes") else {}))
+        normalized.setdefault("has_coordinates", bool(normalized.get("modes")))
+        if fallback_reason:
+            normalized["fallback_reason"] = fallback_reason
+        return normalized
+
+    def run_docking_workflow(
+        self,
+        *,
+        protein_prep: Dict,
+        ligand_data: Dict,
+        ligand_name: str,
+        protein_length: int,
+        ligand_mw: float,
+        activity_value: float | None = None,
+        mode: str | None = None,
+        exhaustiveness: int = 8,
+        num_modes: int = 9,
+        energy_range: int = 3,
+    ) -> Dict:
+        selected_mode = (mode or os.getenv("DOCKING_MODE_DEFAULT", "simulation")).lower().strip()
+
+        if selected_mode == "real" and os.getenv("DOCKING_ENABLED", "true").lower() in {"1", "true", "yes"}:
+            try:
+                job = self.submit_real_docking_job(
+                    protein_prep=protein_prep,
+                    ligand_data=ligand_data,
+                    ligand_name=ligand_name,
+                    exhaustiveness=exhaustiveness,
+                    num_modes=num_modes,
+                    energy_range=energy_range,
+                )
+                job_id = int(job["id"])
+                try:
+                    job_status = self.poll_docking_job(job_id)
+                    if job_status.get("status") in {"completed", "failed"}:
+                        result_payload = self.normalize_docking_result(job_status.get("result_payload") or {})
+                        result_payload.update(
+                            {
+                                "job_id": job_id,
+                                "job_status": job_status.get("status"),
+                                "job_type": job.get("job_type", "docking.vina"),
+                                "job_url": f"{self.backend_api_url}/api/v1/jobs/{job_id}",
+                            }
+                        )
+                        return result_payload
+                except Exception:
+                    pass
+
+                return {
+                    "available": True,
+                    "mode": "real",
+                    "simulated": False,
+                    "engine": os.getenv("DOCKING_ENGINE", "vina"),
+                    "status": job.get("status", "queued"),
+                    "job_id": job_id,
+                    "job_type": job.get("job_type", "docking.vina"),
+                    "job_url": f"{self.backend_api_url}/api/v1/jobs/{job_id}",
+                    "binding_affinity": None,
+                    "modes": [],
+                    "best_mode": {},
+                    "has_coordinates": False,
+                    "ligand_name": ligand_name,
+                    "protein_length": protein_length,
+                    "ligand_mw": ligand_mw,
+                    "activity_value": activity_value,
+                    "queued_for_worker": True,
+                }
+            except Exception as exc:
+                fallback_reason = f"Real docking unavailable: {exc}"
+                simulated = self.simulate_docking_score(
+                    protein_length,
+                    ligand_mw,
+                    activity_value,
+                    ligand_data.get("smiles"),
+                )
+                simulated.update(
+                    {
+                        "mode": "simulation",
+                        "simulated": True,
+                        "engine": "simulation",
+                        "fallback_reason": fallback_reason,
+                        "job_id": None,
+                        "job_status": None,
+                        "job_url": None,
+                        "ligand_name": ligand_name,
+                    }
+                )
+                return self.normalize_docking_result(simulated, fallback_reason=fallback_reason)
+
+        simulated = self.simulate_docking_score(
+            protein_length,
+            ligand_mw,
+            activity_value,
+            ligand_data.get("smiles"),
+        )
+        simulated.update(
+            {
+                "mode": "simulation",
+                "simulated": True,
+                "engine": "simulation",
+                "job_id": None,
+                "job_status": None,
+                "job_url": None,
+                "ligand_name": ligand_name,
+            }
+        )
+        return self.normalize_docking_result(simulated)
 
     def simulate_docking_score(self, protein_length: int, ligand_mw: float, 
                           activity_value: float = None, ligand_smiles: str = None) -> Dict:

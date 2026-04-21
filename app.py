@@ -6,6 +6,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 from typing import Dict, List, Optional
+import os
 import time
 from datetime import datetime
 import json
@@ -460,6 +461,41 @@ def _build_clinicaltrials_url(nct_id: Optional[str]) -> Optional[str]:
     if not nct_id:
         return None
     return f"https://clinicaltrials.gov/study/{nct_id}"
+
+
+def _get_docking_mode_choice() -> str:
+    default_mode = "Use Real Docking (Beta)"
+    if os.getenv("DOCKING_MODE_DEFAULT", "real").lower() != "real" or os.getenv("DOCKING_ENABLED", "true").lower() not in {"1", "true", "yes"}:
+        default_mode = "Use Simulation"
+    return st.session_state.get("docking_mode_choice", default_mode)
+
+
+def _get_docking_mode_value() -> str:
+    return "real" if _get_docking_mode_choice() == "Use Real Docking (Beta)" else "simulation"
+
+
+def _run_shared_docking(
+    *,
+    protein_prep: Dict,
+    selected_ligand: Dict,
+    ligand_name: str,
+    protein_length: int,
+    exhaustiveness: int,
+    num_modes: int,
+    energy_range: int,
+) -> Dict:
+    return st.session_state.api_client.run_docking_workflow(
+        protein_prep=protein_prep,
+        ligand_data=selected_ligand,
+        ligand_name=ligand_name,
+        protein_length=protein_length,
+        ligand_mw=float(selected_ligand.get("molecular_weight", selected_ligand.get("mw", 300)) or 300),
+        activity_value=selected_ligand.get("activity_value"),
+        mode=_get_docking_mode_value(),
+        exhaustiveness=exhaustiveness,
+        num_modes=num_modes,
+        energy_range=energy_range,
+    )
 
 
 def _format_phase(phase: Optional[str]) -> str:
@@ -2192,6 +2228,26 @@ def main():
         - Typical drug-like binding: -7 to -12 kcal/mol
         - 3D visualization of ligand orientation and binding prediction
         """)
+
+        docking_mode_options = ["Use Real Docking (Beta)", "Use Simulation"]
+        default_mode_index = 0 if _get_docking_mode_choice() == "Use Real Docking (Beta)" else 1
+        st.radio(
+            "Docking mode",
+            docking_mode_options,
+            index=default_mode_index,
+            horizontal=True,
+            key="docking_mode_choice",
+        )
+        if _get_docking_mode_value() == "real":
+            st.info("Real docking submits a job to the Render worker. The UI stays responsive while the worker runs.")
+        else:
+            st.info("Simulation mode keeps the current fast local fallback.")
+
+        protein_prep = st.session_state.api_client.prepare_protein_for_docking(
+            uniprot_data,
+            data.get('pdb_structure', {}),
+            data.get('alphafold_structure', {}),
+        )
         
         # Create tabs
         docking_tabs = st.tabs(["📚 Known Ligands", "🎯 Binding Predictor", "🔮 Ligand Binding Prediction", "🧪 Custom Docking", "📊 Docking Results"])
@@ -2252,11 +2308,15 @@ def main():
                                     'activity_value': ligand.get('activity_value', None)
                                 }
                                 
-                                # Run docking simulation
-                                docking_result = st.session_state.api_client.simulate_docking_score(
+                                # Run docking using the selected mode
+                                docking_result = _run_shared_docking(
+                                    protein_prep=protein_prep,
+                                    selected_ligand=st.session_state.selected_ligand_for_docking,
+                                    ligand_name=st.session_state.selected_ligand_for_docking['name'],
                                     protein_length=uniprot_data.get('sequence_length', 500),
-                                    ligand_mw=ligand.get('molecular_weight', 0),
-                                    activity_value=ligand.get('activity_value', None)
+                                    exhaustiveness=8,
+                                    num_modes=9,
+                                    energy_range=3,
                                 )
                                 
                                 # Store results and ligand data for display
@@ -2825,14 +2885,16 @@ def main():
                     run_docking = st.button("🚀 Run Molecular Docking", type="primary", key="run_docking_btn")
                     
                     if run_docking:
-                        with st.spinner("🧬 Running AutoDock Vina simulation... Calculating 3D orientation..."):
-                            time.sleep(2)
-                            
-                            docking_results = st.session_state.api_client.simulate_docking_score(
-                                protein_prep['sequence_length'],
-                                selected_ligand.get('molecular_weight', 300),
-                                selected_ligand.get('activity_value'),
-                                selected_ligand.get('smiles')
+                        spinner_message = "🧬 Submitting docking job to Render worker..." if _get_docking_mode_value() == "real" else "🧬 Running AutoDock Vina simulation... Calculating 3D orientation..."
+                        with st.spinner(spinner_message):
+                            docking_results = _run_shared_docking(
+                                protein_prep=protein_prep,
+                                selected_ligand=selected_ligand,
+                                ligand_name=ligand_name,
+                                protein_length=protein_prep['sequence_length'],
+                                exhaustiveness=exhaustiveness,
+                                num_modes=num_modes,
+                                energy_range=energy_range,
                             )
                             
                             st.session_state.docking_results = docking_results
@@ -2925,14 +2987,16 @@ def main():
                 
                 # Run docking
                 if st.button("🚀 Predict & Dock", type="primary", width='stretch', key="ligand_binding_dock"):
-                    with st.spinner("Running binding prediction and docking..."):
-                        time.sleep(1)
-                        
-                        docking_results = st.session_state.api_client.simulate_docking_score(
-                            uniprot_data.get('sequence_length', 500),
-                            selected_ligand.get('molecular_weight', 300),
-                            None,
-                            selected_ligand.get('smiles')
+                    spinner_message = "Submitting docking job to Render worker..." if _get_docking_mode_value() == "real" else "Running binding prediction and docking..."
+                    with st.spinner(spinner_message):
+                        docking_results = _run_shared_docking(
+                            protein_prep=protein_prep,
+                            selected_ligand=selected_ligand,
+                            ligand_name=ligand_name,
+                            protein_length=uniprot_data.get('sequence_length', 500),
+                            exhaustiveness=exhaustiveness,
+                            num_modes=num_modes,
+                            energy_range=energy_range,
                         )
                         
                         st.session_state.ligand_binding_results = docking_results
@@ -2950,7 +3014,14 @@ def main():
                 # Display results
                 if 'ligand_binding_results' in st.session_state:
                     results = st.session_state.ligand_binding_results
-                    best_affinity = results['binding_affinity']
+                    best_affinity = results.get('binding_affinity')
+                    if best_affinity is None:
+                        best_affinity = 0.0
+                    if results.get('status') in {"queued", "running"} and not results.get('simulated'):
+                        st.info(
+                            f"Real docking job {results.get('job_id')} is {results.get('status')}. "
+                            "Refresh this page after the worker finishes to see the completed pose."
+                        )
                     
                     st.divider()
                     st.subheader("📊 Binding Prediction Results")
@@ -3045,8 +3116,16 @@ def main():
                 st.markdown(f"### Results for: **{ligand_name}**")
                 
                 # Best binding affinity
-                best_affinity = results['binding_affinity']
+                best_affinity = results.get('binding_affinity')
+                if best_affinity is None:
+                    best_affinity = 0.0
                 best_mode = results.get('best_mode', {})
+
+                if results.get('status') in {"queued", "running"} and not results.get('simulated'):
+                    st.info(
+                        f"Real docking job {results.get('job_id')} is {results.get('status')}. "
+                        "Refresh this page after the worker finishes to load the completed Vina result."
+                    )
                 
                 col1, col2, col3 = st.columns(3)
                 
@@ -3602,15 +3681,16 @@ def _render_protein_predictor(protein_fasta_content: str):
     # Run docking button
     if selected_ligand:
         if st.button("🚀 Run Molecular Docking", type="primary", key="seq_analysis_run_docking", width='stretch'):
-            with st.spinner("🧬 Running AutoDock Vina simulation... Calculating 3D orientation..."):
-                time.sleep(2)
-                
-                # Call docking API
-                docking_results = st.session_state.api_client.simulate_docking_score(
-                    protein_prep['sequence_length'],
-                    selected_ligand.get('molecular_weight', 300),
-                    None,
-                    selected_ligand.get('smiles')
+            spinner_message = "🧬 Submitting docking job to Render worker..." if _get_docking_mode_value() == "real" else "🧬 Running AutoDock Vina simulation... Calculating 3D orientation..."
+            with st.spinner(spinner_message):
+                docking_results = _run_shared_docking(
+                    protein_prep=protein_prep,
+                    selected_ligand=selected_ligand,
+                    ligand_name=ligand_name,
+                    protein_length=protein_prep['sequence_length'],
+                    exhaustiveness=exhaustiveness,
+                    num_modes=num_modes,
+                    energy_range=energy_range,
                 )
                 
                 # Store results in session state for display
@@ -3638,8 +3718,16 @@ def _render_protein_predictor(protein_fasta_content: str):
         st.markdown(f"### Results for: **{ligand_name_display}**")
         
         # Best binding affinity
-        best_affinity = results['binding_affinity']
+        best_affinity = results.get('binding_affinity')
+        if best_affinity is None:
+            best_affinity = 0.0
         best_mode = results.get('best_mode', {})
+
+        if results.get('status') in {"queued", "running"} and not results.get('simulated'):
+            st.info(
+                f"Real docking job {results.get('job_id')} is {results.get('status')}. "
+                "Refresh this page after the worker finishes to load the completed Vina result."
+            )
         
         col1, col2, col3 = st.columns(3)
         
@@ -4305,10 +4393,28 @@ def _render_protein_predictor(fasta_content: str) -> None:
             if "api_client" not in st.session_state:
                 st.error("API client not available in session state; cannot run docking simulation.")
             else:
-                with st.spinner("🧪 Simulating molecular docking..."):
-                    docking_results = st.session_state.api_client.simulate_docking_score(
+                selected_ligand = {
+                    "name": "Generic ligand",
+                    "smiles": "CC",
+                    "molecular_weight": float(default_mw),
+                }
+                protein_prep = protein_structure_for_docking or {
+                    "available": True,
+                    "structure_type": "predicted",
+                    "structure_id": f"ESMFOLD-{seq_key}",
+                    "sequence_length": len(selected_seq),
+                    "pdb_url": "",
+                    "pdb_text": protein_structure_for_docking.get("pdb_text", "") if protein_structure_for_docking else "",
+                }
+                with st.spinner("🧪 Submitting molecular docking request..." if _get_docking_mode_value() == "real" else "🧪 Simulating molecular docking..."):
+                    docking_results = _run_shared_docking(
+                        protein_prep=protein_prep,
+                        selected_ligand=selected_ligand,
+                        ligand_name=selected_ligand["name"],
                         protein_length=len(selected_seq),
-                        ligand_mw=float(default_mw),
+                        exhaustiveness=8,
+                        num_modes=9,
+                        energy_range=3,
                     )
                 st.session_state[docking_result_key] = docking_results
 

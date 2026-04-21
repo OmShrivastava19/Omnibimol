@@ -1,6 +1,7 @@
 """Application settings for the backend API service."""
 
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -35,11 +36,29 @@ class Settings(BaseSettings):
     )
     redis_url: str = Field(default="redis://localhost:6379/0")
 
+    docking_enabled: bool = Field(default=True)
+    docking_mode_default: Literal["real", "simulation"] = Field(default="real")
+    docking_engine: Literal["vina", "quickvina2"] = Field(default="vina")
+    docking_cache_dir: str = Field(default="/var/lib/omnibimol/docking-cache")
+    docking_timeout_seconds: int = Field(default=900, ge=30)
+    docking_vina_binary: str = Field(default="vina")
+    docking_worker_concurrency: int = Field(default=1, ge=1, le=16)
+
+    backend_api_url: str = Field(default="http://localhost:8000")
+
     @property
     def auth0_issuer(self) -> str:
         if not self.auth0_domain:
             return ""
         return f"https://{self.auth0_domain}/"
+
+    @property
+    def normalized_docking_mode_default(self) -> str:
+        return self.docking_mode_default.lower().strip()
+
+    @property
+    def normalized_docking_engine(self) -> str:
+        return self.docking_engine.lower().strip()
 
 
 @lru_cache

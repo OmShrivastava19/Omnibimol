@@ -164,6 +164,41 @@ def test_job_failure_transition(auth_client: tuple[TestClient, sessionmaker]) ->
     assert "Simulated worker failure" in final_poll.json()["error_message"]
 
 
+def test_docking_job_remains_queued_until_worker_processes_it(auth_client: tuple[TestClient, sessionmaker]) -> None:
+    client, session_local = auth_client
+    token = jwt.encode(
+        _token_payload(sub="auth0|dock-user", tenant_slug="jobs-tenant-dock"),
+        TEST_SECRET,
+        algorithm="HS256",
+    )
+    _sync(client, token)
+    _set_role(
+        session_local,
+        tenant_slug="jobs-tenant-dock",
+        subject="auth0|dock-user",
+        role_name="scientist",
+    )
+
+    enqueue = client.post(
+        "/api/v1/jobs",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "job_type": "docking.vina",
+            "payload": {
+                "protein": {"structure_id": "AF-P12345-F1", "pdb_url": "https://example.org/receptor.pdb"},
+                "ligand": {"name": "Ligand", "smiles": "CC"},
+                "parameters": {"exhaustiveness": 4, "num_modes": 3, "energy_range": 2},
+            },
+        },
+    )
+    assert enqueue.status_code == 200
+    job_id = enqueue.json()["id"]
+
+    poll = client.get(f"/api/v1/jobs/{job_id}", headers={"Authorization": f"Bearer {token}"})
+    assert poll.status_code == 200
+    assert poll.json()["status"] == "queued"
+
+
 def test_job_status_tenant_isolated(auth_client: tuple[TestClient, sessionmaker]) -> None:
     client, session_local = auth_client
     token_a = jwt.encode(

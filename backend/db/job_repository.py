@@ -37,6 +37,9 @@ class JobRepository:
         stmt = select(JobRun).where(JobRun.id == job_id, JobRun.tenant_id == tenant_id)
         return self.db.scalar(stmt)
 
+    def get_job_by_id(self, job_id: int) -> JobRun | None:
+        return self.db.get(JobRun, job_id)
+
     def mark_running(self, job: JobRun) -> JobRun:
         if job.status == "queued":
             job.status = "running"
@@ -45,9 +48,21 @@ class JobRepository:
             self.db.refresh(job)
         return job
 
+    def claim_next_job(self, *, job_types: set[str] | None = None) -> JobRun | None:
+        stmt = select(JobRun).where(JobRun.status == "queued")
+        if job_types:
+            stmt = stmt.where(JobRun.job_type.in_(sorted(job_types)))
+        stmt = stmt.order_by(JobRun.created_at.asc()).with_for_update(skip_locked=True)
+
+        job = self.db.scalar(stmt)
+        if job is None:
+            return None
+        return self.mark_running(job)
+
     def mark_completed(self, *, job: JobRun, result_payload: dict) -> JobRun:
         job.status = "completed"
         job.result_payload = result_payload
+        job.error_message = None
         job.completed_at = datetime.now(UTC)
         self.db.commit()
         self.db.refresh(job)
@@ -55,6 +70,7 @@ class JobRepository:
 
     def mark_failed(self, *, job: JobRun, error_message: str) -> JobRun:
         job.status = "failed"
+        job.result_payload = {}
         job.error_message = error_message
         job.completed_at = datetime.now(UTC)
         self.db.commit()

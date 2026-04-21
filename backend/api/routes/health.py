@@ -25,5 +25,7 @@ def readyz() -> dict[str, object]:
         "environment": settings.environment,
         "database_configured": bool(settings.database_url),
         "redis_configured": bool(settings.redis_url),
+        "docking_enabled": settings.docking_enabled,
+        "docking_engine": settings.docking_engine,
         "timestamp_utc": datetime.now(UTC).isoformat(),
     }

@@ -17,6 +17,8 @@ def test_readyz_returns_service_metadata() -> None:
     assert payload["status"] == "ready"
     assert payload["database_configured"] is True
     assert payload["redis_configured"] is True
+    assert payload["docking_enabled"] is True
+    assert payload["docking_engine"] == "vina"
     assert "timestamp_utc" in payload
 
 
