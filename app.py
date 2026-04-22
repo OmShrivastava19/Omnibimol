@@ -958,7 +958,7 @@ def main():
         
         st.header("📋 About")
         st.markdown("""
-        **OmniBiMol (MVP)**
+        **OmniBiMol**
         
         Integrated protein analysis platform combining:
         - UniProt: Protein function & annotations
@@ -979,9 +979,10 @@ def main():
         - Mobile-responsive design
         - User-friendly interface
         - Extensible architecture
-        - Open-source & free to use
 
-        **Developed by:** Team BhUOm
+        **Developed by:** Om Shrivastava
+        
+        All rights reserved.
         """)
 
         st.divider()
