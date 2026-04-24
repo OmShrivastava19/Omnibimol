@@ -6,7 +6,7 @@ import csv
 import io
 import json
 from datetime import UTC, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class WetLabHandoffEngine:
@@ -219,6 +219,137 @@ class WetLabHandoffEngine:
         candidates.sort(key=lambda r: (-float(r["heuristic_score"]), r["target_position"]))
         return candidates[:25]
 
+    def analyze_crispr_off_targets(
+        self,
+        guide_rna_sequence: str,
+        patient_genome: Dict[str, Any],
+        *,
+        guide_label: str = "SpCas9-NGG",
+    ) -> Dict[str, Any]:
+        """Two-stage deterministic off-target analysis with explainable scoring and tiering."""
+        guide = self._normalize_sequence(str(guide_rna_sequence or "").upper().replace("U", "T"))
+        if len(guide) < 18:
+            return {
+                "guide_rna_sequence": guide,
+                "guide_label": guide_label,
+                "specificity_score_pct": 0.0,
+                "overall_risk_label": "High",
+                "ranked_off_targets": [],
+                "top_3_drivers": ["Guide sequence is too short for robust off-target analysis."],
+                "top_3_risks_assumptions": [
+                    "Insufficient guide sequence length prevents candidate enumeration.",
+                    "No patient-specific off-target ranking can be produced.",
+                ],
+                "missing_inputs_reducing_uncertainty": [
+                    "Provide a 20nt guide RNA sequence.",
+                    "Provide patient genome sequence with annotations.",
+                ],
+                "notes_for_manual_review": (
+                    "Research-use only deterministic heuristic. "
+                    "Sequence/model simplifications may under-represent context-dependent cleavage behavior."
+                ),
+                "summary_text": "Guide sequence too short for off-target analysis.",
+                "disclaimer": self.DISCLAIMER,
+            }
+
+        genome_seq = self._normalize_sequence(patient_genome.get("sequence", ""))
+        annotations = patient_genome.get("annotations", []) if isinstance(patient_genome, dict) else []
+        variants = patient_genome.get("variants", []) if isinstance(patient_genome, dict) else []
+        uncertainty_notes: List[str] = []
+        if not genome_seq:
+            uncertainty_notes.append("Patient genome sequence missing; no candidate off-target sites can be enumerated.")
+        if not annotations:
+            uncertainty_notes.append("Genome annotations missing; impact terms fall back to conservative defaults.")
+
+        candidates = self._enumerate_off_target_candidates(guide=guide, genome_seq=genome_seq)
+        ranked_off_targets: List[Dict[str, Any]] = []
+        for row in candidates:
+            impact = self._compute_off_target_impact(
+                site_position=int(row["site_position"]),
+                site_end=int(row["site_end"]),
+                annotations=annotations,
+                variants=variants,
+            )
+            cleavage_prob = self._estimate_off_target_cleavage_probability(
+                mismatches=int(row["mismatches"]),
+                bulges=int(row["bulges"]),
+                pam=str(row["pam"]),
+                seed_mismatches=int(row["seed_mismatches"]),
+            )
+            risk_score = self._clamp(cleavage_prob * impact["impact_weight"] * 100.0)
+            ranked_off_targets.append(
+                {
+                    **row,
+                    "cleavage_probability": round(cleavage_prob, 4),
+                    "impact_weight": round(float(impact["impact_weight"]), 3),
+                    "impact_flags": impact["impact_flags"],
+                    "gene_name": impact["gene_name"],
+                    "risk_score": round(risk_score, 2),
+                    "tier_label": self._assign_off_target_tier(risk_score=risk_score, impact=impact),
+                    "rank_explanation": self._build_off_target_explanation(row=row, impact=impact, cleavage_prob=cleavage_prob),
+                }
+            )
+
+        ranked_off_targets.sort(key=lambda r: (-float(r["risk_score"]), r["gene_name"], int(r["site_position"])))
+        ranked_off_targets = ranked_off_targets[:25]
+
+        on_target_strength = self._estimate_on_target_strength(guide)
+        aggregate_off_target_risk = sum(float(r["risk_score"]) / 100.0 for r in ranked_off_targets)
+        specificity = (
+            (on_target_strength / (on_target_strength + aggregate_off_target_risk)) * 100.0
+            if (on_target_strength + aggregate_off_target_risk) > 0
+            else 0.0
+        )
+        specificity = self._clamp(specificity)
+
+        if specificity >= 85.0:
+            overall_risk = "Low"
+        elif specificity >= 65.0:
+            overall_risk = "Medium"
+        else:
+            overall_risk = "High"
+
+        top_rows = ranked_off_targets[:3]
+        risky_sites = ", ".join(f"{r.get('gene_name', 'Intergenic')} ({r.get('tier_label', 'Tier 3')})" for r in top_rows)
+        if not risky_sites:
+            risky_sites = "No high-priority off-targets detected"
+        summary_text = f"This gRNA has {round(specificity):.0f}% specificity. Risk off-targets: {risky_sites}"
+        if uncertainty_notes:
+            summary_text = f"{summary_text}. Uncertainty notes: {' '.join(uncertainty_notes)}"
+
+        return {
+            "guide_rna_sequence": guide,
+            "guide_label": guide_label,
+            "specificity_score_pct": round(specificity, 2),
+            "on_target_strength": round(on_target_strength, 4),
+            "aggregate_off_target_risk": round(aggregate_off_target_risk, 4),
+            "overall_risk_label": overall_risk,
+            "ranked_off_targets": ranked_off_targets,
+            "top_3_drivers": [
+                f"On-target strength estimate={on_target_strength:.3f}",
+                f"Total enumerated PAM-adjacent candidates={len(candidates)}",
+                "Impact model upweights coding/cancer/essential/regulatory/variant overlap loci.",
+            ],
+            "top_3_risks_assumptions": [
+                "Deterministic heuristic scorer approximates cleavage probability.",
+                "Bulges limited to small single-event edits in this implementation.",
+                "Chromatin accessibility and cell-state context are not modeled.",
+            ],
+            "missing_inputs_reducing_uncertainty": (
+                uncertainty_notes
+                + [
+                    "Add patient-specific chromatin context (ATAC/histone marks) when available.",
+                    "Validate top-ranked sites with orthogonal wet-lab assays.",
+                ]
+            )[:3],
+            "notes_for_manual_review": (
+                "Research-use only deterministic model. "
+                "Architecture is pluggable: candidate generation and scoring are separated for future ML replacement."
+            ),
+            "summary_text": summary_text,
+            "disclaimer": self.DISCLAIMER,
+        }
+
     def suggest_primers(self, sequence: str, regions: List[Dict[str, Any]], primer_constraints: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Suggest practical primer pairs from candidate regions with conservative heuristics."""
         seq = self._normalize_sequence(sequence)
@@ -428,6 +559,7 @@ class WetLabHandoffEngine:
         crispr_csv = self._to_csv(plan.get("crispr_candidates", []))
         primers_csv = self._to_csv(plan.get("primers", []))
         checklist_csv = self._to_csv(plan.get("validation_checklist", []))
+        crispr_off_targets_csv = self._to_csv(plan.get("crispr_off_target_analysis", {}).get("ranked_off_targets", []))
         markdown_brief = self._build_markdown_brief(plan)
         txt_brief = markdown_brief.replace("## ", "").replace("### ", "")
 
@@ -438,6 +570,7 @@ class WetLabHandoffEngine:
                 "crispr_candidates": crispr_csv,
                 "primers": primers_csv,
                 "validation_checklist": checklist_csv,
+                "crispr_off_targets": crispr_off_targets_csv,
             },
             "markdown_brief": markdown_brief,
             "txt_brief": txt_brief,
@@ -651,6 +784,167 @@ class WetLabHandoffEngine:
             ],
         }
 
+    def _enumerate_off_target_candidates(self, guide: str, genome_seq: str) -> List[Dict[str, Any]]:
+        """Stage 1: PAM-aware candidate enumeration with mismatch and small-bulge support."""
+        if not genome_seq or len(guide) < 18:
+            return []
+        g = guide[:20]
+        results: List[Dict[str, Any]] = []
+        genome_len = len(genome_seq)
+
+        for pam_idx in range(20, genome_len - 2):
+            pam = genome_seq[pam_idx : pam_idx + 3]
+            if len(pam) == 3 and pam[1:] == "GG":
+                protospacer = genome_seq[pam_idx - 20 : pam_idx]
+                alignment_label, mismatches, bulges = self._align_guide_with_small_bulges(g, protospacer)
+                if not alignment_label:
+                    continue
+                seed_mismatches = self._count_mismatches(g[8:20], protospacer[8:20])
+                results.append(
+                    {
+                        "site_position": int(pam_idx - 20),
+                        "site_end": int(pam_idx + 2),
+                        "strand": "+",
+                        "pam": pam,
+                        "candidate_sequence": protospacer,
+                        "mismatches": int(mismatches),
+                        "bulges": int(bulges),
+                        "seed_mismatches": int(seed_mismatches),
+                        "alignment_label": alignment_label,
+                    }
+                )
+
+        for pam_idx in range(3, genome_len - 20):
+            pam_window = genome_seq[pam_idx - 3 : pam_idx]
+            if len(pam_window) == 3 and pam_window[:2] == "CC":
+                protospacer_fw = genome_seq[pam_idx : pam_idx + 20]
+                protospacer = self._reverse_complement(protospacer_fw)
+                pam = self._reverse_complement(pam_window)
+                alignment_label, mismatches, bulges = self._align_guide_with_small_bulges(g, protospacer)
+                if not alignment_label:
+                    continue
+                seed_mismatches = self._count_mismatches(g[8:20], protospacer[8:20])
+                results.append(
+                    {
+                        "site_position": int(pam_idx - 3),
+                        "site_end": int(pam_idx + 19),
+                        "strand": "-",
+                        "pam": pam,
+                        "candidate_sequence": protospacer,
+                        "mismatches": int(mismatches),
+                        "bulges": int(bulges),
+                        "seed_mismatches": int(seed_mismatches),
+                        "alignment_label": alignment_label,
+                    }
+                )
+
+        results.sort(key=lambda r: (int(r["mismatches"]), int(r["bulges"]), int(r["seed_mismatches"]), int(r["site_position"])))
+        return results[:300]
+
+    def _align_guide_with_small_bulges(self, guide: str, target: str) -> Tuple[str, int, int]:
+        mismatch_direct = self._count_mismatches(guide, target)
+        best = ("match", mismatch_direct, 0)
+        if mismatch_direct <= 4:
+            return best
+
+        for idx in range(len(guide)):
+            trimmed_guide = guide[:idx] + guide[idx + 1 :]
+            mismatch = self._count_mismatches(trimmed_guide, target[: len(trimmed_guide)])
+            if mismatch <= 4 and (1 + mismatch) < (best[1] + best[2]):
+                best = ("guide_bulge", mismatch, 1)
+
+        for idx in range(len(target)):
+            trimmed_target = target[:idx] + target[idx + 1 :]
+            mismatch = self._count_mismatches(guide[: len(trimmed_target)], trimmed_target)
+            if mismatch <= 4 and (1 + mismatch) < (best[1] + best[2]):
+                best = ("target_bulge", mismatch, 1)
+
+        if best[1] <= 4 and best[2] <= 1:
+            return best
+        return ("", 99, 99)
+
+    def _estimate_off_target_cleavage_probability(self, mismatches: int, bulges: int, pam: str, seed_mismatches: int) -> float:
+        score = 0.88 - (0.12 * mismatches) - (0.16 * bulges) - (0.07 * seed_mismatches)
+        if pam == "AGG":
+            score += 0.03
+        elif pam == "TGG":
+            score += 0.01
+        return self._clamp(score * 100.0) / 100.0
+
+    def _compute_off_target_impact(
+        self,
+        site_position: int,
+        site_end: int,
+        annotations: List[Dict[str, Any]],
+        variants: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        impact_weight = 1.0
+        impact_flags: List[str] = []
+        gene_name = "Intergenic"
+
+        matched = None
+        for ann in annotations:
+            start = int(ann.get("start", -1))
+            end = int(ann.get("end", -1))
+            if start <= site_end and site_position <= end:
+                matched = ann
+                break
+
+        if matched:
+            gene_name = str(matched.get("gene_name") or matched.get("gene") or "Intergenic")
+            if bool(matched.get("is_coding")):
+                impact_weight += 0.30
+                impact_flags.append("coding_region")
+            if bool(matched.get("is_cancer_gene")):
+                impact_weight += 0.40
+                impact_flags.append("cancer_gene")
+            if bool(matched.get("is_essential_gene")):
+                impact_weight += 0.35
+                impact_flags.append("essential_gene")
+            if bool(matched.get("is_regulatory_hotspot")):
+                impact_weight += 0.25
+                impact_flags.append("regulatory_hotspot")
+        else:
+            impact_flags.append("annotation_missing_for_site")
+
+        for variant in variants:
+            pos = variant.get("position")
+            if pos is None:
+                continue
+            if site_position <= int(pos) <= site_end:
+                if bool(variant.get("pathogenic")) or str(variant.get("impact", "")).lower() in {"high", "pathogenic"}:
+                    impact_weight += 0.45
+                    impact_flags.append("patient_variant_overlap")
+                    break
+
+        return {
+            "impact_weight": impact_weight,
+            "impact_flags": sorted(set(impact_flags)),
+            "gene_name": gene_name,
+        }
+
+    def _assign_off_target_tier(self, risk_score: float, impact: Dict[str, Any]) -> str:
+        high_impact = bool({"cancer_gene", "essential_gene", "patient_variant_overlap"} & set(impact.get("impact_flags", [])))
+        if risk_score >= 70.0 or (risk_score >= 50.0 and high_impact):
+            return "Tier 1"
+        if risk_score >= 35.0 or high_impact:
+            return "Tier 2"
+        return "Tier 3"
+
+    def _estimate_on_target_strength(self, guide: str) -> float:
+        gc = self._gc_content(guide)
+        gc_term = max(0.2, 1.0 - (abs(gc - 50.0) / 60.0))
+        homopolymer_penalty = 0.2 if self._contains_repetitive_run(guide, threshold=4) else 0.0
+        return max(0.1, gc_term - homopolymer_penalty)
+
+    def _build_off_target_explanation(self, row: Dict[str, Any], impact: Dict[str, Any], cleavage_prob: float) -> str:
+        impact_flags = impact.get("impact_flags", [])
+        impact_desc = " / ".join(impact_flags) if impact_flags else "baseline genomic context"
+        return (
+            f"Ranked high due to cleavage={cleavage_prob:.2f}, mismatches={row.get('mismatches')}, "
+            f"bulges={row.get('bulges')}, and impact={impact_desc}."
+        )
+
     def _enumerate_primers(
         self,
         seq: str,
@@ -753,6 +1047,7 @@ class WetLabHandoffEngine:
         crispr = plan.get("crispr_candidates", [])[:8]
         primers = plan.get("primers", [])[:8]
         checklist = plan.get("validation_checklist", [])
+        crispr_off_target = plan.get("crispr_off_target_analysis", {}) or {}
 
         lines = [
             "# OmniBiMol Wet-Lab Handoff Brief",
@@ -779,6 +1074,17 @@ class WetLabHandoffEngine:
             lines.append(
                 f"- Pos {row.get('target_position')} ({row.get('strand')}): {row.get('spacer_sequence')} | PAM {row.get('pam')} | score {row.get('heuristic_score')} | off-target risk {row.get('off_target_risk_level')}"
             )
+
+        if crispr_off_target:
+            lines.extend(["", "## CRISPR Off-Target Risk"])
+            lines.append(f"- {crispr_off_target.get('summary_text', 'Off-target summary unavailable.')}")
+            for row in crispr_off_target.get("ranked_off_targets", [])[:5]:
+                lines.append(
+                    "- "
+                    f"{row.get('gene_name', 'Intergenic')} | tier {row.get('tier_label')} | "
+                    f"risk={row.get('risk_score')} | cleavage={row.get('cleavage_probability')} | "
+                    f"mm={row.get('mismatches')} | bulges={row.get('bulges')}"
+                )
 
         lines.extend(["", "## Primer Pair Highlights"])
         for row in primers[:5]:
@@ -867,6 +1173,12 @@ class WetLabHandoffEngine:
             if sequence[idx : idx + m] == motif:
                 count += 1
         return count
+
+    def _count_mismatches(self, a: str, b: str) -> int:
+        n = min(len(a), len(b))
+        mismatch = sum(1 for i in range(n) if a[i] != b[i])
+        mismatch += abs(len(a) - len(b))
+        return mismatch
 
     def _reverse_complement(self, sequence: str) -> str:
         table = str.maketrans("ACGT", "TGCA")

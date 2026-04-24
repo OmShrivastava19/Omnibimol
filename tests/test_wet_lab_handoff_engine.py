@@ -126,6 +126,147 @@ class TestWetLabHandoffEngine(unittest.TestCase):
         self.assertIn("assays", content["csv"])
         self.assertIn("disclaimer", content)
 
+    def test_crispr_off_target_returns_specificity_and_ranked_sites(self):
+        guide = "GCTAGCTAGGCTTACGATCG"
+        patient_genome = {
+            "sequence": (
+                "TTTTT" + guide + "AGG" + "A" * 24 + "GCTAGCTAGGCTTTCGATCGAGG" + "C" * 24
+            ),
+            "annotations": [
+                {
+                    "start": 4,
+                    "end": 28,
+                    "gene_name": "BRCA2",
+                    "is_coding": True,
+                    "is_cancer_gene": True,
+                    "is_essential_gene": True,
+                    "is_regulatory_hotspot": False,
+                },
+                {
+                    "start": 52,
+                    "end": 80,
+                    "gene_name": "BCL6",
+                    "is_coding": True,
+                    "is_cancer_gene": False,
+                    "is_essential_gene": False,
+                    "is_regulatory_hotspot": True,
+                },
+            ],
+            "variants": [{"position": 18, "pathogenic": True}],
+        }
+        result = self.engine.analyze_crispr_off_targets(guide, patient_genome)
+        self.assertIn("specificity_score_pct", result)
+        self.assertIn("ranked_off_targets", result)
+        self.assertTrue(result["ranked_off_targets"])
+        self.assertIn("summary_text", result)
+        self.assertIn("specificity", result["summary_text"].lower())
+
+    def test_crispr_off_target_deterministic_for_same_inputs(self):
+        guide = "GCTAGCTAGGCTTACGATCG"
+        patient_genome = {
+            "sequence": "AAAAA" + guide + "AGG" + "TTTTT" + "GCTAGCTAGGCTTTCGATCGAGG" + "GGGGG",
+            "annotations": [{"start": 4, "end": 28, "gene_name": "BRCA2", "is_coding": True, "is_cancer_gene": True}],
+            "variants": [],
+        }
+        first = self.engine.analyze_crispr_off_targets(guide, patient_genome)
+        second = self.engine.analyze_crispr_off_targets(guide, patient_genome)
+        self.assertEqual(first["specificity_score_pct"], second["specificity_score_pct"])
+        self.assertEqual(first["ranked_off_targets"], second["ranked_off_targets"])
+
+    def test_crispr_off_target_candidate_fields_present(self):
+        guide = "GCTAGCTAGGCTTACGATCG"
+        patient_genome = {
+            "sequence": "AAAAA" + guide + "AGG" + "TTTTT" + "GCTAGCTAGGCTTTCGATCGAGG" + "GGGGG",
+            "annotations": [{"start": 4, "end": 28, "gene_name": "BRCA2", "is_coding": True, "is_cancer_gene": True}],
+            "variants": [],
+        }
+        result = self.engine.analyze_crispr_off_targets(guide, patient_genome)
+        expected_fields = {
+            "site_position",
+            "site_end",
+            "strand",
+            "pam",
+            "candidate_sequence",
+            "mismatches",
+            "bulges",
+            "seed_mismatches",
+            "alignment_label",
+            "cleavage_probability",
+            "impact_weight",
+            "impact_flags",
+            "gene_name",
+            "risk_score",
+            "tier_label",
+            "rank_explanation",
+        }
+        self.assertTrue(expected_fields.issubset(set(result["ranked_off_targets"][0].keys())))
+
+    def test_crispr_off_target_tiering_high_impact_vs_lower_impact(self):
+        guide = "GCTAGCTAGGCTTACGATCG"
+        patient_genome = {
+            "sequence": (
+                "TTTTT" + guide + "AGG" + "A" * 24 + "GCTAGCTAGGCTTTCGATCGAGG" + "C" * 24
+            ),
+            "annotations": [
+                {
+                    "start": 4,
+                    "end": 28,
+                    "gene_name": "BRCA2",
+                    "is_coding": True,
+                    "is_cancer_gene": True,
+                    "is_essential_gene": True,
+                },
+                {
+                    "start": 52,
+                    "end": 80,
+                    "gene_name": "GENE_X",
+                    "is_coding": False,
+                    "is_cancer_gene": False,
+                    "is_essential_gene": False,
+                },
+            ],
+            "variants": [],
+        }
+        result = self.engine.analyze_crispr_off_targets(guide, patient_genome)
+        tiers = {row["gene_name"]: row["tier_label"] for row in result["ranked_off_targets"]}
+        scores = {row["gene_name"]: row["risk_score"] for row in result["ranked_off_targets"]}
+        self.assertEqual(tiers.get("BRCA2"), "Tier 1")
+        self.assertGreater(scores.get("BRCA2", 0.0), scores.get("GENE_X", 0.0))
+
+    def test_crispr_off_target_missing_annotations_are_conservative(self):
+        guide = "GCTAGCTAGGCTTACGATCG"
+        patient_genome = {"sequence": "AAAAA" + guide + "AGG" + "TTTTT" + "GCTAGCTAGGCTTTCGATCGAGG" + "GGGGG"}
+        result = self.engine.analyze_crispr_off_targets(guide, patient_genome)
+        self.assertIn("missing_inputs_reducing_uncertainty", result)
+        joined = " ".join(result["missing_inputs_reducing_uncertainty"]).lower()
+        self.assertIn("annotations", joined)
+        self.assertIn("uncertainty notes", result["summary_text"].lower())
+
+    def test_export_includes_optional_off_target_analysis(self):
+        guide = "GCTAGCTAGGCTTACGATCG"
+        off_target = self.engine.analyze_crispr_off_targets(
+            guide,
+            {
+                "sequence": "AAAAA" + guide + "AGG" + "TTTTT" + "GCTAGCTAGGCTTTCGATCGAGG" + "GGGGG",
+                "annotations": [{"start": 4, "end": 28, "gene_name": "BRCA2", "is_coding": True, "is_cancer_gene": True}],
+            },
+        )
+        plan = {
+            "objective": "target validation",
+            "context": self.context,
+            "assays": [],
+            "crispr_candidates": [],
+            "primers": [],
+            "validation_checklist": [],
+            "crispr_off_target_analysis": off_target,
+            "confidence": self.engine.compute_plan_confidence(
+                {"context": self.context, "assays": [], "crispr_candidates": [], "primers": []}
+            ),
+        }
+        exported = self.engine.export_wet_lab_package(plan, format="json")
+        self.assertIn("crispr_off_targets", exported["content"]["csv"])
+        self.assertIn("CRISPR Off-Target Risk", exported["content"]["markdown_brief"])
+
 
 if __name__ == "__main__":
     unittest.main()
