@@ -1,0 +1,11 @@
+{
+  "model": "flexpose",
+  "status": "success",
+  "request_hash": "f52027935554907a6bb805e793928b522f6798efbe7c4de0e6d16e637502ddba",
+  "runtime_mode": "native",
+  "artifacts": {
+    "output_dir": "C:\\Users\\DELL\\Desktop\\omnibimol\\tests\\fixtures\\academic_model_hub\\out\\flexpose\\92171bb761bd_4",
+    "csv_path": "C:\\Users\\DELL\\Desktop\\omnibimol\\tests\\fixtures\\academic_model_hub\\out\\flexpose\\92171bb761bd_4\\predictions.csv",
+    "provenance_manifest": "C:\\Users\\DELL\\Desktop\\omnibimol\\tests\\fixtures\\academic_model_hub\\out\\provenance_manifest.json"
+  }
+}

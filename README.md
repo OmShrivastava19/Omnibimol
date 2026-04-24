@@ -14,6 +14,7 @@ OmniBiMol is a Streamlit-based bioinformatics platform that unifies protein disc
 - Ligand binding prediction, docking simulation, and SAR-style insights.
 - Drug search, clinical trials lookup, and repurposing recommendations.
 - Whole genome analysis for mutations, biomarkers, and risk scoring.
+- Academic model hub UI for FlexPose, DeePathNet, CRISPR-DIPOFF, and DeepDTAGen execution.
 
 ## What the App Can Do
 
@@ -68,6 +69,28 @@ OmniBiMol is a Streamlit-based bioinformatics platform that unifies protein disc
 - Personalized insights and pharmacogenomic notes.
 - Predictive risk calculator and recommendations.
 
+### 10) Academic Models UI
+- Discover available academic adapters with runtime and health metadata.
+- Submit normalized model runs using guided forms (no raw payload authoring required).
+- Inspect prediction/explanations/confidence/artifacts/provenance/errors in consistent tabs.
+- Track session run history and reopen previous results.
+- Export normalized response, provenance manifest, and run summary artifacts.
+
+#### Academic Models launch-readiness checklist
+- Model discovery + shallow/deep health checks render from backend endpoints.
+- CRISPR candidate entry supports table editor, CSV upload, and advanced JSON fallback.
+- Model-specific analytics render for FlexPose, DeePathNet, CRISPR-DIPOFF, and DeepDTAGen.
+- Request correlation fields are visible (`request_id`, `request_hash`, runtime mode, status).
+- Browser-level UI tests cover submit flows, tab navigation, artifacts, and error hints.
+- Non-clinical disclaimer remains visible in prediction context.
+
+### Academic Models test setup (release gate)
+- Install test dependencies: `pip install -r requirements.txt`
+- Install browser runtime: `python -m playwright install chromium` (local), `python -m playwright install --with-deps chromium` (CI Linux)
+- Run focused gate:
+  - `python -m pytest tests/test_academic_model_hub.py tests/test_api_client_academic_models.py tests/test_academic_model_ui_helpers.py tests/test_academic_models_accessibility.py -q`
+  - `python -m pytest tests/test_academic_models_ui_playwright.py -q`
+
 ## Tech Stack
 
 - Streamlit (UI)
@@ -80,6 +103,19 @@ OmniBiMol is a Streamlit-based bioinformatics platform that unifies protein disc
 - Biopython (sequence analysis)
 - NetworkX (graph analytics)
 - SQLite (persistent caching)
+
+## Real Docking Startup
+
+Real docking uses the FastAPI backend job queue and the worker process. For local runs, start all of these together:
+
+1. Backend API: `uvicorn backend.main:app --host 0.0.0.0 --port 8000`
+2. Docking worker: `python -m backend.workers.docking_worker`
+3. PostgreSQL with `DATABASE_URL` pointing at the same database for the API and worker
+4. Redis with `REDIS_URL` configured for the backend stack
+
+Set `BACKEND_API_URL` in the Streamlit environment to the API base URL, for example `http://localhost:8000`. If that URL is wrong or the API is down, real docking fails with a clean message instead of a raw socket error.
+
+For academic model runtime setup and UI usage, see `docs/ACADEMIC_MODELS_UI.md` and `docs/academic_model_hub_deployment.md`.
 
 ## Data & APIs Used
 

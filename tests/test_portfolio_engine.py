@@ -33,7 +33,7 @@ class TestPortfolioEngine(unittest.TestCase):
         except PermissionError:
             pass
 
-    def _scores(self, base: float) -> dict:
+    def _scores(self, base: float, variant_sensitivity: float = 0.6, npv: float = 120.0, cost: float = 35.0) -> dict:
         return {
             "expression": {"available": True, "score": base, "source_quality": 0.8},
             "pathway": {"available": True, "score": base, "source_quality": 0.8},
@@ -41,6 +41,9 @@ class TestPortfolioEngine(unittest.TestCase):
             "genetic": {"available": True, "score": base, "source_quality": 0.8},
             "ligandability": {"available": True, "score": base, "source_quality": 0.8},
             "trials": {"available": True, "score": base, "source_quality": 0.8},
+            "variant_sensitivity": variant_sensitivity,
+            "npv": npv,
+            "cost": cost,
         }
 
     def test_db_init_and_crud(self):
@@ -178,6 +181,101 @@ class TestPortfolioEngine(unittest.TestCase):
         self.assertTrue(packet_md["schema_valid"])
         self.assertIn("candidate_ranking", packet_csv["content"])
         self.assertIn("Decision Snapshot", packet_md["content"])
+
+    def test_biomarker_robustness_affects_success_probability(self):
+        low = self.engine.add_target_candidate(self.project["id"], "MYC", alias="MYC-low", priority=50)
+        high = self.engine.add_target_candidate(self.project["id"], "EGFR", alias="EGFR-high", priority=50)
+        self.engine.save_evidence_snapshot(
+            target_candidate_id=low["id"],
+            source_version="low-v1",
+            component_scores=self._scores(25.0, variant_sensitivity=0.7),
+            confidence=0.35,
+            completeness=0.45,
+            key_findings={"highlights": ["weak translational package"]},
+            trial_status="Preclinical",
+        )
+        self.engine.save_evidence_snapshot(
+            target_candidate_id=high["id"],
+            source_version="high-v1",
+            component_scores=self._scores(80.0, variant_sensitivity=0.7),
+            confidence=0.84,
+            completeness=0.9,
+            key_findings={"highlights": ["strong translational package"]},
+            trial_status="Phase 2",
+        )
+        ranked = self.engine.compare_candidates(self.project["id"])["ranked_summary"]
+        low_row = next(row for row in ranked if row["candidate_id"] == low["id"])
+        high_row = next(row for row in ranked if row["candidate_id"] == high["id"])
+        self.assertLess(low_row["biomarker_robustness"], high_row["biomarker_robustness"])
+        self.assertLess(low_row["success_probability"], high_row["success_probability"])
+
+    def test_variant_sensitivity_affects_success_probability(self):
+        low = self.engine.add_target_candidate(self.project["id"], "BRAF", alias="BRAF-low-var", priority=55)
+        high = self.engine.add_target_candidate(self.project["id"], "BRAF", alias="BRAF-high-var", priority=55)
+        self.engine.save_evidence_snapshot(
+            target_candidate_id=low["id"],
+            source_version="v1",
+            component_scores=self._scores(65.0, variant_sensitivity=0.2),
+            confidence=0.76,
+            completeness=0.85,
+            key_findings={"highlights": ["same evidence"], "variant_sensitivity": 0.2},
+            trial_status="Phase 1",
+        )
+        self.engine.save_evidence_snapshot(
+            target_candidate_id=high["id"],
+            source_version="v1",
+            component_scores=self._scores(65.0, variant_sensitivity=0.9),
+            confidence=0.76,
+            completeness=0.85,
+            key_findings={"highlights": ["same evidence"], "variant_sensitivity": 0.9},
+            trial_status="Phase 1",
+        )
+        ranked = self.engine.compare_candidates(self.project["id"])["ranked_summary"]
+        low_row = next(row for row in ranked if row["candidate_id"] == low["id"])
+        high_row = next(row for row in ranked if row["candidate_id"] == high["id"])
+        self.assertLess(low_row["variant_sensitivity"], high_row["variant_sensitivity"])
+        self.assertLess(low_row["success_probability"], high_row["success_probability"])
+
+    def test_higher_predicted_success_increases_ranking(self):
+        weak = self.engine.add_target_candidate(self.project["id"], "TP53", alias="TP53-weak", priority=99)
+        strong = self.engine.add_target_candidate(self.project["id"], "ALK", alias="ALK-strong", priority=1)
+        self.engine.save_evidence_snapshot(
+            target_candidate_id=weak["id"],
+            source_version="v1",
+            component_scores=self._scores(35.0, variant_sensitivity=0.25, npv=100.0, cost=30.0),
+            confidence=0.4,
+            completeness=0.55,
+            key_findings={"highlights": ["limited evidence"]},
+            trial_status="Preclinical",
+        )
+        self.engine.save_evidence_snapshot(
+            target_candidate_id=strong["id"],
+            source_version="v1",
+            component_scores=self._scores(78.0, variant_sensitivity=0.85, npv=100.0, cost=30.0),
+            confidence=0.82,
+            completeness=0.9,
+            key_findings={"highlights": ["robust evidence"]},
+            trial_status="Phase 2",
+        )
+        ranked = self.engine.compare_candidates(self.project["id"])["ranked_summary"]
+        self.assertEqual(ranked[0]["candidate_id"], strong["id"])
+        self.assertGreater(ranked[0]["success_probability"], ranked[1]["success_probability"])
+
+    def test_fallback_success_model_path_when_no_trained_model(self):
+        self.engine.save_evidence_snapshot(
+            target_candidate_id=self.candidate["id"],
+            source_version="v1",
+            component_scores=self._scores(60.0, variant_sensitivity=0.65),
+            confidence=0.72,
+            completeness=0.8,
+            key_findings={"highlights": ["baseline"]},
+            trial_status="Phase 1",
+        )
+        comparison = self.engine.compare_candidates(self.project["id"])
+        top = comparison["ranked_summary"][0]
+        self.assertIn("score_explanation", top)
+        self.assertEqual(top["score_explanation"]["model"], "fallback_logistic_heuristic")
+        self.assertIn("feature_contributions", top["score_explanation"])
 
 
 if __name__ == "__main__":

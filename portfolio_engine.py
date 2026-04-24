@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import csv
 import io
 import json
+import math
 import sqlite3
 import uuid
 
@@ -23,9 +24,40 @@ class PortfolioEngine:
 
     DEFAULT_DECISION_RULES: Dict[str, float] = {
         "min_evidence_confidence": 0.6,
-        "min_translational_score": 55.0,
+        "min_success_probability": 0.45,
         "max_risk_burden": 70.0,
         "min_milestone_completion": 0.55,
+    }
+    SUCCESS_MODEL_COEFFICIENTS: Dict[str, Any] = {
+        "intercept": -1.2,
+        "biomarker_robustness": 2.1,
+        "variant_sensitivity": 1.4,
+        "interaction_biomarker_variant": 0.9,
+        "prior_translational_evidence": 0.8,
+        "assay_strength": 0.5,
+        "target_class": {
+            "kinase": 0.25,
+            "gpcr": 0.18,
+            "transcription_factor": -0.08,
+            "ion_channel": 0.07,
+            "other": 0.0,
+        },
+        "modality": {
+            "small molecule": 0.16,
+            "antibody": 0.12,
+            "rna": 0.05,
+            "cell therapy": -0.06,
+            "other": 0.0,
+        },
+        "phase": {
+            "discovery": -0.22,
+            "preclinical": -0.08,
+            "phase 1": 0.06,
+            "phase 2": 0.16,
+            "phase 3": 0.24,
+            "phase 4": 0.3,
+            "other": 0.0,
+        },
     }
 
     def __init__(self, db_path: str = "omnibimol_portfolio.db", drift_config: Optional[Dict[str, float]] = None):
@@ -372,7 +404,12 @@ class PortfolioEngine:
             drift_events.append(self._classify_drift_event(snapshots[i - 1], snapshots[i]))
         return {"target_candidate_id": target_candidate_id, "snapshots": snapshots, "drift_events": drift_events}
 
-    def compare_candidates(self, project_id: str, candidate_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+    def compare_candidates(
+        self,
+        project_id: str,
+        candidate_ids: Optional[List[str]] = None,
+        budget: Optional[float] = None,
+    ) -> Dict[str, Any]:
         ids = sorted(candidate_ids) if candidate_ids else []
         cache_key = f"{project_id}:{'|'.join(ids)}"
         if cache_key in self._comparison_cache:
@@ -384,6 +421,7 @@ class PortfolioEngine:
             candidates = [c for c in candidates if c["id"] in allowed]
 
         rows: List[Dict[str, Any]] = []
+        project = self._project_by_id(project_id)
         for c in candidates:
             series = self.get_target_time_series(c["id"])["snapshots"]
             latest = series[-1] if series else {}
@@ -402,6 +440,16 @@ class PortfolioEngine:
                 + 0.07 * (100.0 - risk_burden)
             ) - missing_penalty
             rank_score = round(max(0.0, min(100.0, aggregate)), 2)
+            success_scoring = self.score_asset_success(
+                {
+                    "project": project,
+                    "candidate": c,
+                    "snapshot": latest,
+                    "dimensions": dims,
+                    "confidence": confidence,
+                    "completeness": completeness,
+                }
+            )
             rows.append(
                 {
                     "candidate_id": c["id"],
@@ -413,6 +461,12 @@ class PortfolioEngine:
                     "completeness": round(completeness, 3),
                     "missing_data_penalty": round(missing_penalty, 2),
                     "rank_score": rank_score,
+                    "success_probability": success_scoring["success_probability"],
+                    "risk_adjusted_score": success_scoring["risk_adjusted_score"],
+                    "expected_value": success_scoring["expected_value"],
+                    "biomarker_robustness": success_scoring["biomarker_robustness"],
+                    "variant_sensitivity": success_scoring["variant_sensitivity"],
+                    "score_explanation": success_scoring["explanation"],
                     "strengths": self._dimension_strengths(dims),
                     "weaknesses": self._dimension_weaknesses(dims),
                 }
@@ -420,8 +474,26 @@ class PortfolioEngine:
 
         ranked = sorted(
             rows,
-            key=lambda row: (-row["rank_score"], -row["confidence"], -row["priority"], row["target_id"].lower()),
+            key=lambda row: (
+                -row["risk_adjusted_score"],
+                -row["success_probability"],
+                -row["rank_score"],
+                -row["confidence"],
+                -row["priority"],
+                row["target_id"].lower(),
+            ),
         )
+        if budget is not None:
+            remaining = max(0.0, float(budget))
+            for row in ranked:
+                est_cost = self._as_float(row["score_explanation"].get("estimated_cost"), 0.0)
+                row["selected_within_budget"] = est_cost <= remaining
+                if row["selected_within_budget"]:
+                    remaining -= est_cost
+        else:
+            for row in ranked:
+                row["selected_within_budget"] = True
+
         matrix = []
         for row in ranked:
             dim = row["dimensions"]
@@ -439,6 +511,10 @@ class PortfolioEngine:
                     "rank_score": row["rank_score"],
                     "confidence": row["confidence"],
                     "missing_data_penalty": row["missing_data_penalty"],
+                    "success_probability": row["success_probability"],
+                    "risk_adjusted_score": row["risk_adjusted_score"],
+                    "expected_value": row["expected_value"],
+                    "selected_within_budget": row["selected_within_budget"],
                 }
             )
 
@@ -508,14 +584,14 @@ class PortfolioEngine:
         top_candidate = comparison["ranked_summary"][0] if comparison["ranked_summary"] else None
         rules = dict(self.DEFAULT_DECISION_RULES)
         evidence_conf = float(top_candidate["confidence"]) if top_candidate else 0.0
-        translational = float(top_candidate["dimensions"]["translational_evidence"]) if top_candidate else 0.0
+        success_probability = float(top_candidate.get("success_probability", 0.0)) if top_candidate else 0.0
         risk_burden = float(top_candidate["dimensions"]["risk_burden"]) if top_candidate else 100.0
         milestone_completion = float(dashboard["milestone_metrics"]["completion_pct"]) / 100.0
         blockers = dashboard["milestone_metrics"]["blocker_count"]
 
         checks = {
             "min_evidence_confidence": evidence_conf >= rules["min_evidence_confidence"],
-            "min_translational_score": translational >= rules["min_translational_score"],
+            "min_success_probability": success_probability >= rules["min_success_probability"],
             "max_risk_tolerance": risk_burden <= rules["max_risk_burden"],
             "milestone_gate_completion": milestone_completion >= rules["min_milestone_completion"],
             "no_blocked_milestones": blockers == 0,
@@ -550,7 +626,7 @@ class PortfolioEngine:
 
         narrative = (
             f"Recommendation {recommendation}: checks passed {pass_count}/{len(checks)}. "
-            f"Evidence confidence={evidence_conf:.2f}, translational score={translational:.1f}, "
+            f"Evidence confidence={evidence_conf:.2f}, success probability={success_probability:.2f}, "
             f"risk burden={risk_burden:.1f}, milestone completion={milestone_completion*100:.1f}%."
         )
 
@@ -661,6 +737,48 @@ class PortfolioEngine:
             stage = p.get("stage") or "unknown"
             counter[stage] = counter.get(stage, 0) + 1
         return [{"stage": stage, "count": count} for stage, count in sorted(counter.items())]
+
+    def optimize_portfolio(
+        self,
+        portfolio_id: str,
+        budget: float,
+        covariance_penalty: float = 0.05,
+    ) -> Dict[str, Any]:
+        projects = self.list_projects(portfolio_id)
+        ranked_projects: List[Dict[str, Any]] = []
+        for project in projects:
+            comparison = self.compare_candidates(project["id"])
+            top = comparison["ranked_summary"][0] if comparison["ranked_summary"] else None
+            if not top:
+                continue
+            score = float(top.get("risk_adjusted_score", 0.0))
+            corr_penalty = covariance_penalty * self._project_correlation_factor(project, top)
+            ranked_projects.append(
+                {
+                    "project_id": project["id"],
+                    "project_name": project.get("name", ""),
+                    "top_candidate_id": top["candidate_id"],
+                    "success_probability": float(top.get("success_probability", 0.0)),
+                    "expected_value": float(top.get("expected_value", 0.0)),
+                    "estimated_cost": self._as_float(top.get("score_explanation", {}).get("estimated_cost"), 0.0),
+                    "risk_adjusted_score": round(score - corr_penalty, 4),
+                }
+            )
+
+        ranked_projects.sort(key=lambda item: (-item["risk_adjusted_score"], -item["expected_value"], item["project_name"].lower()))
+        selected: List[Dict[str, Any]] = []
+        remaining_budget = max(0.0, float(budget))
+        for item in ranked_projects:
+            if item["estimated_cost"] <= remaining_budget:
+                selected.append(item)
+                remaining_budget -= item["estimated_cost"]
+        return {
+            "portfolio_id": portfolio_id,
+            "budget": round(float(budget), 4),
+            "remaining_budget": round(remaining_budget, 4),
+            "ranked_projects": ranked_projects,
+            "selected_projects": selected,
+        }
 
     def list_recent_activity(self, limit: int = 40) -> List[Dict[str, Any]]:
         with sqlite3.connect(self.db_path) as conn:
@@ -830,6 +948,173 @@ class PortfolioEngine:
             "data_quality_confidence": round(quality, 2),
             "risk_burden": round(risk, 2),
         }
+
+    def score_asset_success(self, asset: Dict[str, Any], model: Optional[Any] = None) -> Dict[str, Any]:
+        features = self._extract_success_features(asset)
+        if model:
+            return self._score_asset_success_with_model(features, model)
+        return self._score_asset_success_heuristic(features)
+
+    def _extract_success_features(self, asset: Dict[str, Any]) -> Dict[str, Any]:
+        project = asset.get("project", {})
+        candidate = asset.get("candidate", {})
+        snapshot = asset.get("snapshot", {})
+        dims = asset.get("dimensions", {})
+        confidence = self._as_float(asset.get("confidence"), 0.0)
+        completeness = self._as_float(asset.get("completeness"), 0.0)
+        component_scores = snapshot.get("component_scores", {})
+        key_findings = snapshot.get("key_findings", {})
+        highlights = key_findings.get("highlights", []) if isinstance(key_findings, dict) else []
+        evidence_volume = self._as_float(snapshot.get("evidence_volume"), float(len(highlights)))
+
+        translational_norm = max(0.0, min(1.0, self._as_float(dims.get("translational_evidence"), 0.0) / 100.0))
+        clinical_norm = max(0.0, min(1.0, self._as_float(dims.get("clinical_evidence_maturity"), 0.0) / 100.0))
+        quality_norm = max(0.0, min(1.0, self._as_float(dims.get("data_quality_confidence"), 0.0) / 100.0))
+        biomarker_robustness = max(
+            0.0,
+            min(
+                1.0,
+                (0.35 * translational_norm) + (0.2 * clinical_norm) + (0.2 * confidence) + (0.15 * completeness) + (0.1 * quality_norm),
+            ),
+        )
+        variant_sensitivity = max(0.0, min(1.0, self._infer_variant_sensitivity(component_scores, key_findings, translational_norm)))
+        prior_translational_evidence = max(0.0, min(1.0, (translational_norm * 0.7) + (clinical_norm * 0.3)))
+        assay_strength = max(0.0, min(1.0, quality_norm))
+        target_class = self._infer_target_class(candidate.get("target_id", ""))
+        stage = str(project.get("stage", "")).strip().lower() or self._normalize_phase(snapshot.get("trial_status", ""))
+        modality = str(project.get("modality", "")).strip().lower() or "other"
+        indication = str(project.get("indication", "")).strip().lower()
+        npv = self._as_float(component_scores.get("npv"), 120.0)
+        cost = self._as_float(component_scores.get("cost"), 35.0)
+        return {
+            "target_class": target_class,
+            "biomarker_robustness": round(biomarker_robustness, 4),
+            "variant_sensitivity": round(variant_sensitivity, 4),
+            "modality": modality,
+            "phase": stage or "other",
+            "indication": indication,
+            "assay_strength": round(assay_strength, 4),
+            "prior_translational_evidence": round(prior_translational_evidence, 4),
+            "npv": round(npv, 4),
+            "cost": round(cost, 4),
+            "evidence_volume": round(evidence_volume, 2),
+        }
+
+    def _score_asset_success_with_model(self, features: Dict[str, Any], model: Any) -> Dict[str, Any]:
+        prediction = model.predict_proba([features])[0][1]
+        success_probability = max(0.0, min(1.0, self._as_float(prediction, 0.0)))
+        expected_value = (success_probability * features["npv"]) - features["cost"]
+        risk_adjusted = expected_value - ((1.0 - success_probability) * 8.0)
+        return {
+            "success_probability": round(success_probability, 4),
+            "risk_adjusted_score": round(risk_adjusted, 4),
+            "expected_value": round(expected_value, 4),
+            "biomarker_robustness": features["biomarker_robustness"],
+            "variant_sensitivity": features["variant_sensitivity"],
+            "explanation": {"model": "trained", "features": features, "estimated_cost": features["cost"]},
+        }
+
+    def _score_asset_success_heuristic(self, features: Dict[str, Any]) -> Dict[str, Any]:
+        coeffs = self.SUCCESS_MODEL_COEFFICIENTS
+        target_weight = coeffs["target_class"].get(features["target_class"], coeffs["target_class"]["other"])
+        modality_weight = coeffs["modality"].get(features["modality"], coeffs["modality"]["other"])
+        phase_weight = coeffs["phase"].get(features["phase"], coeffs["phase"]["other"])
+        interaction = features["biomarker_robustness"] * features["variant_sensitivity"]
+        contributions = {
+            "intercept": coeffs["intercept"],
+            "target_class": target_weight,
+            "biomarker_robustness": coeffs["biomarker_robustness"] * features["biomarker_robustness"],
+            "variant_sensitivity": coeffs["variant_sensitivity"] * features["variant_sensitivity"],
+            "interaction_biomarker_variant": coeffs["interaction_biomarker_variant"] * interaction,
+            "prior_translational_evidence": coeffs["prior_translational_evidence"] * features["prior_translational_evidence"],
+            "assay_strength": coeffs["assay_strength"] * features["assay_strength"],
+            "modality": modality_weight,
+            "phase": phase_weight,
+        }
+        logit = sum(contributions.values())
+        success_probability = self._sigmoid(logit)
+        expected_value = (success_probability * features["npv"]) - features["cost"]
+        risk_adjusted = expected_value - ((1.0 - success_probability) * 10.0)
+        return {
+            "success_probability": round(success_probability, 4),
+            "risk_adjusted_score": round(risk_adjusted, 4),
+            "expected_value": round(expected_value, 4),
+            "biomarker_robustness": features["biomarker_robustness"],
+            "variant_sensitivity": features["variant_sensitivity"],
+            "explanation": {
+                "model": "fallback_logistic_heuristic",
+                "features": features,
+                "feature_contributions": {k: round(v, 4) for k, v in contributions.items()},
+                "estimated_cost": features["cost"],
+            },
+        }
+
+    def _infer_target_class(self, target_id: str) -> str:
+        token = str(target_id or "").upper()
+        if any(mark in token for mark in ("EGFR", "ALK", "BRAF", "KRAS", "PI3K", "MAPK", "JAK")):
+            return "kinase"
+        if any(mark in token for mark in ("GPR", "CCR", "CXCR", "DRD", "HTR")):
+            return "gpcr"
+        if any(mark in token for mark in ("SCN", "KCN", "CACN")):
+            return "ion_channel"
+        if any(mark in token for mark in ("MYC", "STAT", "TP53", "FOXO")):
+            return "transcription_factor"
+        return "other"
+
+    def _normalize_phase(self, phase: str) -> str:
+        text = str(phase or "").strip().lower()
+        if "phase 4" in text or "phase4" in text:
+            return "phase 4"
+        if "phase 3" in text or "phase3" in text:
+            return "phase 3"
+        if "phase 2" in text or "phase2" in text:
+            return "phase 2"
+        if "phase 1" in text or "phase1" in text:
+            return "phase 1"
+        if "preclin" in text:
+            return "preclinical"
+        return "discovery" if text in {"", "unknown"} else text
+
+    def _infer_variant_sensitivity(
+        self,
+        component_scores: Dict[str, Any],
+        key_findings: Dict[str, Any],
+        translational_norm: float,
+    ) -> float:
+        explicit = component_scores.get("variant_sensitivity")
+        if explicit is not None:
+            value = self._as_float(explicit, translational_norm)
+            return value if value <= 1.0 else value / 100.0
+        if isinstance(key_findings, dict):
+            for key in ("variant_sensitivity", "variant_robustness"):
+                if key in key_findings:
+                    value = self._as_float(key_findings.get(key), translational_norm)
+                    return value if value <= 1.0 else value / 100.0
+        return max(0.0, min(1.0, translational_norm))
+
+    def _project_correlation_factor(self, project: Dict[str, Any], top_candidate: Dict[str, Any]) -> float:
+        modality = str(project.get("modality", "")).strip().lower()
+        indication = str(project.get("indication", "")).strip().lower()
+        class_factor = 1.0 if top_candidate.get("score_explanation", {}).get("features", {}).get("target_class") == "kinase" else 0.7
+        modality_factor = 1.0 if modality == "small molecule" else 0.8
+        indication_factor = 1.0 if indication else 0.75
+        return round(class_factor * modality_factor * indication_factor, 4)
+
+    def _project_by_id(self, project_id: str) -> Dict[str, Any]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone()
+        return dict(row) if row else {}
+
+    def _sigmoid(self, value: float) -> float:
+        value = max(-30.0, min(30.0, float(value)))
+        return 1.0 / (1.0 + math.exp(-value))
+
+    def _as_float(self, value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float(default)
 
     def _dimension_strengths(self, dims: Dict[str, float]) -> List[str]:
         ranked = sorted(dims.items(), key=lambda kv: kv[1], reverse=True)

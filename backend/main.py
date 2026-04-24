@@ -7,9 +7,11 @@ from uuid import uuid4
 from fastapi import FastAPI, Request, Response
 
 from backend.api.routes.audit import router as audit_router
+from backend.api.routes.academic_models import router as academic_models_router
 from backend.api.routes.auth import router as auth_router
 from backend.api.routes.health import router as health_router
 from backend.api.routes.jobs import router as jobs_router
+from backend.api.routes.multiomics import router as multiomics_router
 from backend.api.routes.projects import router as projects_router
 from backend.api.routes.reliability import router as reliability_router
 from backend.core.config import get_settings
@@ -57,6 +59,8 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix=settings.api_prefix)
     app.include_router(projects_router, prefix=settings.api_prefix)
     app.include_router(jobs_router, prefix=settings.api_prefix)
+    app.include_router(multiomics_router, prefix=settings.api_prefix)
+    app.include_router(academic_models_router, prefix=settings.api_prefix)
     app.include_router(audit_router, prefix=settings.api_prefix)
     app.include_router(reliability_router, prefix=settings.api_prefix)
     return app

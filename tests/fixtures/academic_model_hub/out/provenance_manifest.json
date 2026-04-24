@@ -1,0 +1,12 @@
+{
+  "paper_title": "FlexPose: predicting flexible protein-ligand structure",
+  "paper_year": 2023,
+  "repo_url": "https://github.com/tiejundong/FlexPose",
+  "commit_or_release": "unknown",
+  "runtime_mode": "native",
+  "python_version": "3.10+",
+  "torch_version": "1.10+",
+  "device": "cpu",
+  "request_hash": "f52027935554907a6bb805e793928b522f6798efbe7c4de0e6d16e637502ddba",
+  "timestamp_utc": "2026-04-24T12:49:38.706969+00:00"
+}

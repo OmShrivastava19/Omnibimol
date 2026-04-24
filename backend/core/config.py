@@ -43,6 +43,12 @@ class Settings(BaseSettings):
     docking_timeout_seconds: int = Field(default=900, ge=30)
     docking_vina_binary: str = Field(default="vina")
     docking_worker_concurrency: int = Field(default=1, ge=1, le=16)
+    multiomics_enabled: bool = Field(default=True)
+    multiomics_calibration_a: float = Field(default=1.0)
+    multiomics_calibration_b: float = Field(default=0.0)
+    multiomics_transcriptomics_weight: float = Field(default=0.45, ge=0.0, le=1.0)
+    multiomics_genomics_weight: float = Field(default=0.35, ge=0.0, le=1.0)
+    multiomics_proteomics_weight: float = Field(default=0.20, ge=0.0, le=1.0)
 
     backend_api_url: str = Field(default="http://localhost:8000")
 

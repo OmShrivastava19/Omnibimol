@@ -5,7 +5,7 @@ import asyncio
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import os
 import time
 from datetime import datetime
@@ -15,7 +15,9 @@ import base64
 import gzip
 import hashlib
 import httpx
+import requests
 import textwrap
+import io
 from xml.etree import ElementTree as ET
 import html as html_lib
 import sys
@@ -32,6 +34,7 @@ from wet_lab_handoff_engine import WetLabHandoffEngine
 from portfolio_engine import PortfolioEngine
 from backend.core.config import get_settings
 from backend.services.multiomics_fusion import FusionSettings, MultiOmicsFusionService
+from academic_model_hub.ui_helpers import available_downloads, error_hint, push_run_history, status_color
 try:
     from streamlit.runtime.scriptrunner.script_runner import RerunException
 except Exception:
@@ -983,7 +986,7 @@ def main():
     """, unsafe_allow_html=True)
     
     # Header with banner
-    st.image("icons/Omnibimol_banner.png", width='stretch')
+    st.image("icons/Omnibimol_banner.png")
     
     # Initialize cache and API client
     if 'cache_manager' not in st.session_state:
@@ -994,6 +997,13 @@ def main():
     if "portfolio_engine" not in st.session_state:
         st.session_state.portfolio_engine = PortfolioEngine()
     
+    page_param_map = {
+        "academic-models": "🧠 Academic Models",
+    }
+    page_param = str(st.query_params.get("page", "")).strip().lower() if hasattr(st, "query_params") else ""
+    if page_param in page_param_map:
+        st.session_state.current_page = page_param_map[page_param]
+
     # Sidebar
     with st.sidebar:
         st.header("🧬 OmniBiMol")
@@ -1004,6 +1014,7 @@ def main():
             "Sequence Analysis",
             "Whole Genome Sequencing",
             "Drugs & Clinical Trials",
+            "🧠 Academic Models",
             "📁 Portfolio Mode",
             "🎯 Target Prioritization",
             "🧬 Variant-to-Therapy",
@@ -1067,6 +1078,9 @@ def main():
         return
     elif st.session_state.get('current_page') == "Drugs & Clinical Trials":
         render_drugs_clinical_trials_page()
+        return
+    elif st.session_state.get('current_page') == "🧠 Academic Models":
+        render_academic_models_page()
         return
     elif st.session_state.get('current_page') == "📁 Portfolio Mode":
         render_portfolio_mode_page()
@@ -6661,6 +6675,471 @@ def _build_target_scoring_payload(target_query: str) -> Optional[Dict]:
         "multiomics_fusion": multiomics_prediction,
     }
     return payload
+
+
+def _persist_uploaded_file(uploaded_file, *, subdir: str = "uploads") -> str:
+    base = os.path.join("outputs", "academic_models", subdir)
+    os.makedirs(base, exist_ok=True)
+    target = os.path.join(base, uploaded_file.name)
+    with open(target, "wb") as handle:
+        handle.write(uploaded_file.getbuffer())
+    return target
+
+
+def _validate_academic_payload(model_name: str, payload: Dict) -> List[str]:
+    errors: List[str] = []
+    if model_name == "flexpose":
+        if not payload.get("protein_path"):
+            errors.append("FlexPose requires a protein path.")
+        if not payload.get("ligand"):
+            errors.append("FlexPose requires ligand as SMILES or file path.")
+        if not payload.get("ref_pocket_center"):
+            errors.append("FlexPose requires reference pocket center path.")
+    elif model_name == "deepathnet":
+        for key in ("input_table_path", "pretrained_model_path", "config_path"):
+            if not payload.get(key):
+                errors.append(f"DeePathNet requires `{key}`.")
+    elif model_name == "crispr-dipoff":
+        if not payload.get("guide_rna"):
+            errors.append("CRISPR-DIPOFF requires guide RNA.")
+        if not payload.get("candidate_sites"):
+            errors.append("CRISPR-DIPOFF requires at least one candidate site.")
+    elif model_name == "deepdtagen":
+        if not payload.get("drug_input", {}).get("smiles"):
+            errors.append("DeepDTAGen requires drug SMILES.")
+        if not payload.get("target_input", {}).get("sequence"):
+            errors.append("DeepDTAGen requires target sequence.")
+    return errors
+
+
+def _render_flexpose_prediction(prediction: Dict, confidence: Dict, artifacts: Dict) -> None:
+    runtime = prediction.get("runtime_metadata", {}) if isinstance(prediction, dict) else {}
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Affinity", f"{float(prediction.get('affinity', 0.0)):.3f}")
+    c2.metric("Raw confidence", f"{float(confidence.get('raw_confidence', 0.0)):.3f}")
+    c3.metric("Normalized confidence", f"{float(confidence.get('normalized_confidence', 0.0)):.3f}")
+    c4.metric("Runtime (s)", f"{float(runtime.get('duration_seconds', 0.0)):.2f}")
+    st.caption(f"Device: `{runtime.get('device', 'n/a')}`")
+    quick = []
+    if artifacts.get("pose_path"):
+        quick.append(("Pose structure", artifacts["pose_path"]))
+    if artifacts.get("csv_path"):
+        quick.append(("Prediction CSV", artifacts["csv_path"]))
+    if quick:
+        st.markdown("**Quick artifacts**")
+        for label, path in quick:
+            st.code(f"{label}: {path}")
+
+
+def _render_status_badge(label: str, value: str) -> None:
+    color = status_color(value)
+    st.markdown(
+        (
+            f"<span style='font-weight:600'>{label}: </span>"
+            f"<span style='display:inline-block;padding:0.2rem 0.5rem;border-radius:0.5rem;"
+            f"background:{color};color:#FFFFFF;'>{value}</span>"
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def _render_deepathnet_prediction(prediction: Dict) -> None:
+    summary = prediction.get("cohort_summary", {}) if isinstance(prediction, dict) else {}
+    rows = prediction.get("per_sample_predictions", []) if isinstance(prediction, dict) else []
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Samples", int(summary.get("n_samples", len(rows) or 0)))
+    c2.metric("Mean response", f"{float(summary.get('mean_response', 0.0)):.3f}")
+    c3.metric("Std response", f"{float(summary.get('std_response', 0.0)):.3f}")
+    top_n = int(st.slider("Top pathways to show", min_value=3, max_value=20, value=8, key="deepathnet_topn"))
+    pathways = prediction.get("pathway_importance", []) if isinstance(prediction, dict) else []
+    if pathways:
+        p_df = pd.DataFrame(pathways).sort_values("importance", ascending=False).head(top_n)
+        fig = px.bar(
+            p_df,
+            x="pathway",
+            y="importance",
+            title="Pathway importance",
+            color_discrete_sequence=["#005A9C"],
+        )
+        st.plotly_chart(fig, width="stretch")
+    else:
+        st.info("No pathway importance data returned.")
+    if rows:
+        table = pd.DataFrame(rows)
+        sort_by = st.selectbox("Sort per-sample table by", list(table.columns), index=1 if len(table.columns) > 1 else 0, key="deepathnet_sort_col")
+        st.dataframe(table.sort_values(sort_by, ascending=False), hide_index=True)
+
+
+def _render_crispr_prediction(prediction: Dict) -> None:
+    model_pred = prediction.get("model_prediction", {}) if isinstance(prediction, dict) else {}
+    ranked = model_pred.get("ranked_candidates", []) if isinstance(model_pred, dict) else []
+    if ranked:
+        rank_df = pd.DataFrame(ranked)
+        max_risk = float(st.slider("Minimum risk score", min_value=0.0, max_value=1.0, value=0.0, step=0.05, key="crispr_min_risk"))
+        filtered = rank_df[rank_df["offtarget_score"] >= max_risk]
+        st.dataframe(filtered.sort_values("offtarget_score", ascending=False), hide_index=True)
+    else:
+        st.info("No ranked off-target candidates returned.")
+
+    attr_map = prediction.get("attribution_map", {}) if isinstance(prediction, dict) else {}
+    if attr_map:
+        values = [float(v) for _, v in sorted(attr_map.items(), key=lambda x: int(x[0]))]
+        heat_df = pd.DataFrame({"position": list(range(1, len(values) + 1)), "attribution": values})
+        fig = px.density_heatmap(
+            heat_df,
+            x="position",
+            y=["attribution"] * len(heat_df),
+            z="attribution",
+            color_continuous_scale=[[0.0, "#F5F5F5"], [0.5, "#007A7A"], [1.0, "#003C3C"]],
+        )
+        fig.update_layout(title="Guide attribution heatmap", yaxis_title="")
+        st.plotly_chart(fig, width="stretch")
+    else:
+        st.caption("Attribution heatmap unavailable for this run.")
+
+
+def _render_deepdtagen_prediction(prediction: Dict, confidence: Dict, payload: Dict) -> None:
+    task_mode = str(prediction.get("task_mode") or payload.get("task_mode", "both"))
+    generation = confidence.get("generation_summary", {}) if isinstance(confidence, dict) else {}
+    badges = []
+    badges.append(f"Task mode: `{task_mode}`")
+    if generation:
+        badges.append(f"Valid: `{generation.get('valid_count', 0)}`")
+        badges.append(f"Unique: `{generation.get('unique_count', 0)}`")
+        badges.append(f"Requested: `{generation.get('requested', 0)}`")
+    st.markdown(" | ".join(badges))
+
+    if task_mode in {"affinity", "both"} and prediction.get("affinity_score") is not None:
+        st.metric("Affinity score", f"{float(prediction.get('affinity_score', 0.0)):.3f}")
+    if task_mode in {"generate", "both"}:
+        molecules = prediction.get("generated_molecules", [])
+        if molecules:
+            m_df = pd.DataFrame({"generated_smiles": molecules})
+            st.dataframe(m_df, hide_index=True)
+        else:
+            st.info("No generated molecules returned.")
+
+
+def _render_academic_result(result: Dict) -> None:
+    status = result.get("status", "error")
+    st.subheader(f"Run Result: {status.upper()}")
+    provenance = result.get("provenance", {}) if isinstance(result.get("provenance"), dict) else {}
+    request_id = provenance.get("request_id") or result.get("_client_meta", {}).get("request_id")
+    if request_id:
+        st.caption(f"Backend request id: `{request_id}`")
+    tabs = st.tabs(["Prediction", "Explanations", "Confidence", "Artifacts", "Provenance", "Errors", "Raw JSON"])
+    with tabs[0]:
+        prediction = result.get("prediction", {})
+        confidence = result.get("confidence", {})
+        artifacts = result.get("artifacts", {})
+        model_name = str(result.get("model", "")).lower()
+        payload = provenance.get("payload") if isinstance(provenance.get("payload"), dict) else {}
+        if model_name == "flexpose":
+            _render_flexpose_prediction(prediction, confidence, artifacts)
+        elif model_name == "deepathnet":
+            _render_deepathnet_prediction(prediction)
+        elif model_name == "crispr-dipoff":
+            _render_crispr_prediction(prediction)
+        elif model_name == "deepdtagen":
+            _render_deepdtagen_prediction(prediction, confidence, payload)
+        st.json(prediction, expanded=1)
+    with tabs[1]:
+        st.json(result.get("explanations", {}), expanded=1)
+    with tabs[2]:
+        st.json(result.get("confidence", {}), expanded=1)
+    with tabs[3]:
+        artifacts = result.get("artifacts", {})
+        st.json(artifacts, expanded=1)
+        downloads = available_downloads(result)
+        if downloads:
+            for label, path in downloads:
+                if os.path.exists(path):
+                    with open(path, "rb") as handle:
+                        st.download_button(label, data=handle.read(), file_name=os.path.basename(path), key=f"dl_{label}_{path}")
+                else:
+                    st.caption(f"{label}: unavailable ({path})")
+        else:
+            st.info("No downloadable artifacts were generated for this run.")
+    with tabs[4]:
+        st.json(result.get("provenance", {}), expanded=1)
+    with tabs[5]:
+        errors = result.get("errors", []) or []
+        if not errors:
+            st.success("No errors reported.")
+        for err in errors:
+            code = str(err.get("code", "UNKNOWN"))
+            hint = error_hint(code)
+            st.error(f"{code}: {err.get('message', 'Unknown error')}")
+            st.caption(
+                f"Category: {hint['category']} | Fixability: {hint.get('fixability', 'depends')} | Hint: {hint['hint']}"
+            )
+            if err.get("details"):
+                st.json(err.get("details"), expanded=1)
+    with tabs[6]:
+        st.json(result, expanded=2)
+
+
+def render_academic_models_page():
+    st.header("🧠 Academic Models")
+    st.caption("Research support only. Outputs are not clinical recommendations.")
+    api_client = st.session_state.api_client
+    if "academic_run_history" not in st.session_state:
+        st.session_state.academic_run_history = []
+
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        if st.button("Refresh Model Catalog", key="refresh_academic_models"):
+            st.session_state.pop("academic_models_cache", None)
+    with col_b:
+        if st.button("Run Deep Health Check", key="academic_deep_health"):
+            try:
+                st.session_state["academic_health_deep"] = api_client.get_academic_models_health(depth="deep")
+            except Exception as exc:
+                st.session_state["academic_health_deep"] = {"error": str(exc)}
+
+    try:
+        models = st.session_state.get("academic_models_cache") or api_client.get_academic_models()
+        st.session_state["academic_models_cache"] = models
+        shallow_health = api_client.get_academic_models_health(depth="shallow")
+    except Exception as exc:
+        st.error(f"Unable to load academic model metadata: {exc}")
+        return
+
+    if not models:
+        st.warning("No academic models are currently discoverable from the backend.")
+        return
+
+    st.subheader("Model Discovery")
+    if st.session_state.get("academic_health_deep"):
+        with st.expander("Deep Health Diagnostics", expanded=False):
+            st.json(st.session_state.get("academic_health_deep"), expanded=1)
+    for model in models:
+        name = model.get("model_name", "unknown")
+        health = (shallow_health or {}).get(name, {})
+        with st.expander(f"{name} | {model.get('paper_title', 'paper unknown')}", expanded=False):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.write(f"Runtime mode: `{model.get('runtime_mode', 'n/a')}`")
+                st.write(f"Supported tasks: {', '.join(model.get('supported_tasks', [])) or 'n/a'}")
+                st.write(f"Input schema: `{model.get('input_schema_name', 'v1')}`")
+            with c2:
+                st.write(f"Explanation support: `{model.get('explanation_support')}`")
+                st.write(f"Artifact support: `{model.get('artifact_support')}`")
+                _render_status_badge("Health status", str(health.get("status", "unknown")))
+            st.caption(f"Repository: {model.get('repo_url', 'n/a')}")
+
+    st.subheader("Submit Prediction")
+    model_names = [m.get("model_name") for m in models if m.get("model_name")]
+    selected_model = st.selectbox("Model", model_names, key="academic_selected_model")
+    runtime_mode = st.selectbox("Runtime mode", ["native", "container"], index=0, key="academic_runtime_mode")
+    output_dir = st.text_input("Output directory", value=os.path.join("outputs", "academic_models"), key="academic_output_dir")
+    request_id = st.text_input("Request ID (optional)", value="", key="academic_request_id")
+    with st.expander("Advanced options"):
+        timeout_seconds = st.number_input("Timeout seconds", min_value=30, max_value=3600, value=240, step=30, key="academic_timeout")
+
+    payload: Dict = {"runtime_mode": runtime_mode, "output_dir": output_dir, "timeout_seconds": int(timeout_seconds)}
+    if request_id.strip():
+        payload["request_id"] = request_id.strip()
+
+    if selected_model == "flexpose":
+        protein_upload = st.file_uploader("Protein PDB upload (optional)", type=["pdb"], key="flexpose_protein_upload")
+        protein_path = st.text_input("Protein path", key="flexpose_protein_path")
+        if protein_upload is not None:
+            protein_path = _persist_uploaded_file(protein_upload, subdir="flexpose")
+            st.caption(f"Uploaded protein saved to `{protein_path}`")
+        ligand_mode = st.radio("Ligand input", ["SMILES", "File path"], key="flexpose_ligand_mode", horizontal=True)
+        ligand = st.text_input("Ligand SMILES" if ligand_mode == "SMILES" else "Ligand file path", key="flexpose_ligand_value")
+        ref_center = st.text_input("Reference pocket center path", key="flexpose_ref_center")
+        device = st.text_input("Device", value="cpu", key="flexpose_device")
+        ensemble = st.number_input("Ensemble size", min_value=1, max_value=100, value=10, key="flexpose_ensemble")
+        minimization = st.checkbox("Energy minimization", value=True, key="flexpose_min")
+        payload.update(
+            {
+                "protein_path": protein_path,
+                "ligand": ligand,
+                "ref_pocket_center": ref_center,
+                "device": device,
+                "ensemble_size": int(ensemble),
+                "energy_minimization": bool(minimization),
+            }
+        )
+    elif selected_model == "deepathnet":
+        table_upload = st.file_uploader("Omics table CSV/TSV upload (optional)", type=["csv", "tsv"], key="deepathnet_table_upload")
+        input_table_path = st.text_input("Input table path", key="deepathnet_table_path")
+        if table_upload is not None:
+            input_table_path = _persist_uploaded_file(table_upload, subdir="deepathnet")
+            st.caption(f"Uploaded omics table saved to `{input_table_path}`")
+        task = st.selectbox("Task", ["drug_response"], key="deepathnet_task")
+        pretrained_model_path = st.text_input("Pretrained model path", key="deepathnet_weights")
+        config_path = st.text_input("Config path", key="deepathnet_config")
+        return_pathway_importance = st.checkbox("Return pathway importance", value=True, key="deepathnet_pathway")
+        return_gene_importance = st.checkbox("Return gene importance", value=False, key="deepathnet_gene")
+        payload.update(
+            {
+                "input_table_path": input_table_path,
+                "task": task,
+                "pretrained_model_path": pretrained_model_path,
+                "config_path": config_path,
+                "return_pathway_importance": bool(return_pathway_importance),
+                "return_gene_importance": bool(return_gene_importance),
+            }
+        )
+    elif selected_model == "crispr-dipoff":
+        guide_rna = st.text_input("Guide RNA", key="crispr_guide")
+        pam = st.selectbox("PAM", ["NGG", "NAG", "NNGRRT"], key="crispr_pam")
+        return_attr = st.checkbox("Return attributions", value=True, key="crispr_attr")
+        st.markdown("Candidate sites")
+        st.caption("Provide one or more candidate cut sites as table rows, or upload a CSV with sequence/chrom/pos/gene.")
+        default_sites = [{"sequence": "", "chrom": "", "pos": None, "gene": ""}]
+        uploaded_sites = st.file_uploader("Candidate sites CSV upload", type=["csv"], key="crispr_sites_csv")
+        if uploaded_sites is not None:
+            try:
+                uploaded_df = pd.read_csv(io.StringIO(uploaded_sites.getvalue().decode("utf-8")))
+                rename_map = {c.lower().strip(): c for c in uploaded_df.columns}
+                required = ["sequence", "chrom", "pos", "gene"]
+                if all(k in rename_map for k in required):
+                    uploaded_df = uploaded_df.rename(columns={rename_map[k]: k for k in required})
+                    default_sites = uploaded_df[required].to_dict(orient="records")
+                else:
+                    st.error("CSV must include columns: sequence, chrom, pos, gene.")
+            except Exception as exc:
+                st.error(f"Unable to parse candidate CSV: {exc}")
+        edited_sites = st.data_editor(
+            pd.DataFrame(default_sites),
+            key="crispr_sites_editor",
+            num_rows="dynamic",
+            hide_index=True,
+        )
+        candidate_sites = []
+        row_errors: List[str] = []
+        for idx, row in enumerate(edited_sites.fillna("").to_dict(orient="records")):
+            record = dict(row)
+            if not any(str(record.get(k, "")).strip() for k in ("sequence", "chrom", "pos", "gene")):
+                continue
+            seq = str(record.get("sequence", "")).strip().upper()
+            chrom = str(record.get("chrom", "")).strip()
+            gene = str(record.get("gene", "")).strip()
+            pos_raw = str(record.get("pos", "")).strip()
+            if not seq or not chrom or not gene or not pos_raw:
+                row_errors.append(f"Row {idx + 1}: all fields sequence/chrom/pos/gene are required.")
+                continue
+            if re.search(r"[^ACGT]", seq):
+                row_errors.append(f"Row {idx + 1}: sequence must contain only A/C/G/T.")
+                continue
+            try:
+                pos = int(float(pos_raw))
+            except Exception:
+                row_errors.append(f"Row {idx + 1}: pos must be an integer.")
+                continue
+            candidate_sites.append({"sequence": seq, "chrom": chrom, "pos": pos, "gene": gene})
+        if row_errors:
+            for row_error in row_errors[:8]:
+                st.warning(row_error)
+        with st.expander("Advanced: JSON candidate sites fallback", expanded=False):
+            sites_json = st.text_area(
+                "candidate_sites_json",
+                value='[{"sequence":"ACGTACGTACGTACGTACGT","chrom":"1","pos":1234,"gene":"GENE1"}]',
+                key="crispr_sites_json",
+                height=120,
+            )
+            if not candidate_sites and sites_json.strip():
+                try:
+                    candidate_sites = json.loads(sites_json)
+                except Exception:
+                    st.warning("Candidate sites JSON is invalid.")
+        payload.update(
+            {
+                "guide_rna": guide_rna,
+                "pam": pam,
+                "return_attributions": bool(return_attr),
+                "candidate_sites": candidate_sites,
+            }
+        )
+    elif selected_model == "deepdtagen":
+        smiles = st.text_input("Drug SMILES", key="deepdtagen_smiles")
+        target_seq = st.text_area("Target sequence", key="deepdtagen_target_seq")
+        target_id = st.text_input("Target ID", value="EGFR", key="deepdtagen_target_id")
+        task_mode = st.selectbox("Task mode", ["affinity", "generate", "both"], index=2, key="deepdtagen_task_mode")
+        num_generate = st.number_input("Number to generate", min_value=1, max_value=200, value=20, key="deepdtagen_num")
+        payload.update(
+            {
+                "drug_input": {"smiles": smiles},
+                "target_input": {"sequence": target_seq, "target_id": target_id},
+                "task_mode": task_mode,
+                "num_generate": int(num_generate),
+            }
+        )
+
+    validation_errors = _validate_academic_payload(selected_model, payload)
+    if selected_model == "crispr-dipoff":
+        validation_errors.extend(row_errors)
+    if validation_errors:
+        for msg in validation_errors:
+            st.warning(msg)
+
+    left, right = st.columns([1, 1])
+    with left:
+        if st.button("Run Prediction", key="academic_run_prediction"):
+            if validation_errors:
+                st.warning("Fix validation errors before running prediction.")
+            else:
+                try:
+                    result = api_client.predict_academic_model(model_name=selected_model, payload=payload)
+                    st.session_state["academic_last_result"] = result
+                    st.session_state.academic_run_history = push_run_history(
+                        st.session_state.academic_run_history,
+                        result,
+                        selected_model,
+                        runtime_mode,
+                    )
+                except Exception as exc:
+                    st.session_state["academic_last_result"] = {
+                        "status": "error",
+                        "model": selected_model,
+                        "model_version": None,
+                        "source_paper": None,
+                        "input_schema_version": "v1",
+                        "prediction": {},
+                        "explanations": {},
+                        "artifacts": {},
+                        "confidence": {},
+                        "provenance": {},
+                        "errors": [{"code": "UPSTREAM_SCRIPT_FAILURE", "message": str(exc), "details": {}}],
+                    }
+    with right:
+        st.code(
+            f"curl -X POST {api_client.backend_api_url}/api/v1/academic-models/predict -H 'Content-Type: application/json' -d '{json.dumps({'model_name': selected_model, 'payload': payload})}'",
+            language="bash",
+        )
+        st.code(json.dumps(payload, indent=2), language="json")
+
+    last_result = st.session_state.get("academic_last_result")
+    if last_result:
+        _render_academic_result(last_result)
+
+    st.subheader("Run History")
+    history = st.session_state.get("academic_run_history", [])
+    if not history:
+        st.info("No academic model runs yet in this session.")
+    else:
+        history_df = pd.DataFrame(
+            [
+                {
+                    "timestamp": row.get("timestamp"),
+                    "model": row.get("model"),
+                    "status": row.get("status"),
+                    "request_hash": row.get("request_hash"),
+                    "runtime_mode": row.get("runtime_mode"),
+                    "request_id": row.get("request_id"),
+                }
+                for row in history
+            ]
+        )
+        st.dataframe(history_df)
+        choice = st.selectbox("Reopen run", ["(none)"] + [f"{i+1}. {h.get('model')} {h.get('status')}" for i, h in enumerate(history)], key="academic_reopen_choice")
+        if choice != "(none)":
+            idx = int(choice.split(".")[0]) - 1
+            st.session_state["academic_last_result"] = history[idx]["result"]
 
 
 def render_portfolio_mode_page():

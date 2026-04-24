@@ -4,7 +4,7 @@ import httpx
 import pandas as pd
 import streamlit as st
 import asyncio
-from typing import List, Dict
+from typing import Any, List, Dict
 import os
 import re
 import html
@@ -1869,6 +1869,95 @@ class ProteinAPIClient:
             response.raise_for_status()
             return response.json()
 
+    def _request_backend_json_with_metadata(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: Dict | None = None,
+        timeout: float = 60.0,
+    ) -> Dict[str, Any]:
+        if not self.backend_api_url:
+            raise RuntimeError("Backend API URL is not configured")
+
+        url = f"{self.backend_api_url}{path}"
+        with httpx.Client(timeout=timeout) as client:
+            response = client.request(
+                method,
+                url,
+                json=json_body,
+                headers=self._build_backend_headers(),
+            )
+            response.raise_for_status()
+            return {
+                "body": response.json(),
+                "status_code": response.status_code,
+                "headers": dict(response.headers),
+            }
+
+    def _classify_academic_exception(self, exc: Exception) -> Dict[str, str]:
+        if isinstance(exc, httpx.TimeoutException):
+            return {
+                "code": "UPSTREAM_TIMEOUT",
+                "message": "The academic model request timed out before completion.",
+            }
+        if isinstance(exc, httpx.RequestError):
+            return {
+                "code": "BACKEND_UNREACHABLE",
+                "message": "Could not reach the backend API. Check BACKEND_API_URL and service health.",
+            }
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code if exc.response is not None else None
+            if status in {429, 503, 504}:
+                msg = "Backend is temporarily unavailable or overloaded."
+            elif status == 413:
+                msg = "Payload too large. Reduce upload size or candidate count."
+            elif status and 400 <= status < 500:
+                msg = "Backend rejected the request due to invalid or unsupported input."
+            else:
+                msg = "Backend returned an unexpected server error."
+            return {
+                "code": "ACADEMIC_HTTP_ERROR",
+                "message": f"{msg} (HTTP {status if status is not None else 'unknown'})",
+            }
+        return {
+            "code": "ACADEMIC_UNKNOWN_ERROR",
+            "message": f"Unexpected academic model error: {exc}",
+        }
+
+    def _should_retry_academic_prediction(self, exc: Exception) -> bool:
+        if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout)):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+            return exc.response.status_code in {429, 503, 504}
+        return False
+
+    def _inject_academic_response_metadata(self, result: Dict, metadata: Dict[str, Any], *, model_name: str, payload: Dict) -> Dict:
+        response = dict(result or {})
+        provenance = response.get("provenance", {}) if isinstance(response.get("provenance"), dict) else {}
+        headers = metadata.get("headers", {}) if isinstance(metadata.get("headers"), dict) else {}
+        request_id = headers.get("x-request-id") or headers.get("X-Request-Id")
+        if request_id and "request_id" not in provenance:
+            provenance["request_id"] = request_id
+        response["provenance"] = provenance
+        response["_client_meta"] = {
+            "request_id": request_id,
+            "model_name": model_name,
+            "runtime_mode": payload.get("runtime_mode"),
+            "request_hash": provenance.get("request_hash"),
+            "status": response.get("status"),
+            "http_status": metadata.get("status_code"),
+        }
+        logger.info(
+            "academic_model_predict completed request_id=%s model_name=%s runtime_mode=%s request_hash=%s status=%s",
+            request_id or "-",
+            model_name,
+            payload.get("runtime_mode", "native"),
+            provenance.get("request_hash", "-"),
+            response.get("status", "unknown"),
+        )
+        return response
+
     def _check_real_docking_backend(self) -> None:
         readiness = self._request_backend_json("GET", "/api/v1/readyz", timeout=5.0)
         if not readiness.get("database_configured") or not readiness.get("redis_configured"):
@@ -1974,6 +2063,81 @@ class ProteinAPIClient:
 
     def poll_docking_job(self, job_id: int) -> Dict:
         return self._request_backend_json("GET", f"/api/v1/jobs/{job_id}")
+
+    def get_academic_models(self) -> List[Dict]:
+        """Fetch discoverable academic models and metadata."""
+        data = self._request_backend_json("GET", "/api/v1/academic-models/models", timeout=20.0)
+        if isinstance(data, list):
+            return data
+        return []
+
+    def get_academic_models_health(self, *, depth: str = "shallow", model_name: str | None = None) -> Dict:
+        """Fetch hub health at shallow or deep depth."""
+        query_parts = [f"depth={depth}"]
+        if model_name:
+            query_parts.append(f"model_name={model_name}")
+        suffix = "&".join(query_parts)
+        return self._request_backend_json("GET", f"/api/v1/academic-models/health?{suffix}", timeout=30.0)
+
+    def predict_academic_model(
+        self,
+        *,
+        model_name: str,
+        payload: Dict,
+        timeout: float = 300.0,
+        retry_once_on_network_error: bool = True,
+    ) -> Dict:
+        """
+        Submit academic model prediction.
+
+        Predict calls are not retried by default because they may trigger non-idempotent
+        upstream execution. An optional single retry is available for pre-flight connection
+        errors when explicitly requested by UI logic.
+        """
+        body = {"model_name": model_name, "payload": payload}
+        try:
+            metadata = self._request_backend_json_with_metadata(
+                "POST",
+                "/api/v1/academic-models/predict",
+                json_body=body,
+                timeout=min(timeout, 600.0),
+            )
+            return self._inject_academic_response_metadata(metadata.get("body", {}), metadata, model_name=model_name, payload=payload)
+        except Exception as exc:
+            if retry_once_on_network_error and self._should_retry_academic_prediction(exc):
+                metadata = self._request_backend_json_with_metadata(
+                    "POST",
+                    "/api/v1/academic-models/predict",
+                    json_body=body,
+                    timeout=min(timeout, 600.0),
+                )
+                return self._inject_academic_response_metadata(metadata.get("body", {}), metadata, model_name=model_name, payload=payload)
+            classified = self._classify_academic_exception(exc)
+            logger.warning(
+                "academic_model_predict failed model_name=%s runtime_mode=%s code=%s details=%s",
+                model_name,
+                payload.get("runtime_mode", "native"),
+                classified["code"],
+                str(exc),
+            )
+            return {
+                "status": "error",
+                "model": model_name,
+                "prediction": {},
+                "explanations": {},
+                "artifacts": {},
+                "confidence": {},
+                "provenance": {},
+                "errors": [{"code": classified["code"], "message": classified["message"], "details": {}}],
+                "_client_meta": {
+                    "request_id": None,
+                    "model_name": model_name,
+                    "runtime_mode": payload.get("runtime_mode"),
+                    "request_hash": None,
+                    "status": "error",
+                    "http_status": None,
+                },
+            }
 
     def normalize_docking_result(self, docking_result: Dict, *, fallback_reason: str | None = None) -> Dict:
         normalized = dict(docking_result or {})

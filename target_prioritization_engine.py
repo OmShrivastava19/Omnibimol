@@ -313,6 +313,15 @@ class TargetPrioritizationEngine:
         if not genetic_data:
             return self._missing_component("genetic", ["No genetic evidence available"])
 
+        fusion = genetic_data.get("multiomics_fusion", {})
+        fusion_prob = self._as_float(fusion.get("predicted_response_probability"))
+        fusion_uncertainty = self._as_float(fusion.get("uncertainty"))
+        fusion_prob_quality = (
+            self._clamp01(1.0 - fusion_uncertainty)
+            if fusion_uncertainty is not None
+            else None
+        )
+
         mutation = genetic_data.get("mutation_analysis", {})
         biomarkers = genetic_data.get("biomarker_detection", {})
         associations = genetic_data.get("disease_associations", {})
@@ -327,17 +336,33 @@ class TargetPrioritizationEngine:
         biomarker_support = self._clamp01(therapeutic_targets / 6.0)
         association_confidence = self._clamp01((high_confidence_assoc + 0.5 * moderate_assoc) / 6.0)
 
-        score = 100.0 * (0.40 * variant_burden + 0.30 * biomarker_support + 0.30 * association_confidence)
+        base_score = 100.0 * (0.40 * variant_burden + 0.30 * biomarker_support + 0.30 * association_confidence)
+        score = base_score
+        notes = [
+            f"Variant burden={variant_burden*100:.1f}%",
+            f"Biomarker support={biomarker_support*100:.1f}%",
+            f"Disease association confidence={association_confidence*100:.1f}%",
+        ]
+        source_quality = 0.7
+        risk_flags = [] if high_risk_variants > 0 else ["No high-risk variant signal"]
+
+        if fusion_prob is not None:
+            # Blend pathway-level multi-omics signal while preserving legacy genomics contribution.
+            score = (0.7 * base_score) + (0.3 * (self._clamp01(fusion_prob) * 100.0))
+            notes.append(
+                f"Fusion response probability={self._clamp01(fusion_prob)*100:.1f}%"
+            )
+        if fusion_prob_quality is not None:
+            source_quality = self._clamp01((0.75 * source_quality) + (0.25 * fusion_prob_quality))
+            if fusion_prob_quality < 0.45:
+                risk_flags.append("High uncertainty in multi-omics fusion evidence")
+
         return {
             "available": True,
             "score": round(self._clamp(score), 2),
-            "source_quality": 0.7,
-            "notes": [
-                f"Variant burden={variant_burden*100:.1f}%",
-                f"Biomarker support={biomarker_support*100:.1f}%",
-                f"Disease association confidence={association_confidence*100:.1f}%",
-            ],
-            "risk_flags": [] if high_risk_variants > 0 else ["No high-risk variant signal"],
+            "source_quality": source_quality,
+            "notes": notes,
+            "risk_flags": risk_flags,
         }
 
     def _score_ligandability(self, ligandability_data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -347,6 +372,7 @@ class TargetPrioritizationEngine:
         chembl = ligandability_data.get("chembl", {})
         docking = ligandability_data.get("docking", {})
         prediction = ligandability_data.get("binding_prediction", {})
+        fusion = ligandability_data.get("multiomics_fusion", {})
 
         known_ligands = len(chembl.get("ligands", [])) if chembl.get("available") else 0
         ligand_score = min(1.0, known_ligands / 15.0)
@@ -374,16 +400,30 @@ class TargetPrioritizationEngine:
         if docking.get("simulated"):
             flags.append("Docking evidence is simulated-only")
 
+        fusion_prob = self._as_float(fusion.get("predicted_response_probability"))
+        fusion_uncertainty = self._as_float(fusion.get("uncertainty"))
+        fusion_quality = self._clamp01(1.0 - fusion_uncertainty) if fusion_uncertainty is not None else None
+        if fusion_prob is not None:
+            score = (0.8 * score) + (0.2 * self._clamp01(fusion_prob) * 100.0)
+        if fusion_quality is not None:
+            source_quality = self._clamp01((0.8 * source_quality) + (0.2 * fusion_quality))
+
+        notes = [
+            f"Known ligand support={ligand_score*100:.1f}%",
+            f"Docking quality={docking_quality*100:.1f}%",
+            f"Predicted binder quality={pred_quality*100:.1f}%",
+            f"Simulated evidence penalty={simulated_penalty*100:.0f}%",
+        ]
+        if fusion_prob is not None:
+            notes.append(f"Fusion response probability={self._clamp01(fusion_prob)*100:.1f}%")
+        if fusion_quality is not None and fusion_quality < 0.45:
+            flags.append("Fusion response uncertainty is high")
+
         return {
             "available": bool(known_ligands or docking_affinity is not None or predicted),
             "score": round(self._clamp(score), 2),
             "source_quality": source_quality,
-            "notes": [
-                f"Known ligand support={ligand_score*100:.1f}%",
-                f"Docking quality={docking_quality*100:.1f}%",
-                f"Predicted binder quality={pred_quality*100:.1f}%",
-                f"Simulated evidence penalty={simulated_penalty*100:.0f}%",
-            ],
+            "notes": notes,
             "risk_flags": flags,
         }
 

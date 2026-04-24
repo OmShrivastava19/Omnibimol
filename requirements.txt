@@ -10,3 +10,5 @@ networkx>=3.0
 biopython>=1.81
 py3Dmol>=2.0.0
 matplotlib>=3.5.0
+playwright
+pytest-playwright

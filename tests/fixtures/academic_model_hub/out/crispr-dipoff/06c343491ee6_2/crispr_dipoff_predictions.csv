@@ -1,0 +1,3 @@
+candidate,chrom,pos,gene,offtarget_score,binary_label,attribution
+ACGTACGTACGTACGTACGT,1,1234,GENE1,1.0,1,0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1
+ACGTACGTACGTACGTTCGT,1,2234,GENE2,0.95,1,0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|0.1|1.0|0.1|0.1|0.1

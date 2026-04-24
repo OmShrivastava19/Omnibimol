@@ -76,5 +76,4 @@ data/*.csv
 omnibimol_portfolio.db
 
 docs/
-
 # End of .gitignore

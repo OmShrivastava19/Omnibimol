@@ -102,6 +102,42 @@ class TestTargetPrioritizationEngine(unittest.TestCase):
         self.assertGreater(row["confidence_score"], 0)
         self.assertIsInstance(row["missing_components"], list)
 
+    def test_multiomics_fusion_enriches_genetic_and_ligandability_notes(self):
+        payload = dict(self.payload)
+        payload["genetic_data"] = dict(self.payload["genetic_data"])
+        payload["genetic_data"]["multiomics_fusion"] = {
+            "predicted_response_probability": 0.82,
+            "uncertainty": 0.18,
+        }
+        payload["ligandability_data"] = dict(self.payload["ligandability_data"])
+        payload["ligandability_data"]["multiomics_fusion"] = {
+            "predicted_response_probability": 0.82,
+            "uncertainty": 0.18,
+        }
+
+        scores = self.engine.compute_component_scores(payload)
+        genetic_notes = " ".join(scores["genetic"]["notes"]).lower()
+        ligand_notes = " ".join(scores["ligandability"]["notes"]).lower()
+        self.assertIn("fusion response probability", genetic_notes)
+        self.assertIn("fusion response probability", ligand_notes)
+
+    def test_high_uncertainty_fusion_adds_risk_flags(self):
+        payload = dict(self.payload)
+        payload["genetic_data"] = dict(self.payload["genetic_data"])
+        payload["genetic_data"]["multiomics_fusion"] = {
+            "predicted_response_probability": 0.51,
+            "uncertainty": 0.9,
+        }
+        payload["ligandability_data"] = dict(self.payload["ligandability_data"])
+        payload["ligandability_data"]["multiomics_fusion"] = {
+            "predicted_response_probability": 0.51,
+            "uncertainty": 0.9,
+        }
+
+        scores = self.engine.compute_component_scores(payload)
+        self.assertTrue(any("uncertainty" in flag.lower() for flag in scores["genetic"]["risk_flags"]))
+        self.assertTrue(any("uncertainty" in flag.lower() for flag in scores["ligandability"]["risk_flags"]))
+
 
 if __name__ == "__main__":
     unittest.main()

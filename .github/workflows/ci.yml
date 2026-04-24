@@ -26,6 +26,9 @@ jobs:
           pip install -r requirements-backend.txt
           pip install ruff mypy pytest pytest-cov
 
+      - name: Install Playwright Browsers
+        run: python -m playwright install --with-deps chromium
+
       - name: Lint
         run: python -m ruff check backend alembic tests
 
@@ -34,3 +37,5 @@ jobs:
 
       - name: Test With Coverage
         run: python -m pytest --cov=backend --cov-report=term --cov-fail-under=70
+        env:
+          ACADEMIC_UI_BROWSER_TESTS: "1"
