@@ -498,6 +498,69 @@ def _run_shared_docking(
     )
 
 
+def _refresh_real_docking_result_if_needed(result: Dict) -> Dict:
+    if not result or result.get("simulated"):
+        return result
+
+    job_id = result.get("job_id")
+    current_status = str(result.get("status") or result.get("job_status") or "").lower().strip()
+    if current_status not in {"queued", "running"} or not job_id:
+        return result
+
+    try:
+        job_status = st.session_state.api_client.poll_docking_job(int(job_id))
+    except Exception:
+        return result
+
+    refreshed_status = str(job_status.get("status") or current_status).lower().strip()
+    if refreshed_status in {"queued", "running"}:
+        refreshed = dict(result)
+        refreshed["status"] = refreshed_status
+        refreshed["job_status"] = refreshed_status
+        return refreshed
+
+    if refreshed_status == "completed":
+        payload = st.session_state.api_client.normalize_docking_result(job_status.get("result_payload") or {})
+        payload.update(
+            {
+                "job_id": int(job_id),
+                "job_status": "completed",
+                "status": "completed",
+                "job_url": f"{st.session_state.api_client.backend_api_url}/api/v1/jobs/{int(job_id)}",
+            }
+        )
+        return payload
+
+    if refreshed_status == "failed":
+        payload = st.session_state.api_client.normalize_docking_result(job_status.get("result_payload") or {})
+        failure_reason = (
+            str(job_status.get("error_message") or "").strip()
+            or str(payload.get("error_message") or "").strip()
+            or str(payload.get("fallback_reason") or "").strip()
+            or "Real docking job failed"
+        )
+        payload.update(
+            {
+                "available": False,
+                "mode": "real",
+                "simulated": False,
+                "status": "failed",
+                "job_status": "failed",
+                "job_id": int(job_id),
+                "job_url": f"{st.session_state.api_client.backend_api_url}/api/v1/jobs/{int(job_id)}",
+                "binding_affinity": None,
+                "modes": [],
+                "best_mode": {},
+                "has_coordinates": False,
+                "fallback_reason": failure_reason,
+                "error_message": failure_reason,
+            }
+        )
+        return payload
+
+    return result
+
+
 def _format_phase(phase: Optional[str]) -> str:
     if not phase:
         return "N/A"
@@ -3013,7 +3076,8 @@ def main():
                 
                 # Display results
                 if 'ligand_binding_results' in st.session_state:
-                    results = st.session_state.ligand_binding_results
+                    results = _refresh_real_docking_result_if_needed(st.session_state.ligand_binding_results)
+                    st.session_state.ligand_binding_results = results
                     best_affinity = results.get('binding_affinity')
                     if best_affinity is None:
                         best_affinity = 0.0
@@ -3112,7 +3176,8 @@ def main():
         with docking_tabs[4]:
             st.subheader("Docking Results")
             if 'docking_results' in st.session_state:
-                results = st.session_state.docking_results
+                results = _refresh_real_docking_result_if_needed(st.session_state.docking_results)
+                st.session_state.docking_results = results
                 ligand_name = st.session_state.get('docked_ligand_name', 'Unknown')
                 ligand_data = st.session_state.get('docked_ligand_data', {})
                 protein_structure = st.session_state.get('protein_structure', {})
@@ -3721,7 +3786,8 @@ def _render_protein_predictor(protein_fasta_content: str):
     
     # Display docking results (if available)
     if 'seq_analysis_docking_results' in st.session_state:
-        results = st.session_state.seq_analysis_docking_results
+        results = _refresh_real_docking_result_if_needed(st.session_state.seq_analysis_docking_results)
+        st.session_state.seq_analysis_docking_results = results
         ligand_name_display = st.session_state.get('seq_analysis_docked_ligand_name', 'Unknown')
         ligand_data = st.session_state.get('seq_analysis_docked_ligand_data', {})
         protein_structure = st.session_state.get('seq_analysis_protein_structure', {})
@@ -4441,6 +4507,9 @@ def _render_protein_predictor(fasta_content: str) -> None:
                 st.session_state[docking_result_key] = docking_results
 
         docking_results = st.session_state.get(docking_result_key)
+        if docking_results:
+            docking_results = _refresh_real_docking_result_if_needed(docking_results)
+            st.session_state[docking_result_key] = docking_results
         if docking_results:
             if docking_results.get("available"):
                 st.success("✅ Docking simulation completed")
