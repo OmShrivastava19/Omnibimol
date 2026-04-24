@@ -30,6 +30,8 @@ from target_prioritization_engine import TargetPrioritizationEngine
 from variant_therapy_engine import VariantTherapyEngine
 from wet_lab_handoff_engine import WetLabHandoffEngine
 from portfolio_engine import PortfolioEngine
+from backend.core.config import get_settings
+from backend.services.multiomics_fusion import FusionSettings, MultiOmicsFusionService
 try:
     from streamlit.runtime.scriptrunner.script_runner import RerunException
 except Exception:
@@ -924,7 +926,7 @@ def render_kegg_interactive_pathway(first_result: Dict, kegg_protein_id: Optiona
 
 # app.py - Main Streamlit application
 def main():
-    """Main OmniBiMol (MVP)"""
+    """OmniBiMol"""
     
     # Page configuration
     st.set_page_config(
@@ -1021,7 +1023,7 @@ def main():
         
         st.header("📋 About")
         st.markdown("""
-        **OmniBiMol (MVP)**
+        **OmniBiMol**
         
         Integrated protein analysis platform combining:
         - UniProt: Protein function & annotations
@@ -1042,9 +1044,10 @@ def main():
         - Mobile-responsive design
         - User-friendly interface
         - Extensible architecture
-        - Open-source & free to use
 
-        **Developed by:** Team BhUOm
+        **Developed by:** Om Shrivastava
+
+        All rights reserved.
         """)
 
         st.divider()
@@ -6470,6 +6473,122 @@ def _run_async(coro):
             loop.close()
 
 
+def _build_multiomics_sample_from_state(
+    *,
+    selected_gene: str,
+    tissue_rows: List[Dict],
+) -> Dict:
+    transcriptomics: Dict[str, float] = {}
+    if tissue_rows:
+        expr_values = []
+        for row in tissue_rows:
+            level = row.get("level_numeric")
+            if level is None:
+                continue
+            try:
+                expr_values.append(float(level))
+            except (TypeError, ValueError):
+                continue
+        if expr_values:
+            normalized_expr = min(1.0, (sum(expr_values) / len(expr_values)) / 3.0)
+            transcriptomics[selected_gene.upper()] = normalized_expr
+
+    genomics = {"mutations": {}, "cnv": {}}
+    variant_bundle = st.session_state.get("variant_therapy_results", {})
+    gene_impact = variant_bundle.get("gene_impact", {}) if isinstance(variant_bundle, dict) else {}
+    genes = gene_impact.get("genes", {}) if isinstance(gene_impact, dict) else {}
+    for gene, row in genes.items():
+        if not isinstance(row, dict):
+            continue
+        key = str(gene).upper()
+        genomics["mutations"][key] = float(row.get("score", 0.0))
+        genomics["cnv"][key] = float(row.get("severity_score", 0.0))
+
+    # Fallback from genome-analysis summary when VCF-derived gene-level data is absent.
+    if not genomics["mutations"]:
+        genome_summary = st.session_state.get("genome_analysis_results", {}) or {}
+        mutation = genome_summary.get("mutation_analysis", {})
+        high_risk = float(mutation.get("high_risk_variants", 0.0) or 0.0)
+        total = float(mutation.get("total_variants", 0.0) or 0.0)
+        genomics["mutations"][selected_gene.upper()] = min(1.0, (0.7 * high_risk + 0.3 * total) / 10.0)
+        genomics["cnv"][selected_gene.upper()] = min(1.0, total / 12.0)
+
+    proteomics_payload = st.session_state.get("proteomics_data", {})
+    proteomics = proteomics_payload if isinstance(proteomics_payload, dict) else {}
+
+    sample = {"genomics": genomics}
+    if transcriptomics:
+        sample["transcriptomics"] = transcriptomics
+    if proteomics:
+        sample["proteomics"] = proteomics
+    return sample
+
+
+def _infer_drug_context_for_multiomics(all_data: Dict) -> Dict:
+    binding_prediction = st.session_state.get("binding_prediction", {}) or {}
+    docking_results = st.session_state.get("docking_results", {}) or {}
+    chembl = all_data.get("chembl_ligands", {}) or {}
+
+    drug_name = "Unknown compound"
+    smiles = None
+    descriptors = {}
+
+    known_ligands = binding_prediction.get("known_ligands", []) if isinstance(binding_prediction, dict) else []
+    if known_ligands:
+        top = known_ligands[0]
+        drug_name = top.get("compound_name") or top.get("name") or drug_name
+        smiles = top.get("smiles")
+        descriptors = {"molecular_weight": top.get("molecular_weight", 0.0)}
+    elif chembl.get("available") and chembl.get("ligands"):
+        top = chembl["ligands"][0]
+        drug_name = top.get("name") or top.get("compound_name") or drug_name
+        smiles = top.get("smiles")
+        descriptors = {"molecular_weight": top.get("molecular_weight", 0.0)}
+    elif isinstance(docking_results, dict):
+        drug_name = docking_results.get("ligand_name") or drug_name
+
+    return {
+        "drug_name": drug_name,
+        "smiles": smiles,
+        "descriptors": descriptors,
+    }
+
+
+def _compute_multiomics_prediction(
+    *,
+    selected_gene: str,
+    tissue_rows: List[Dict],
+    all_data: Dict,
+) -> Dict:
+    settings = get_settings()
+    if not settings.multiomics_enabled:
+        return {}
+
+    sample_omics = _build_multiomics_sample_from_state(
+        selected_gene=selected_gene,
+        tissue_rows=tissue_rows,
+    )
+    drug_context = _infer_drug_context_for_multiomics(all_data)
+    service = MultiOmicsFusionService(
+        settings=FusionSettings(
+            calibration_a=settings.multiomics_calibration_a,
+            calibration_b=settings.multiomics_calibration_b,
+            transcriptomics_weight=settings.multiomics_transcriptomics_weight,
+            genomics_weight=settings.multiomics_genomics_weight,
+            proteomics_weight=settings.multiomics_proteomics_weight,
+        )
+    )
+    try:
+        return service.predict(
+            drug_name=drug_context["drug_name"],
+            smiles=drug_context["smiles"],
+            drug_descriptors=drug_context["descriptors"],
+            sample_omics=sample_omics,
+        )
+    except Exception:
+        return {}
+
+
 def _build_target_scoring_payload(target_query: str) -> Optional[Dict]:
     api_client = st.session_state.api_client
     current_data = st.session_state.get("current_data")
@@ -6511,6 +6630,11 @@ def _build_target_scoring_payload(target_query: str) -> Optional[Dict]:
 
     tissue_df = all_data.get("tissue_expression")
     tissue_rows = tissue_df.to_dict("records") if hasattr(tissue_df, "to_dict") else []
+    multiomics_prediction = _compute_multiomics_prediction(
+        selected_gene=selected_gene,
+        tissue_rows=tissue_rows,
+        all_data=all_data,
+    )
 
     payload = {
         "target_id": selected_gene or selected_uniprot,
@@ -6523,13 +6647,18 @@ def _build_target_scoring_payload(target_query: str) -> Optional[Dict]:
         },
         "pathway_data": all_data.get("kegg_pathways", {}),
         "ppi_data": all_data.get("string_ppi", {}),
-        "genetic_data": st.session_state.get("genome_analysis_results"),
+        "genetic_data": {
+            **(st.session_state.get("genome_analysis_results") or {}),
+            "multiomics_fusion": multiomics_prediction,
+        },
         "ligandability_data": {
             "chembl": all_data.get("chembl_ligands", {}),
             "docking": st.session_state.get("docking_results", {}),
             "binding_prediction": st.session_state.get("binding_prediction", {}),
+            "multiomics_fusion": multiomics_prediction,
         },
         "trial_data": clinical_trials,
+        "multiomics_fusion": multiomics_prediction,
     }
     return payload
 
@@ -6599,10 +6728,10 @@ def render_portfolio_mode_page():
                     pd.DataFrame(projects)[["name", "indication", "modality", "stage", "status", "owner"]]
                     if projects
                     else pd.DataFrame(columns=["name", "indication", "modality", "stage", "status", "owner"]),
-                    use_container_width=True,
+                    width='stretch',
                 )
                 stage_dist = engine.get_stage_distribution(pf["id"])
-                st.plotly_chart(ProteinVisualizer.create_portfolio_funnel(stage_dist), use_container_width=True)
+                st.plotly_chart(ProteinVisualizer.create_portfolio_funnel(stage_dist), width='stretch')
 
         if selected_portfolio:
             st.divider()
@@ -6652,11 +6781,11 @@ def render_portfolio_mode_page():
             col4.metric("Blocked milestones", dash["milestone_metrics"]["blocker_count"])
 
             st.markdown("**Target pipeline**")
-            st.dataframe(pd.DataFrame(dash["candidate_comparison"]["comparison_table"]), use_container_width=True)
-            st.plotly_chart(ProteinVisualizer.create_project_risk_heatmap(dash["candidate_comparison"]["comparison_table"]), use_container_width=True)
+            st.dataframe(pd.DataFrame(dash["candidate_comparison"]["comparison_table"]), width='stretch')
+            st.plotly_chart(ProteinVisualizer.create_project_risk_heatmap(dash["candidate_comparison"]["comparison_table"]), width='stretch')
             st.markdown("**Milestone tracker**")
-            st.dataframe(pd.DataFrame(dash["milestones"]), use_container_width=True)
-            st.plotly_chart(ProteinVisualizer.create_milestone_burndown(dash["milestones"]), use_container_width=True)
+            st.dataframe(pd.DataFrame(dash["milestones"]), width='stretch')
+            st.plotly_chart(ProteinVisualizer.create_milestone_burndown(dash["milestones"]), width='stretch')
             if dash["latest_decision_snapshot"]:
                 st.markdown("**Latest decision snapshot**")
                 st.json(dash["latest_decision_snapshot"])
@@ -6709,8 +6838,8 @@ def render_portfolio_mode_page():
             selected = st.multiselect("Candidates", list(options.keys()), default=list(options.keys())[:4], key="compare_candidates_select")
             selected_ids = [options[s] for s in selected]
             compare = engine.compare_candidates(selected_project["id"], selected_ids if selected_ids else None)
-            st.dataframe(pd.DataFrame(compare["comparison_table"]), use_container_width=True)
-            st.plotly_chart(ProteinVisualizer.create_candidate_comparison_radar(compare["comparison_table"]), use_container_width=True)
+            st.dataframe(pd.DataFrame(compare["comparison_table"]), width='stretch')
+            st.plotly_chart(ProteinVisualizer.create_candidate_comparison_radar(compare["comparison_table"]), width='stretch')
             if compare["ranked_summary"]:
                 best = compare["ranked_summary"][0]
                 st.success(f"Best candidate for current stage: {best['alias']} (score {best['rank_score']}, confidence {best['confidence']})")
@@ -6728,9 +6857,9 @@ def render_portfolio_mode_page():
                 picked = st.selectbox("Candidate", list(cand_map.keys()), key="timeline_candidate_select")
                 selected_cand = cand_map[picked]
                 ts_payload = engine.get_target_time_series(selected_cand["id"])
-                st.plotly_chart(ProteinVisualizer.create_score_confidence_timeline(ts_payload["snapshots"]), use_container_width=True)
+                st.plotly_chart(ProteinVisualizer.create_score_confidence_timeline(ts_payload["snapshots"]), width='stretch')
                 st.markdown("**Drift alerts**")
-                st.dataframe(pd.DataFrame(ts_payload["drift_events"]), use_container_width=True)
+                st.dataframe(pd.DataFrame(ts_payload["drift_events"]), width='stretch')
                 with st.expander("Add evidence snapshot"):
                     expr = st.slider("Expression score", 0.0, 100.0, 50.0, 1.0, key="snap_expr")
                     pathway = st.slider("Pathway score", 0.0, 100.0, 50.0, 1.0, key="snap_path")
@@ -6773,7 +6902,7 @@ def render_portfolio_mode_page():
             snapshot = st.session_state.get("latest_portfolio_decision") or engine.get_project_dashboard_data(selected_project["id"]).get("latest_decision_snapshot")
             if snapshot:
                 st.json(snapshot)
-                st.plotly_chart(ProteinVisualizer.create_go_no_go_matrix(snapshot.get("checks", {})), use_container_width=True)
+                st.plotly_chart(ProteinVisualizer.create_go_no_go_matrix(snapshot.get("checks", {})), width='stretch')
                 st.caption("Research and portfolio decision support output only. Not for clinical use.")
 
     with tabs[5]:
@@ -7372,6 +7501,22 @@ def render_wet_lab_handoff_page():
             if strict_crispr:
                 crispr_candidates = [row for row in crispr_candidates if row.get("off_target_risk_level") != "High"]
 
+            crispr_off_target_analysis = {}
+            if crispr_candidates:
+                selected_guide = crispr_candidates[0].get("spacer_sequence", "")
+                variant_rows = []
+                if isinstance(variant_data, dict):
+                    variant_rows = variant_data.get("annotated") or variant_data.get("variants") or []
+                patient_genome_payload = {
+                    "sequence": context.get("sequence", {}).get("sequence", ""),
+                    "annotations": [],
+                    "variants": variant_rows,
+                }
+                crispr_off_target_analysis = engine.analyze_crispr_off_targets(
+                    guide_rna_sequence=selected_guide,
+                    patient_genome=patient_genome_payload,
+                )
+
             selected_regions = crispr_candidates[:6] if crispr_candidates else []
             primers = engine.suggest_primers(
                 sequence=context.get("sequence", {}).get("sequence", ""),
@@ -7385,6 +7530,7 @@ def render_wet_lab_handoff_page():
                 "context": context,
                 "assays": assays,
                 "crispr_candidates": crispr_candidates,
+                "crispr_off_target_analysis": crispr_off_target_analysis,
                 "primers": primers,
             }
             plan["validation_checklist"] = engine.generate_validation_checklist(plan=plan, objective=objective)
@@ -7410,6 +7556,7 @@ def render_wet_lab_handoff_page():
     confidence = plan.get("confidence", {})
     assays = plan.get("assays", [])
     crispr_candidates = plan.get("crispr_candidates", [])
+    crispr_off_target_analysis = plan.get("crispr_off_target_analysis", {}) or {}
     primers = plan.get("primers", [])
     checklist = plan.get("validation_checklist", [])
 
@@ -7454,6 +7601,31 @@ def render_wet_lab_handoff_page():
         st.plotly_chart(ProteinVisualizer.create_crispr_candidate_score_plot(crispr_candidates), width="stretch")
     else:
         st.info("No CRISPR candidates found from provided sequence.")
+
+    st.subheader("CRISPR Off-Target Risk Analysis")
+    if crispr_off_target_analysis:
+        st.markdown(crispr_off_target_analysis.get("summary_text", "Off-target summary unavailable."))
+        st.caption(crispr_off_target_analysis.get("notes_for_manual_review", ""))
+        off_target_df = pd.DataFrame(crispr_off_target_analysis.get("ranked_off_targets", []))
+        if not off_target_df.empty:
+            off_target_cols = [
+                "gene_name",
+                "tier_label",
+                "risk_score",
+                "cleavage_probability",
+                "impact_weight",
+                "mismatches",
+                "bulges",
+                "seed_mismatches",
+                "alignment_label",
+                "rank_explanation",
+            ]
+            st.dataframe(off_target_df[[c for c in off_target_cols if c in off_target_df.columns]], width="stretch", hide_index=True)
+        missing_uncertainty = crispr_off_target_analysis.get("missing_inputs_reducing_uncertainty", [])
+        if missing_uncertainty:
+            st.warning("Off-target uncertainty notes: " + ", ".join(missing_uncertainty))
+    else:
+        st.info("Off-target analysis unavailable (no CRISPR guide candidate selected).")
 
     st.subheader("Primer Suggestions")
     primer_df = pd.DataFrame(primers)
@@ -7512,6 +7684,12 @@ def render_wet_lab_handoff_page():
         "📥 Download CRISPR candidates CSV",
         csv_payload.get("crispr_candidates", ""),
         file_name="wet_lab_crispr_candidates.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "📥 Download CRISPR off-target CSV",
+        csv_payload.get("crispr_off_targets", ""),
+        file_name="wet_lab_crispr_off_targets.csv",
         mime="text/csv",
     )
     st.download_button(
