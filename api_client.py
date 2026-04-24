@@ -1,3 +1,5 @@
+import logging
+
 import httpx
 import pandas as pd
 import streamlit as st
@@ -8,6 +10,8 @@ import re
 import html
 import hashlib
 import sys
+
+logger = logging.getLogger(__name__)
 
 # Load TSV data at startup
 @st.cache_data
@@ -125,7 +129,8 @@ class ProteinAPIClient:
         self.cache = cache_manager
         self.uniprot_base = "https://rest.uniprot.org"
         self.hpa_base = "https://www.proteinatlas.org/api"
-        self.backend_api_url = (backend_api_url or os.getenv("BACKEND_API_URL", "http://localhost:8000")).rstrip("/")
+        # self.backend_api_url = (backend_api_url or os.getenv("BACKEND_API_URL", "http://localhost:8000")).rstrip("/")
+        self.backend_api_url = (backend_api_url or os.getenv("BACKEND_API_URL", "https://omshrivastava-omnibimol.hf.space/")).rstrip("/")
         
     async def search_uniprot(self, protein_name: str, max_results: int = 5) -> List[Dict]:
         """
@@ -1794,12 +1799,67 @@ class ProteinAPIClient:
         except Exception:
             return {}
 
-    def _request_backend_json(self, method: str, path: str, *, json_body: Dict | None = None) -> Dict:
+    def _real_docking_dependency_message(self) -> str:
+        return (
+            f"Check BACKEND_API_URL ({self.backend_api_url}) and make sure the API service, PostgreSQL, Redis, "
+            "and the docking worker are running."
+        )
+
+    def _real_docking_failure_reason(self, *, stage: str, exc: Exception | None = None, job_id: int | None = None) -> str:
+        if isinstance(exc, httpx.RequestError):
+            if stage == "submit":
+                return (
+                    f"Real docking could not start because the backend API at {self.backend_api_url} is unreachable. "
+                    f"{self._real_docking_dependency_message()}"
+                )
+            if job_id is not None:
+                return (
+                    f"Real docking job {job_id} could not be refreshed because the backend API at {self.backend_api_url} "
+                    f"is unreachable. {self._real_docking_dependency_message()}"
+                )
+            return (
+                f"Real docking could not contact the backend API at {self.backend_api_url}. "
+                f"{self._real_docking_dependency_message()}"
+            )
+
+        if isinstance(exc, httpx.HTTPStatusError):
+            status_code = exc.response.status_code if exc.response is not None else "unknown"
+            if stage == "submit":
+                return (
+                    f"Real docking could not start because the backend API at {self.backend_api_url} returned HTTP {status_code}. "
+                    f"{self._real_docking_dependency_message()}"
+                )
+            if job_id is not None:
+                return (
+                    f"Real docking job {job_id} could not be refreshed because the backend API at {self.backend_api_url} "
+                    f"returned HTTP {status_code}. {self._real_docking_dependency_message()}"
+                )
+            return (
+                f"Real docking failed because the backend API at {self.backend_api_url} returned HTTP {status_code}. "
+                f"{self._real_docking_dependency_message()}"
+            )
+
+        if stage == "ready":
+            return (
+                f"Backend API at {self.backend_api_url} is reachable but not ready for real docking. "
+                "Configure DATABASE_URL and REDIS_URL on the backend, then restart the API and worker services."
+            )
+
+        return f"Real docking failed while {stage}. {self._real_docking_dependency_message()}"
+
+    def _request_backend_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        json_body: Dict | None = None,
+        timeout: float = 60.0,
+    ) -> Dict:
         if not self.backend_api_url:
             raise RuntimeError("Backend API URL is not configured")
 
         url = f"{self.backend_api_url}{path}"
-        with httpx.Client(timeout=60.0) as client:
+        with httpx.Client(timeout=timeout) as client:
             response = client.request(
                 method,
                 url,
@@ -1808,6 +1868,81 @@ class ProteinAPIClient:
             )
             response.raise_for_status()
             return response.json()
+
+    def _check_real_docking_backend(self) -> None:
+        readiness = self._request_backend_json("GET", "/api/v1/readyz", timeout=5.0)
+        if not readiness.get("database_configured") or not readiness.get("redis_configured"):
+            raise RuntimeError(self._real_docking_failure_reason(stage="ready"))
+
+    def _build_real_docking_failed_result(
+        self,
+        *,
+        ligand_name: str,
+        protein_length: int,
+        ligand_mw: float,
+        activity_value: float | None,
+        failure_reason: str,
+        job_id: int | None = None,
+        job_type: str = "docking.vina",
+        job_url: str | None = None,
+    ) -> Dict:
+        return {
+            "available": False,
+            "mode": "real",
+            "simulated": False,
+            "engine": os.getenv("DOCKING_ENGINE", "vina"),
+            "status": "failed",
+            "job_id": job_id,
+            "job_status": "failed",
+            "job_type": job_type,
+            "job_url": job_url,
+            "binding_affinity": None,
+            "modes": [],
+            "best_mode": {},
+            "has_coordinates": False,
+            "ligand_name": ligand_name,
+            "protein_length": protein_length,
+            "ligand_mw": ligand_mw,
+            "activity_value": activity_value,
+            "fallback_reason": failure_reason,
+            "error_message": failure_reason,
+        }
+
+    def _build_real_docking_queued_result(
+        self,
+        *,
+        ligand_name: str,
+        protein_length: int,
+        ligand_mw: float,
+        activity_value: float | None,
+        job_id: int,
+        job_type: str,
+        status: str,
+    ) -> Dict:
+        return {
+            "available": False,
+            "mode": "real",
+            "simulated": False,
+            "engine": os.getenv("DOCKING_ENGINE", "vina"),
+            "status": status,
+            "job_id": job_id,
+            "job_status": status,
+            "job_type": job_type,
+            "job_url": f"{self.backend_api_url}/api/v1/jobs/{job_id}",
+            "binding_affinity": None,
+            "modes": [],
+            "best_mode": {},
+            "has_coordinates": False,
+            "ligand_name": ligand_name,
+            "protein_length": protein_length,
+            "ligand_mw": ligand_mw,
+            "activity_value": activity_value,
+            "queued_for_worker": True,
+            "fallback_reason": (
+                "Real docking job was submitted successfully and is waiting for the worker. "
+                "If it stays queued, verify the worker is running and connected to PostgreSQL and Redis."
+            ),
+        }
 
     def submit_real_docking_job(
         self,
@@ -1852,7 +1987,18 @@ class ProteinAPIClient:
         normalized.setdefault("has_coordinates", bool(normalized.get("modes")))
         if fallback_reason:
             normalized["fallback_reason"] = fallback_reason
+        if normalized.get("fallback_reason") and not normalized.get("error_message"):
+            normalized["error_message"] = normalized.get("fallback_reason")
         return normalized
+
+    def _extract_real_job_failure_reason(self, job_status: Dict) -> str:
+        result_payload = dict(job_status.get("result_payload") or {})
+        return (
+            str(job_status.get("error_message") or "").strip()
+            or str(result_payload.get("error_message") or "").strip()
+            or str(result_payload.get("fallback_reason") or "").strip()
+            or "Real docking job failed"
+        )
 
     def run_docking_workflow(
         self,
@@ -1872,6 +2018,7 @@ class ProteinAPIClient:
 
         if selected_mode == "real" and os.getenv("DOCKING_ENABLED", "true").lower() in {"1", "true", "yes"}:
             try:
+                self._check_real_docking_backend()
                 job = self.submit_real_docking_job(
                     protein_prep=protein_prep,
                     ligand_data=ligand_data,
@@ -1880,63 +2027,84 @@ class ProteinAPIClient:
                     num_modes=num_modes,
                     energy_range=energy_range,
                 )
-                job_id = int(job["id"])
-                try:
-                    job_status = self.poll_docking_job(job_id)
-                    if job_status.get("status") in {"completed", "failed"}:
-                        result_payload = self.normalize_docking_result(job_status.get("result_payload") or {})
-                        result_payload.update(
-                            {
-                                "job_id": job_id,
-                                "job_status": job_status.get("status"),
-                                "job_type": job.get("job_type", "docking.vina"),
-                                "job_url": f"{self.backend_api_url}/api/v1/jobs/{job_id}",
-                            }
-                        )
-                        return result_payload
-                except Exception:
-                    pass
-
-                return {
-                    "available": True,
-                    "mode": "real",
-                    "simulated": False,
-                    "engine": os.getenv("DOCKING_ENGINE", "vina"),
-                    "status": job.get("status", "queued"),
-                    "job_id": job_id,
-                    "job_type": job.get("job_type", "docking.vina"),
-                    "job_url": f"{self.backend_api_url}/api/v1/jobs/{job_id}",
-                    "binding_affinity": None,
-                    "modes": [],
-                    "best_mode": {},
-                    "has_coordinates": False,
-                    "ligand_name": ligand_name,
-                    "protein_length": protein_length,
-                    "ligand_mw": ligand_mw,
-                    "activity_value": activity_value,
-                    "queued_for_worker": True,
-                }
             except Exception as exc:
-                fallback_reason = f"Real docking unavailable: {exc}"
-                simulated = self.simulate_docking_score(
-                    protein_length,
-                    ligand_mw,
-                    activity_value,
-                    ligand_data.get("smiles"),
+                logger.exception("Real docking submit failed for backend %s", self.backend_api_url)
+                failure_reason = self._real_docking_failure_reason(stage="submit", exc=exc)
+                return self._build_real_docking_failed_result(
+                    ligand_name=ligand_name,
+                    protein_length=protein_length,
+                    ligand_mw=ligand_mw,
+                    activity_value=activity_value,
+                    failure_reason=failure_reason,
+                    job_type="docking.vina",
                 )
-                simulated.update(
+
+            job_id = int(job["id"])
+            try:
+                job_status = self.poll_docking_job(job_id)
+            except Exception as exc:
+                logger.exception("Real docking status refresh failed for job %s at backend %s", job_id, self.backend_api_url)
+                failure_reason = self._real_docking_failure_reason(stage="poll", exc=exc, job_id=job_id)
+                return self._build_real_docking_failed_result(
+                    ligand_name=ligand_name,
+                    protein_length=protein_length,
+                    ligand_mw=ligand_mw,
+                    activity_value=activity_value,
+                    failure_reason=failure_reason,
+                    job_id=job_id,
+                    job_type=job.get("job_type", "docking.vina"),
+                    job_url=f"{self.backend_api_url}/api/v1/jobs/{job_id}",
+                )
+
+            job_state = job_status.get("status")
+            if job_state in {"completed", "failed"}:
+                result_payload = self.normalize_docking_result(job_status.get("result_payload") or {})
+                result_payload.update(
                     {
-                        "mode": "simulation",
-                        "simulated": True,
-                        "engine": "simulation",
-                        "fallback_reason": fallback_reason,
-                        "job_id": None,
-                        "job_status": None,
-                        "job_url": None,
-                        "ligand_name": ligand_name,
+                        "job_id": job_id,
+                        "job_status": job_state,
+                        "job_type": job.get("job_type", "docking.vina"),
+                        "job_url": f"{self.backend_api_url}/api/v1/jobs/{job_id}",
                     }
                 )
-                return self.normalize_docking_result(simulated, fallback_reason=fallback_reason)
+                if job_state == "failed":
+                    failure_reason = self._extract_real_job_failure_reason(job_status)
+                    result_payload.update(
+                        {
+                            "available": False,
+                            "mode": "real",
+                            "simulated": False,
+                            "status": "failed",
+                            "fallback_reason": failure_reason,
+                            "error_message": failure_reason,
+                            "binding_affinity": None,
+                            "modes": [],
+                            "best_mode": {},
+                            "has_coordinates": False,
+                        }
+                    )
+                return result_payload
+
+            if job_state in {"queued", "running"}:
+                return self._build_real_docking_queued_result(
+                    ligand_name=ligand_name,
+                    protein_length=protein_length,
+                    ligand_mw=ligand_mw,
+                    activity_value=activity_value,
+                    job_id=job_id,
+                    job_type=job.get("job_type", "docking.vina"),
+                    status=job_state,
+                )
+
+            return self._build_real_docking_queued_result(
+                ligand_name=ligand_name,
+                protein_length=protein_length,
+                ligand_mw=ligand_mw,
+                activity_value=activity_value,
+                job_id=job_id,
+                job_type=job.get("job_type", "docking.vina"),
+                status=job_state or "queued",
+            )
 
         simulated = self.simulate_docking_score(
             protein_length,
@@ -1944,6 +2112,11 @@ class ProteinAPIClient:
             activity_value,
             ligand_data.get("smiles"),
         )
+        fallback_reason: str | None = None
+        if selected_mode == "real" and os.getenv("DOCKING_ENABLED", "true").lower() not in {"1", "true", "yes"}:
+            fallback_reason = (
+                "Real docking mode was requested but DOCKING_ENABLED is disabled, so simulation mode was used."
+            )
         simulated.update(
             {
                 "mode": "simulation",
@@ -1953,9 +2126,11 @@ class ProteinAPIClient:
                 "job_status": None,
                 "job_url": None,
                 "ligand_name": ligand_name,
+                "fallback_reason": fallback_reason,
+                "error_message": fallback_reason,
             }
         )
-        return self.normalize_docking_result(simulated)
+        return self.normalize_docking_result(simulated, fallback_reason=fallback_reason)
 
     def simulate_docking_score(self, protein_length: int, ligand_mw: float, 
                           activity_value: float = None, ligand_smiles: str = None) -> Dict:

@@ -47,6 +47,44 @@ class DockingExecutionError(DockingError):
     """Raised when Vina execution fails."""
 
 
+RECEPTOR_PDBQT_FORMAT_VERSION = "pdbqt-v3"
+RECEPTOR_CONVERTER_VERSION = "2026-04-24"
+ALLOWED_RECEPTOR_ATOM_TYPES = {
+    "H",
+    "HD",
+    "HS",
+    "C",
+    "A",
+    "N",
+    "NA",
+    "NS",
+    "OA",
+    "OS",
+    "F",
+    "Mg",
+    "P",
+    "SA",
+    "S",
+    "Cl",
+    "Ca",
+    "Mn",
+    "Fe",
+    "Zn",
+    "Br",
+    "I",
+    "Si",
+    "B",
+    "Cu",
+    "Ni",
+    "Co",
+    "Se",
+    "Mo",
+    "Sn",
+    "Na",
+    "K",
+}
+
+
 @dataclass(frozen=True)
 class ReceptorCacheRecord:
     cache_key: str
@@ -127,6 +165,14 @@ class DockingCache:
                     except OSError:
                         pass
 
+    def _invalidate_entry(self, cache_key: str) -> None:
+        paths = self._paths_for_key(cache_key)
+        for candidate in (paths["receptor_pdbqt"], paths["metadata"]):
+            try:
+                candidate.unlink()
+            except OSError:
+                pass
+
     def load(self, cache_key: str) -> ReceptorCacheRecord | None:
         paths = self._paths_for_key(cache_key)
         if not paths["receptor_pdbqt"].exists() or not paths["metadata"].exists():
@@ -134,6 +180,18 @@ class DockingCache:
         try:
             metadata = json.loads(paths["metadata"].read_text(encoding="utf-8"))
         except Exception:
+            self._invalidate_entry(cache_key)
+            return None
+        if metadata.get("format_version") != RECEPTOR_PDBQT_FORMAT_VERSION:
+            self._invalidate_entry(cache_key)
+            return None
+        if metadata.get("converter_version") != RECEPTOR_CONVERTER_VERSION:
+            self._invalidate_entry(cache_key)
+            return None
+        try:
+            validate_receptor_pdbqt_file(paths["receptor_pdbqt"])
+        except DockingConversionError:
+            self._invalidate_entry(cache_key)
             return None
         metadata["cache_hit"] = True
         return ReceptorCacheRecord(
@@ -167,7 +225,9 @@ class DockingCache:
 
     def get_or_create(self, *, structure_id: str, source_url: str, pdb_text: str) -> ReceptorCacheRecord:
         content_hash = hashlib.sha256(pdb_text.encode("utf-8")).hexdigest()
-        cache_key = hashlib.sha256(f"{structure_id}|{source_url}|{content_hash}".encode("utf-8")).hexdigest()[:24]
+        cache_key = hashlib.sha256(
+            f"{RECEPTOR_PDBQT_FORMAT_VERSION}|{RECEPTOR_CONVERTER_VERSION}|{structure_id}|{source_url}|{content_hash}".encode("utf-8")
+        ).hexdigest()[:24]
         paths = self._paths_for_key(cache_key)
 
         with _exclusive_file_lock(paths["lock"]):
@@ -177,6 +237,8 @@ class DockingCache:
 
             receptor_pdbqt_text = convert_pdb_to_pdbqt(pdb_text, structure_id=structure_id)
             metadata = {
+                "format_version": RECEPTOR_PDBQT_FORMAT_VERSION,
+                "converter_version": RECEPTOR_CONVERTER_VERSION,
                 "structure_id": structure_id,
                 "source_url": source_url,
                 "content_hash": content_hash,
@@ -205,10 +267,124 @@ def _parse_pdb_element(atom_name: str, element_field: str) -> str:
 
 
 def _atom_type_from_element(element: str) -> str:
-    element = element.upper()
-    if element in {"CL", "BR"}:
-        return element.lower()
-    return element[0].lower()
+    mapping = {
+        "H": "H",
+        "C": "C",
+        "N": "N",
+        "O": "OA",
+        "S": "SA",
+        "P": "P",
+        "F": "F",
+        "CL": "Cl",
+        "BR": "Br",
+        "I": "I",
+        "MG": "Mg",
+        "CA": "Ca",
+        "MN": "Mn",
+        "FE": "Fe",
+        "ZN": "Zn",
+        "SI": "Si",
+        "B": "B",
+        "CU": "Cu",
+        "NI": "Ni",
+        "CO": "Co",
+        "SE": "Se",
+        "MO": "Mo",
+        "SN": "Sn",
+        "NA": "Na",
+        "K": "K",
+    }
+    normalized = element.upper().strip()
+    if normalized in mapping:
+        return mapping[normalized]
+    if not normalized:
+        return "C"
+    return mapping.get(normalized[0], "C")
+
+
+def _validate_receptor_atom_line(line: str, *, line_number: int) -> None:
+    if len(line) < 78:
+        raise DockingConversionError(
+            f"Invalid receptor PDBQT ATOM line at {line_number}: expected fixed-width columns, got len={len(line)}"
+        )
+
+    coordinate_fields = {
+        "x": line[30:38],
+        "y": line[38:46],
+        "z": line[46:54],
+        "charge": line[68:76],
+    }
+    for field_name, field_value in coordinate_fields.items():
+        try:
+            float(field_value)
+        except Exception as exc:
+            raise DockingConversionError(
+                f"Invalid receptor PDBQT {field_name} field at line {line_number}: {field_value!r}"
+            ) from exc
+
+    atom_type = line[77:79].strip()
+    if atom_type not in ALLOWED_RECEPTOR_ATOM_TYPES:
+        raise DockingConversionError(
+            f"Invalid receptor PDBQT atom type at line {line_number}: {atom_type!r}"
+        )
+
+
+def validate_receptor_pdbqt_text(pdbqt_text: str) -> None:
+    atom_count = 0
+    for line_number, line in enumerate(pdbqt_text.splitlines(), start=1):
+        if not line.startswith(("ATOM", "HETATM")):
+            continue
+        _validate_receptor_atom_line(line, line_number=line_number)
+        atom_count += 1
+
+    if atom_count == 0:
+        raise DockingConversionError("Receptor PDBQT validation failed: no ATOM/HETATM records found")
+
+
+def validate_receptor_pdbqt_file(pdbqt_path: Path) -> None:
+    try:
+        pdbqt_text = pdbqt_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise DockingConversionError(f"Failed to read receptor PDBQT file: {pdbqt_path}") from exc
+    validate_receptor_pdbqt_text(pdbqt_text)
+
+
+def _format_pdbqt_atom_line(
+    *,
+    record_name: str,
+    atom_index: int,
+    atom_name: str,
+    res_name: str,
+    chain_id: str,
+    res_seq: int,
+    x: float,
+    y: float,
+    z: float,
+    occupancy: float,
+    temp_factor: float,
+    charge: float,
+    atom_type: str,
+) -> str:
+    # Follow canonical PDB/PDBQT fixed columns so Vina can parse coordinates reliably.
+    line = (
+        f"{record_name[:6]:<6}"
+        f"{atom_index:5d} "
+        f"{atom_name[:4]:>4}"
+        f" "
+        f"{res_name[:3]:>3}"
+        f" "
+        f"{(chain_id[:1] or 'A'):1}"
+        f"{res_seq:4d}"
+        f" "
+        f"   "
+        f"{x:8.3f}{y:8.3f}{z:8.3f}"
+        f"{occupancy:6.2f}{temp_factor:6.2f}"
+        f"  "
+        f"{charge:8.3f}"
+        f" "
+        f"{atom_type[:2]:<2}"
+    )
+    return line.ljust(80)
 
 
 def convert_pdb_to_pdbqt(pdb_text: str, *, structure_id: str) -> str:
@@ -236,15 +412,29 @@ def convert_pdb_to_pdbqt(pdb_text: str, *, structure_id: str) -> str:
 
         atom_type = _atom_type_from_element(element)
         output_lines.append(
-            f"ATOM  {atom_index:5d} {atom_name:<4}{res_name:>3} {chain_id:1}{res_seq:4d}    "
-            f"{x:8.3f}{y:8.3f}{z:8.3f}{occupancy:6.2f}{temp_factor:6.2f}    "
-            f"{0.000:7.3f} {atom_type:>2}"
+            _format_pdbqt_atom_line(
+                record_name="ATOM",
+                atom_index=atom_index,
+                atom_name=atom_name,
+                res_name=res_name,
+                chain_id=chain_id,
+                res_seq=res_seq,
+                x=x,
+                y=y,
+                z=z,
+                occupancy=occupancy,
+                temp_factor=temp_factor,
+                charge=0.0,
+                atom_type=atom_type,
+            )
         )
         atom_index += 1
 
     if atom_index == 1:
         raise DockingConversionError("No receptor atoms were found in the PDB content")
-    return "\n".join(output_lines) + "\n"
+    receptor_pdbqt = "\n".join(output_lines) + "\n"
+    validate_receptor_pdbqt_text(receptor_pdbqt)
+    return receptor_pdbqt
 
 
 def _smiles_to_mol(smiles: str):
@@ -282,9 +472,21 @@ def _mol_to_rigid_pdbqt(molecule, *, molecule_name: str) -> str:
         except Exception:
             charge = 0.0
         output_lines.append(
-            f"HETATM{atom_index:5d} {atom.GetSymbol():<4}{'LIG':>3} {'A':1}{1:4d}    "
-            f"{position.x:8.3f}{position.y:8.3f}{position.z:8.3f}{1.00:6.2f}{0.00:6.2f}    "
-            f"{charge:7.3f} {atom_type:>2}"
+            _format_pdbqt_atom_line(
+                record_name="HETATM",
+                atom_index=atom_index,
+                atom_name=atom.GetSymbol(),
+                res_name="LIG",
+                chain_id="A",
+                res_seq=1,
+                x=position.x,
+                y=position.y,
+                z=position.z,
+                occupancy=1.00,
+                temp_factor=0.00,
+                charge=charge,
+                atom_type=atom_type,
+            )
         )
     output_lines.extend(["ENDROOT", "TORSDOF 0"])
     return "\n".join(output_lines) + "\n"
@@ -469,6 +671,7 @@ class DockingProcessor:
             )
 
         center, size = _compute_box_from_pdb(receptor_pdb_text)
+        validate_receptor_pdbqt_file(Path(receptor_pdbqt_path))
         with tempfile.TemporaryDirectory(prefix="omnibimol-docking-") as temp_dir:
             temp_dir_path = Path(temp_dir)
             ligand_pdbqt_path = temp_dir_path / "ligand.pdbqt"

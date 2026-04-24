@@ -958,7 +958,7 @@ def main():
         
         st.header("📋 About")
         st.markdown("""
-        **OmniBiMol**
+        **OmniBiMol (MVP)**
         
         Integrated protein analysis platform combining:
         - UniProt: Protein function & annotations
@@ -979,10 +979,9 @@ def main():
         - Mobile-responsive design
         - User-friendly interface
         - Extensible architecture
+        - Open-source & free to use
 
-        **Developed by:** Om Shrivastava
-        
-        All rights reserved.
+        **Developed by:** Team BhUOm
         """)
 
         st.divider()
@@ -3018,11 +3017,18 @@ def main():
                     best_affinity = results.get('binding_affinity')
                     if best_affinity is None:
                         best_affinity = 0.0
+                    if results.get('simulated') and results.get('fallback_reason'):
+                        st.warning(f"Simulation fallback reason: {results.get('fallback_reason')}")
                     if results.get('status') in {"queued", "running"} and not results.get('simulated'):
                         st.info(
                             f"Real docking job {results.get('job_id')} is {results.get('status')}. "
                             "Refresh this page after the worker finishes to see the completed pose."
                         )
+                        if results.get('fallback_reason'):
+                            st.warning(results.get('fallback_reason'))
+                    elif results.get('status') == 'failed' and not results.get('simulated'):
+                        failure_reason = results.get('error_message') or results.get('fallback_reason') or 'Real docking failed.'
+                        st.error(f"Real docking failed: {failure_reason}")
                     
                     st.divider()
                     st.subheader("📊 Binding Prediction Results")
@@ -3112,7 +3118,10 @@ def main():
                 protein_structure = st.session_state.get('protein_structure', {})
                 
                 if results.get('simulated'):
-                    st.warning("⚠️ **Note:** These are simulated results for demonstration. Production version would use actual AutoDock Vina calculations.")
+                    simulated_reason = results.get('fallback_reason') or 'Production version would use actual AutoDock Vina calculations.'
+                    st.warning(f"⚠️ **Note:** These are simulated results for demonstration. {simulated_reason}")
+                    if results.get('error_message'):
+                        st.info(f"Simulation fallback details: {results.get('error_message')}")
                 
                 st.markdown(f"### Results for: **{ligand_name}**")
                 
@@ -3127,6 +3136,13 @@ def main():
                         f"Real docking job {results.get('job_id')} is {results.get('status')}. "
                         "Refresh this page after the worker finishes to load the completed Vina result."
                     )
+                    if results.get('fallback_reason'):
+                        st.warning(results.get('fallback_reason'))
+                elif results.get('status') == 'failed' and not results.get('simulated'):
+                    failure_reason = results.get('error_message') or results.get('fallback_reason') or 'Real docking failed.'
+                    st.error(f"Real docking failed: {failure_reason}")
+                elif results.get('fallback_reason') and not results.get('simulated'):
+                    st.info(f"Docking details: {results.get('fallback_reason')}")
                 
                 col1, col2, col3 = st.columns(3)
                 
@@ -3729,6 +3745,11 @@ def _render_protein_predictor(protein_fasta_content: str):
                 f"Real docking job {results.get('job_id')} is {results.get('status')}. "
                 "Refresh this page after the worker finishes to load the completed Vina result."
             )
+            if results.get('fallback_reason'):
+                st.warning(results.get('fallback_reason'))
+        elif results.get('status') == 'failed' and not results.get('simulated'):
+            failure_reason = results.get('error_message') or results.get('fallback_reason') or 'Real docking failed.'
+            st.error(f"Real docking failed: {failure_reason}")
         
         col1, col2, col3 = st.columns(3)
         
@@ -4420,8 +4441,21 @@ def _render_protein_predictor(fasta_content: str) -> None:
                 st.session_state[docking_result_key] = docking_results
 
         docking_results = st.session_state.get(docking_result_key)
+        if docking_results:
+            if docking_results.get("available"):
+                st.success("✅ Docking simulation completed")
+            elif docking_results.get("status") == "failed" and not docking_results.get("simulated"):
+                failure_reason = docking_results.get("error_message") or docking_results.get("fallback_reason") or "Real docking failed."
+                st.error(f"Real docking failed: {failure_reason}")
+            elif docking_results.get("status") in {"queued", "running"} and not docking_results.get("simulated"):
+                st.info(
+                    f"Real docking job {docking_results.get('job_id')} is {docking_results.get('status')}. "
+                    "Refresh this page after the worker finishes to load the completed Vina result."
+                )
+                if docking_results.get("fallback_reason"):
+                    st.warning(docking_results.get("fallback_reason"))
+
         if docking_results and docking_results.get("available"):
-            st.success("✅ Docking simulation completed")
             
             st.markdown("---")
             st.markdown("**Docking Scores & Binding Affinity**")
