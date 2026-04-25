@@ -17,7 +17,7 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    app_name: str = Field(default="OmniBioMol API")
+    app_name: str = Field(default="OmniBiMol API")
     environment: str = Field(default="development")
     api_prefix: str = Field(default="/api/v1")
     debug: bool = Field(default=False)
@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     chemprot_enable_ensemble: bool = Field(default=True)
     chemprot_timeout_sec: int = Field(default=30, ge=5, le=120)
     chemprot_local_files_only: bool = Field(default=False)
+
+    localizer_enabled: bool = Field(default=True)
+    localizer_repo_id: str = Field(default="omshrivastava/omnibimol-protein-localization")
+    localizer_confidence_threshold: float = Field(default=0.6, ge=0.0, le=1.0)
+    localizer_max_seq_len: int = Field(default=1024, ge=20, le=4096)
 
     backend_api_url: str = Field(default="http://localhost:8000")
 

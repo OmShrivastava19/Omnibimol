@@ -26,6 +26,7 @@ OmniBiMol is a Streamlit-based bioinformatics platform that unifies protein disc
 ### 2) Tissue Expression & Subcellular Localization (HPA)
 - Tissue expression bar charts with expression level scoring.
 - Subcellular localization heatmaps with reliability grading.
+- Hugging Face-backed subcellular localization prediction with confidence gating and wet-lab prioritization.
 - Summary tables of tissue and localization coverage.
 
 ### 3) Protein Sequence Analysis (UniProt + EMBL-EBI)
@@ -75,6 +76,11 @@ OmniBiMol is a Streamlit-based bioinformatics platform that unifies protein disc
 - Inspect prediction/explanations/confidence/artifacts/provenance/errors in consistent tabs.
 - Track session run history and reopen previous results.
 - Export normalized response, provenance manifest, and run summary artifacts.
+
+### 11) Protein Localization Inference
+- CPU-friendly 10-class subcellular localization predictions from `omshrivastava/omnibimol-protein-localization`.
+- Evidence gating, membrane risk, wet-lab prioritization score, and assay recommendation.
+- Graceful fallback when the model is unavailable.
 
 #### Academic Models launch-readiness checklist
 - Model discovery + shallow/deep health checks render from backend endpoints.
@@ -181,6 +187,10 @@ Core backend variables (see `.env.example`):
 - `AUTH0_AUDIENCE` - expected token audience
 - `AUTH_JWT_ALGORITHMS` - accepted JWT algorithm list
 - `AUTH_TENANT_CLAIM` - claim key for tenant slug
+- `LOCALIZER_ENABLED` - enable the protein localization service
+- `LOCALIZER_REPO_ID` - Hugging Face repo for localization artifacts (`omshrivastava/omnibimol-protein-localization` by default)
+- `LOCALIZER_CONFIDENCE_THRESHOLD` - confidence gate used for evidence filtering (`0.6` by default)
+- `LOCALIZER_MAX_SEQ_LEN` - maximum sequence length accepted by the localization service (`1024` by default)
 
 ## Installation
 
@@ -217,6 +227,16 @@ uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
 API base URL: `http://localhost:8000/api/v1`
+
+### Protein localization API
+
+```bash
+curl -X POST http://localhost:8000/api/v1/protein-localization/predict \
+  -H "Content-Type: application/json" \
+  -d '{"sequence":"MKWVTFISLLFLFSSAYSRGVFRRDTHKSEIAHRFKDLGE"}'
+```
+
+Example response fields include `localization`, `confidence`, `membrane_risk`, `wetlab_prioritization_score`, `recommended_assay`, and `evidence_passed`.
 
 ### Useful API groups
 

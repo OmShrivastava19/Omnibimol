@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 import jwt
 import pytest
 from backend.auth.streamlit_integration import build_job_status_url
+from backend.api.routes.jobs import AnnotatedVariantPayload, DrugRepurposingJobPayload, GenomeAnalysisJobPayload
 from backend.auth.token_verifier import Auth0TokenVerifier
 from backend.core.config import get_settings
 from backend.db.base import Base
@@ -234,3 +235,48 @@ def test_job_status_tenant_isolated(auth_client: tuple[TestClient, sessionmaker]
 def test_streamlit_job_polling_url_builder() -> None:
     url = build_job_status_url("https://api.omnibimol.local", 123)
     assert url == "https://api.omnibimol.local/api/v1/jobs/123"
+
+
+def test_genome_analysis_payload_accepts_vcf_and_annotated_variants() -> None:
+    payload = GenomeAnalysisJobPayload(
+        vcf_text="##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n1\t123\t.\tA\tT\t99\tPASS\tANN=missense_variant|MODERATE|TP53|TP53|transcript|NM_000546|protein_coding|1|c.123A>T|p.Lys41Asn",
+        annotated_variants=[
+            AnnotatedVariantPayload(
+                chrom="1",
+                pos=123,
+                ref="A",
+                alt="T",
+                gene="TP53",
+                consequence="missense_variant",
+                pathogenicity_score=0.91,
+                pathogenicity_tier=1,
+                pathogenicity_method="xgb_precomputed",
+                model_confidence="High",
+                evidence_summary="stub",
+            )
+        ],
+    )
+
+    assert payload.vcf_text is not None
+    assert payload.annotated_variants[0].pathogenicity_score == 0.91
+
+
+def test_genome_analysis_payload_requires_a_variant_source() -> None:
+    with pytest.raises(ValueError):
+        GenomeAnalysisJobPayload()
+
+
+def test_drug_repurposing_payload_accepts_variant_context() -> None:
+    payload = DrugRepurposingJobPayload(
+        target_sequence="ACDEFGHIKLMNPQRSTVWY",
+        annotated_variants=[
+            AnnotatedVariantPayload(
+                gene="TP53",
+                consequence="missense_variant",
+                pathogenicity_score=0.88,
+                pathogenicity_tier=1,
+            )
+        ],
+    )
+
+    assert payload.annotated_variants[0].pathogenicity_tier == 1

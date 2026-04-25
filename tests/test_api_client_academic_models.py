@@ -94,6 +94,34 @@ def test_predict_academic_model_retries_once_on_timeout(monkeypatch) -> None:
     assert calls["count"] == 2
 
 
+def test_score_chemprot_interaction_posts_contract(monkeypatch) -> None:
+    client = ProteinAPIClient(_DummyCache(), backend_api_url="http://localhost:8000")
+    captured = {}
+
+    def fake_request(method, path, *, json_body=None, timeout=60.0):  # noqa: ANN001
+        captured["method"] = method
+        captured["path"] = path
+        captured["json_body"] = json_body
+        return {
+            "body": {
+                "interaction_probability": 0.91,
+                "final_score": 0.88,
+                "ranked_targets": [{"protein": "ABL1"}],
+            },
+            "status_code": 200,
+            "headers": {"x-request-id": "chemprot-req-1"},
+        }
+
+    monkeypatch.setattr(client, "_request_backend_json_with_metadata", fake_request)
+    out = client.score_chemprot_interaction(
+        payload={"chemical": "imatinib", "abstracts": [{"abstract": "Imatinib interacts with ABL1."}]}
+    )
+    assert out["interaction_probability"] == 0.91
+    assert out["_client_meta"]["request_id"] == "chemprot-req-1"
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/api/v1/chemprot/score"
+
+
 def test_backend_url_normalizes_huggingface_spaces_runtime_domain() -> None:
     client = ProteinAPIClient(
         _DummyCache(),

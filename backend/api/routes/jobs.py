@@ -59,6 +59,22 @@ class ProteinSequenceInput(BaseModel):
         return v_clean
 
 
+class AnnotatedVariantPayload(BaseModel):
+    """Compact variant payload used by genome and therapy jobs."""
+    chrom: str | None = Field(None, max_length=50)
+    pos: int | None = Field(None, ge=0)
+    ref: str | None = Field(None, max_length=100)
+    alt: str | None = Field(None, max_length=100)
+    gene: str | None = Field(None, max_length=50)
+    consequence: str | None = Field(None, max_length=200)
+    pathogenicity_score: float | None = Field(None, ge=0.0, le=1.0)
+    pathogenicity_tier: int | None = Field(None, ge=1, le=3)
+    pathogenicity_method: str | None = Field(None, max_length=100)
+    model_confidence: str | None = Field(None, max_length=20)
+    evidence_summary: str | None = Field(None, max_length=1000)
+    info: dict[str, Any] = Field(default_factory=dict)
+
+
 class DNASequenceInput(BaseModel):
     """DNA sequence with validation for length and format."""
     sequence: str = Field(
@@ -185,11 +201,20 @@ class ProteinAnalysisJobPayload(BaseModel):
 
 class GenomeAnalysisJobPayload(BaseModel):
     """Payload for genome analysis jobs."""
-    dna_sequence: str = Field(
-        ...,
+    dna_sequence: str | None = Field(
+        None,
         min_length=20,
         max_length=1000000,
         description="DNA sequence (20-1,000,000 base pairs)"
+    )
+    vcf_text: str | None = Field(
+        None,
+        max_length=5000000,
+        description="VCF text to analyze and score"
+    )
+    annotated_variants: list[AnnotatedVariantPayload] = Field(
+        default_factory=list,
+        description="Pre-annotated variants with optional pathogenicity scores"
     )
     analysis_type: Literal["variants", "annotation", "pathways"] = Field(
         "variants",
@@ -204,6 +229,8 @@ class GenomeAnalysisJobPayload(BaseModel):
     @classmethod
     def validate_dna_seq(cls, v: str) -> str:
         """Validate DNA sequence format."""
+        if v is None:
+            return v
         v_clean = v.strip().upper().replace('\n', '')
         if v_clean.startswith('>'):
             v_clean = '\n'.join(v_clean.split('\n')[1:])
@@ -215,6 +242,15 @@ class GenomeAnalysisJobPayload(BaseModel):
             )
         return v_clean
 
+    @model_validator(mode='after')
+    def validate_variant_inputs(self) -> 'GenomeAnalysisJobPayload':
+        """Allow either a DNA sequence, VCF text, or annotated variant payload."""
+        if not (self.dna_sequence or self.vcf_text or self.annotated_variants):
+            raise ValueError(
+                "Genome analysis payload must include dna_sequence, vcf_text, or annotated_variants"
+            )
+        return self
+
 
 class DrugRepurposingJobPayload(BaseModel):
     """Payload for drug repurposing jobs."""
@@ -223,6 +259,10 @@ class DrugRepurposingJobPayload(BaseModel):
         min_length=10,
         max_length=10000,
         description="Target protein sequence"
+    )
+    annotated_variants: list[AnnotatedVariantPayload] = Field(
+        default_factory=list,
+        description="Optional pathogenicity-scored variant context to bias candidate ranking"
     )
     disease_context: str | None = Field(
         None,
@@ -272,15 +312,17 @@ class JobEnqueueRequest(BaseModel):
     def validate_job_type(cls, v: str) -> str:
         """Validate job type format."""
         v = v.strip().lower()
-        if not re.match(r'^[a-z0-9_]+$', v):
+        if not re.match(r'^[a-z0-9_]+(?:\.[a-z0-9_]+)?$', v):
             raise ValueError(
-                "Job type must contain only lowercase alphanumeric characters and underscores"
+                "Job type must contain only lowercase alphanumeric characters, underscores, and at most one dot separator"
             )
+        base_job_type = v.split('.', 1)[0]
         valid_types = {
-            "docking", "protein_analysis", "genome_analysis", 
-            "drug_repurposing", "target_prioritization", "portfolio_analysis"
+            "docking", "protein_analysis", "genome_analysis",
+            "drug_repurposing", "target_prioritization", "portfolio_analysis",
+            "report_generation", "fail_demo",
         }
-        if v not in valid_types:
+        if base_job_type not in valid_types:
             raise ValueError(
                 f"Unknown job type '{v}'. Valid types: {', '.join(sorted(valid_types))}"
             )

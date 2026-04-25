@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import Mock, patch, MagicMock
 import json
+import tempfile
+from pathlib import Path
 import numpy as np
 
 from variant_prioritizer import VariantPrioritizer
@@ -293,3 +295,66 @@ class TestVariantPrioritizerWithMockedModels(TestVariantPrioritizer):
     def test_predict_without_models(self):
         """Skip this inherited test - MockedModels always loads models."""
         self.skipTest("Parent test not applicable to MockedModels - models always loaded")
+
+
+class TestVariantPrioritizerCacheAndFallbacks(unittest.TestCase):
+    """Focused tests for HF cache behavior and fallback model selection."""
+
+    def test_cached_artifacts_skip_download(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_root = Path(tmpdir) / "cache"
+            repo_dir = cache_root / "omshrivastava--omnibimol-variant-priority"
+            repo_dir.mkdir(parents=True, exist_ok=True)
+            (repo_dir / "rf_protein.pkl").write_text("cached")
+
+            download = MagicMock(side_effect=AssertionError("download should not run"))
+            with patch("variant_prioritizer._lazy_import_hf_hub", return_value=download):
+                prioritizer = VariantPrioritizer(cache_path=str(cache_root), enable_remote_download=True)
+                resolved = prioritizer._get_or_download_artifacts()
+
+            self.assertEqual(resolved, repo_dir)
+            download.assert_not_called()
+
+    def test_model_selection_prefers_precomputed_then_protein_then_lr(self):
+        prioritizer = VariantPrioritizer(enable_remote_download=False)
+        prioritizer._model_loaded = True
+
+        prioritizer._xgb_model = MagicMock()
+        prioritizer._xgb_model.predict_proba.return_value = [[0.2, 0.8]]
+        prioritizer._rf_model = MagicMock()
+        prioritizer._rf_model.predict_proba.return_value = [[0.4, 0.6]]
+        prioritizer._lr_model = MagicMock()
+        prioritizer._lr_model.predict_proba.return_value = [[0.55, 0.45]]
+
+        precomputed_features = {
+            "gpn_msa_score": 0.85,
+            "cadd_raw": 5.2,
+            "cadd_phred": 25.3,
+            "phyloP100way_vertebrate": 2.1,
+            "phyloP241way_mammalian": 1.8,
+            "phastCons100way_vertebrate": 0.9,
+            "phastCons241way_mammalian": 0.85,
+            "esm1b_embedding_mean": 0.42,
+            "esm1b_embedding_max": 0.91,
+            "esm1b_embedding_norm": 0.55,
+            "nt_score": 0.73,
+            "hyena_dna_embedding_mean": 0.38,
+        }
+        protein_features = {
+            "aa_position": 150,
+            "aa_change_type": 1,
+            "domain_score": 0.8,
+            "conservation_score": 0.9,
+            "blosum62_score": 0.8,
+            "grantham_distance": 0.7,
+            "sift_score": 0.9,
+            "polyphen_score": 0.8,
+        }
+
+        xgb_result = prioritizer.predict_pathogenicity(precomputed_features, feature_type="auto")
+        rf_result = prioritizer.predict_pathogenicity(protein_features, feature_type="auto")
+        lr_result = prioritizer.predict_pathogenicity({"some_feature": 0.5}, feature_type="auto")
+
+        self.assertEqual(xgb_result["model_used"], "xgb_precomputed")
+        self.assertEqual(rf_result["model_used"], "rf_protein")
+        self.assertEqual(lr_result["model_used"], "lr_protein")

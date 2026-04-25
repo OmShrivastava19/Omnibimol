@@ -19,6 +19,7 @@ degrade on artifact unavailability.
 
 import json
 import logging
+import math
 import os
 import warnings
 from pathlib import Path
@@ -251,7 +252,8 @@ class VariantPrioritizer:
         """Get cached artifacts or download from Hugging Face."""
         # Check local cache first
         cached_repo = self.cache_path / self.hf_repo_id.replace("/", "--")
-        if cached_repo.exists():
+        cached_repo.mkdir(parents=True, exist_ok=True)
+        if self._has_artifacts(cached_repo):
             return cached_repo
         
         if not self.enable_remote_download:
@@ -279,9 +281,10 @@ class VariantPrioritizer:
                 revision=self.hf_revision,
                 cache_dir=str(self.cache_path.parent),
                 local_dir_use_symlinks=False,
-                local_dir=str(cached_repo.parent),
+                local_dir=str(cached_repo),
                 allow_patterns=[
                     "xgb_precomputed.json",
+                    "xgb_precomputed.pkl",
                     "xgb_precomputed_imp.pkl",
                     "xgb_precomputed_scaler.pkl",
                     "rf_protein.pkl",
@@ -294,10 +297,30 @@ class VariantPrioritizer:
                     "research_memo.md",
                 ],
             )
-            return Path(repo_path)
+            downloaded_repo = Path(repo_path)
+            return downloaded_repo if self._has_artifacts(downloaded_repo) else None
         except Exception as e:
             logger.error(f"Failed to download model artifacts: {e}")
-            return None
+            return cached_repo if self._has_artifacts(cached_repo) else None
+
+    @staticmethod
+    def _has_artifacts(repo_path: Path) -> bool:
+        """Check whether a cache directory contains at least one expected artifact."""
+        expected_files = [
+            "xgb_precomputed.json",
+            "xgb_precomputed.pkl",
+            "xgb_precomputed_imp.pkl",
+            "xgb_precomputed_scaler.pkl",
+            "rf_protein.pkl",
+            "rf_protein_imp.pkl",
+            "rf_protein_scaler.pkl",
+            "lr_protein.pkl",
+            "lr_protein_imp.pkl",
+            "lr_protein_scaler.pkl",
+            "metrics_summary.json",
+            "research_memo.md",
+        ]
+        return any((repo_path / filename).exists() for filename in expected_files)
     
     def _load_xgboost_models(self, repo_path: Path) -> bool:
         """Load XGBoost model and preprocessing artifacts."""
@@ -474,6 +497,10 @@ class VariantPrioritizer:
         # Auto-detect feature type if needed
         if feature_type == "auto":
             feature_type = self._detect_feature_type(features)
+        elif feature_type in {"precomputed", "protein"}:
+            validation = self.validate_features(features, feature_type)
+            if not validation["valid"]:
+                feature_type = self._detect_feature_type(features)
         
         # Route to appropriate scoring method
         if feature_type == "precomputed" and self._xgb_model is not None:
@@ -491,15 +518,11 @@ class VariantPrioritizer:
     
     def _detect_feature_type(self, features: Dict[str, Any]) -> str:
         """Auto-detect which feature set is available."""
-        has_precomputed = all(f in features for f in PRE_COMPUTED_FEATURES[:5])  # Check key subset
-        has_protein = all(f in features for f in PROTEIN_FEATURES[:3])
-        
-        if has_precomputed:
+        if self.validate_features(features, "precomputed")["valid"]:
             return "precomputed"
-        elif has_protein:
+        if self.validate_features(features, "protein")["valid"]:
             return "protein"
-        else:
-            return "minimal"
+        return "minimal"
     
     def _score_xgboost(self, features: Dict[str, Any]) -> Dict[str, Any]:
         """Score using XGBoost with precomputed missense features."""
@@ -804,8 +827,11 @@ class VariantPrioritizer:
                 missing.append(feat)
             else:
                 try:
-                    float(features[feat])
-                    present.append(feat)
+                    value = float(features[feat])
+                    if math.isfinite(value):
+                        present.append(feat)
+                    else:
+                        invalid.append(feat)
                 except (TypeError, ValueError):
                     invalid.append(feat)
         

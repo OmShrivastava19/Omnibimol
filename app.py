@@ -25,17 +25,17 @@ import sys
 import urllib.parse
 import logging
 
-# Frontend error handling with structured logging
-from frontend_errors import (
-    OmniBiMolError,
-    DataValidationError,
-    ExternalServiceError,
-    StructurePredictionError,
-    DockingError,
-    AnalysisError,
-    DatabaseError,
-    create_log_context,
-)
+# # Frontend error handling with structured logging
+# from frontend_errors import (
+#     OmniBiMolError,
+#     DataValidationError,
+#     ExternalServiceError,
+#     StructurePredictionError,
+#     DockingError,
+#     AnalysisError,
+#     DatabaseError,
+#     create_log_context,
+# )
 
 # Configure structured logging
 logger = logging.getLogger(__name__)
@@ -58,6 +58,7 @@ from cache_manager import (
     cached_fetch_pubchem_structure,
     cached_fetch_kegg_pathways,
     cached_predict_ligand_binding,
+    cached_predict_protein_localization,
 )
 # Protein visualization: interactive Plotly charts for protein analysis
 from visualizations import ProteinVisualizer
@@ -1065,6 +1066,7 @@ def main():
             "Sequence Analysis",
             "Whole Genome Sequencing",
             "Drugs & Clinical Trials",
+            "🧪 ChemProt Interaction",
             "🧠 Academic Models",
             "📁 Portfolio Mode",
             "🎯 Target Prioritization",
@@ -1129,6 +1131,9 @@ def main():
         return
     elif st.session_state.get('current_page') == "Drugs & Clinical Trials":
         render_drugs_clinical_trials_page()
+        return
+    elif st.session_state.get('current_page') == "🧪 ChemProt Interaction":
+        render_chemprot_interaction_page()
         return
     elif st.session_state.get('current_page') == "🧠 Academic Models":
         render_academic_models_page()
@@ -2087,18 +2092,85 @@ def main():
         
         # Section 5: Subcellular Localization
         st.header("📍 Subcellular Localization")
-        
-        if not subcellular_df.empty:
-            # Create and display heatmap
-            fig_subcellular = ProteinVisualizer.create_subcellular_heatmap(subcellular_df)
-            st.plotly_chart(fig_subcellular, width='stretch')
-            
-            # Location list
-            st.markdown("**Detected Locations:**")
-            for idx, row in subcellular_df.iterrows():
-                st.markdown(f"- **{row['location']}** ({row['reliability']} confidence)")
-        else:
-            st.warning("⚠️ No subcellular localization data available from Human Protein Atlas")
+
+        localization_threshold = st.slider(
+            "Evidence filter threshold",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.6,
+            step=0.05,
+            help="Predictions below this confidence are marked as not evidence-passed.",
+            key="localization_threshold",
+        )
+
+        protein_sequence = uniprot_data.get('sequence', '')
+        localization_prediction = None
+        if protein_sequence:
+            try:
+                localization_prediction = cached_predict_protein_localization(
+                    protein_sequence,
+                    localization_threshold,
+                    st.session_state.api_client,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Localization prediction unavailable: %s",
+                    exc,
+                    extra=create_log_context(
+                        "protein_localization",
+                        protein_id=st.session_state.current_uniprot_id,
+                        error_type=type(exc).__name__,
+                    ),
+                )
+                localization_prediction = {"error": "Localization model is temporarily unavailable."}
+
+        left_col, right_col = st.columns([1, 1])
+        with left_col:
+            if localization_prediction and localization_prediction.get("error"):
+                st.warning(f"⚠️ {localization_prediction['error']}")
+            elif localization_prediction:
+                st.markdown(f"### {localization_prediction.get('localization', 'Unknown')}")
+                st.progress(min(max(float(localization_prediction.get('confidence', 0.0)), 0.0), 1.0))
+                st.caption(f"Confidence: {localization_prediction.get('confidence', 0.0):.3f}")
+                st.caption(
+                    f"Evidence pass: {'Yes' if localization_prediction.get('evidence_passed') else 'No'} | "
+                    f"Sequence length: {localization_prediction.get('sequence_length', len(protein_sequence))} aa"
+                )
+                st.markdown(
+                    f"""
+                    <div class="metric-card">
+                        <h3 style="margin:0; color:#1f77b4;">{localization_prediction.get('wetlab_prioritization_score', 0):.1f}</h3>
+                        <p style="margin:0; color:#666;">Wet-Lab Prioritization Score</p>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                st.info(localization_prediction.get("recommended_assay", "No assay recommendation available."))
+
+                if localization_prediction.get("all_probabilities"):
+                    st.dataframe(
+                        pd.DataFrame(
+                            [
+                                {"Compartment": label, "Probability": probability}
+                                for label, probability in localization_prediction["all_probabilities"].items()
+                            ]
+                        ).sort_values("Probability", ascending=False),
+                        width='stretch',
+                        hide_index=True,
+                    )
+            else:
+                st.info("⚠️ Run localization inference to see a predicted compartment and wet-lab guidance.")
+
+        with right_col:
+            if not subcellular_df.empty:
+                fig_subcellular = ProteinVisualizer.create_subcellular_heatmap(subcellular_df)
+                st.plotly_chart(fig_subcellular, width='stretch')
+
+                st.markdown("**Detected Locations:**")
+                for idx, row in subcellular_df.iterrows():
+                    st.markdown(f"- **{row['location']}** ({row['reliability']} confidence)")
+            else:
+                st.warning("⚠️ No subcellular localization data available from Human Protein Atlas")
 
         st.divider()
         
@@ -6988,6 +7060,164 @@ def _render_status_badge(label: str, value: str) -> None:
     )
 
 
+def render_chemprot_interaction_page():
+    """Render the ChemProt interaction scoring page."""
+    st.header("🧪 ChemProt Interaction")
+    st.caption("LoRA-backed ChemProt scoring with deterministic fallback when the HF adapter is unavailable.")
+
+    api_client = st.session_state.api_client
+
+    health = st.session_state.get("chemprot_health_snapshot")
+    refresh_requested = st.button("Refresh ChemProt health", key="chemprot_refresh_health")
+    if refresh_requested or health is None:
+        try:
+            health = api_client.get_chemprot_health()
+            st.session_state.chemprot_health_snapshot = health
+        except Exception as exc:
+            health = {"status": "error", "error": str(exc)}
+            st.session_state.chemprot_health_snapshot = health
+
+    if health:
+        health_backend = health.get("backend", {}) if isinstance(health.get("backend"), dict) else {}
+        health_cols = st.columns(4)
+        with health_cols[0]:
+            st.metric("Status", str(health.get("status", "unknown")))
+        with health_cols[1]:
+            st.metric("Enabled", "Yes" if health.get("enabled") else "No")
+        with health_cols[2]:
+            st.metric("Backend", str(health_backend.get("backend", "unknown")))
+        with health_cols[3]:
+            st.metric("Ensemble", "Yes" if health.get("ensemble_enabled") else "No")
+
+    st.markdown("Provide one chemical, a candidate protein set, and at least one abstract to score interaction evidence.")
+
+    with st.form("chemprot_scoring_form"):
+        chemical = st.text_input("Chemical / drug name", value=st.session_state.get("chemprot_chemical", "imatinib"))
+        candidate_input = st.text_area(
+            "Candidate proteins (comma or newline separated)",
+            value=st.session_state.get("chemprot_candidate_input", "ABL1, EGFR"),
+            height=100,
+        )
+        disease_context = st.text_input(
+            "Disease context",
+            value=st.session_state.get("chemprot_disease_context", "leukemia"),
+        )
+        pmid = st.text_input("PMID (optional)", value=st.session_state.get("chemprot_pmid", "11111111"))
+        title = st.text_input("Abstract title (optional)", value=st.session_state.get("chemprot_title", "Imatinib and ABL1"))
+        abstract = st.text_area(
+            "Abstract text",
+            value=st.session_state.get(
+                "chemprot_abstract",
+                "Imatinib interacts with ABL1 in chronic myeloid leukemia.",
+            ),
+            height=180,
+        )
+        max_results = st.slider("Max ranked targets", 1, 25, int(st.session_state.get("chemprot_max_results", 10)))
+        runtime_mode = st.selectbox("Runtime mode", ["native", "simulation"], index=0)
+        submitted = st.form_submit_button("Score interactions", type="primary")
+
+    if submitted:
+        cleaned_candidates = _parse_target_inputs(candidate_input)
+        if not chemical.strip():
+            st.warning("Please provide a chemical or drug name.")
+            return
+        if not abstract.strip():
+            st.warning("Please provide an abstract.")
+            return
+
+        st.session_state.chemprot_chemical = chemical
+        st.session_state.chemprot_candidate_input = candidate_input
+        st.session_state.chemprot_disease_context = disease_context
+        st.session_state.chemprot_pmid = pmid
+        st.session_state.chemprot_title = title
+        st.session_state.chemprot_abstract = abstract
+        st.session_state.chemprot_max_results = max_results
+
+        payload = {
+            "chemical": chemical.strip(),
+            "drug_name": chemical.strip(),
+            "disease_context": disease_context.strip() or None,
+            "candidate_proteins": cleaned_candidates or None,
+            "abstracts": [
+                {
+                    "pmid": pmid.strip() or None,
+                    "title": title.strip() or None,
+                    "abstract": abstract.strip(),
+                }
+            ],
+            "pmids": [pmid.strip()] if pmid.strip() else None,
+            "max_results": max_results,
+            "runtime_mode": runtime_mode,
+        }
+
+        with st.spinner("Scoring ChemProt interaction evidence..."):
+            try:
+                result = api_client.score_chemprot_interaction(payload=payload)
+                st.session_state.chemprot_last_result = result
+                st.session_state.chemprot_last_request = payload
+            except Exception as exc:
+                st.session_state.chemprot_last_result = {"status": "error", "error": str(exc)}
+                st.error(f"ChemProt scoring failed: {exc}")
+
+    result = st.session_state.get("chemprot_last_result")
+    if not result:
+        return
+
+    if result.get("status") == "error":
+        st.error(result.get("error", "ChemProt scoring failed"))
+        return
+
+    summary_cols = st.columns(5)
+    with summary_cols[0]:
+        st.metric("Interaction probability", f"{float(result.get('interaction_probability', 0.0)):.2f}")
+    with summary_cols[1]:
+        st.metric("Final score", f"{float(result.get('final_score', 0.0)):.2f}")
+    with summary_cols[2]:
+        st.metric("Reranker used", "Yes" if result.get("reranker_used") else "No")
+    with summary_cols[3]:
+        st.metric("Degraded mode", "Yes" if result.get("degraded_mode") else "No")
+    with summary_cols[4]:
+        st.metric("Latency (ms)", f"{float(result.get('latency_ms', 0.0)):.1f}")
+
+    ranked_targets = result.get("ranked_targets", []) or []
+    if ranked_targets:
+        ranked_df = pd.DataFrame(
+            [
+                {
+                    "Protein": row.get("protein"),
+                    "Final score": row.get("final_score"),
+                    "Interaction probability": row.get("interaction_probability"),
+                    "Reranker used": row.get("reranker_used"),
+                    "Evidence count": len(row.get("evidence", []) or []),
+                }
+                for row in ranked_targets
+            ]
+        )
+        st.subheader("Ranked targets")
+        st.dataframe(ranked_df, width="stretch", hide_index=True)
+
+    evidence_rows = result.get("evidence", []) or []
+    if evidence_rows:
+        st.subheader("Evidence")
+        st.dataframe(pd.DataFrame(evidence_rows), width="stretch", hide_index=True)
+
+    detail_cols = st.columns(2)
+    with detail_cols[0]:
+        st.subheader("Resolved inputs")
+        st.json(
+            {
+                "resolved_candidate_proteins": result.get("resolved_candidate_proteins", []),
+                "resolved_abstracts": result.get("resolved_abstracts", []),
+            }
+        )
+    with detail_cols[1]:
+        st.subheader("Model metadata")
+        st.json(result.get("model_metadata", {}))
+
+    with st.expander("Raw response", expanded=False):
+        st.json(result)
+
+
 def _render_deepathnet_prediction(prediction: Dict) -> None:
     summary = prediction.get("cohort_summary", {}) if isinstance(prediction, dict) else {}
     rows = prediction.get("per_sample_predictions", []) if isinstance(prediction, dict) else []
@@ -7904,17 +8134,17 @@ def render_variant_to_therapy_page():
 
             progress.progress(40, text="Annotating variant effects...")
             annotated = engine.annotate_variant_effects(filtered)
-             progress.progress(55, text="Aggregating gene impact...")
-             gene_impact = engine.aggregate_gene_impact(annotated)
- 
-             progress.progress(62, text="Computing research-backed pathogenicity scores...")
-             try:
-                 annotated = engine.score_variant_pathogenicity(annotated, use_prioritization=True)
-             except Exception as e:
-                 st.warning(f"Pathogenicity scoring failed: {e}. Using heuristic scores.")
-                 annotated = engine.score_variant_pathogenicity(annotated, use_prioritization=False)
- 
-             progress.progress(70, text="Scoring pathway impact...")
+            progress.progress(55, text="Aggregating gene impact...")
+            gene_impact = engine.aggregate_gene_impact(annotated)
+
+            progress.progress(62, text="Computing research-backed pathogenicity scores...")
+            try:
+                annotated = engine.score_variant_pathogenicity(annotated, use_prioritization=True)
+            except Exception as e:
+                st.warning(f"Pathogenicity scoring failed: {e}. Using heuristic scores.")
+                annotated = engine.score_variant_pathogenicity(annotated, use_prioritization=False)
+
+            progress.progress(70, text="Scoring pathway impact...")
             pathway_map = {"pathways": []}
             for gene in list(gene_impact.get("genes", {}).keys())[:10]:
                 try:

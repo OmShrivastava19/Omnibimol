@@ -13,6 +13,7 @@ from backend.api.routes.chemprot import router as chemprot_router
 from backend.api.routes.health import router as health_router
 from backend.api.routes.jobs import router as jobs_router
 from backend.api.routes.multiomics import router as multiomics_router
+from backend.api.routes.protein_localization import router as protein_localization_router
 from backend.api.routes.projects import router as projects_router
 from backend.api.routes.reliability import router as reliability_router
 from backend.core.config import get_settings
@@ -65,6 +66,7 @@ def create_app() -> FastAPI:
             "health": f"{settings.api_prefix}/healthz",
             "ready": f"{settings.api_prefix}/readyz",
             "academic_models": f"{settings.api_prefix}/academic-models/models",
+            "protein_localization": f"{settings.api_prefix}/protein-localization/health",
         }
 
     app.include_router(health_router, prefix=settings.api_prefix)
@@ -72,6 +74,7 @@ def create_app() -> FastAPI:
     app.include_router(projects_router, prefix=settings.api_prefix)
     app.include_router(jobs_router, prefix=settings.api_prefix)
     app.include_router(multiomics_router, prefix=settings.api_prefix)
+    app.include_router(protein_localization_router, prefix=settings.api_prefix)
     app.include_router(chemprot_router, prefix=settings.api_prefix)
     app.include_router(academic_models_router, prefix=settings.api_prefix)
     app.include_router(audit_router, prefix=settings.api_prefix)

@@ -6,6 +6,7 @@ from fastapi import APIRouter
 
 from backend.core.config import get_settings
 from backend.services.chemprot import get_chemprot_service
+from backend.services.protein_localization import get_protein_localization_service
 
 router = APIRouter(tags=["health"])
 
@@ -29,5 +30,6 @@ def readyz() -> dict[str, object]:
         "docking_enabled": settings.docking_enabled,
         "docking_engine": settings.docking_engine,
         "chemprot": get_chemprot_service().health_snapshot(),
+        "protein_localization": get_protein_localization_service().health_snapshot(),
         "timestamp_utc": datetime.now(UTC).isoformat(),
     }

@@ -440,6 +440,12 @@ def cached_predict_ligand_binding(smiles_list: tuple, names_list: tuple, _api_cl
     return _api_client.predict_ligand_binding(list(smiles_list), list(names_list))
 
 
+@st.cache_data(ttl=86400)
+def cached_predict_protein_localization(sequence: str, confidence_threshold: float, _api_client):
+    """Cache protein localization predictions."""
+    return _api_client.predict_protein_localization(sequence=sequence, confidence_threshold=confidence_threshold)
+
+
 # UTILITY FUNCTIONS
 
 def get_cache_hash(key: str) -> str:

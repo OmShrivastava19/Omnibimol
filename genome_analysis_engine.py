@@ -12,6 +12,11 @@ import json
 import numpy as np
 from enum import Enum
 
+try:
+    from variant_therapy_engine import VariantTherapyEngine
+except ImportError:
+    VariantTherapyEngine = None
+
 
 class VariantType(Enum):
     """Classification of genetic variants"""
@@ -45,6 +50,11 @@ class Variant:
     alternate: str = ""
     sequence_match: str = ""
     confidence: float = 0.8  # 0-1
+    pathogenicity_score: Optional[float] = None
+    pathogenicity_tier: Optional[int] = None
+    pathogenicity_method: str = ""
+    model_confidence: str = ""
+    evidence_summary: str = ""
     
     def to_dict(self) -> Dict:
         """Convert to dictionary"""
@@ -57,7 +67,12 @@ class Variant:
             'reference': self.reference,
             'alternate': self.alternate,
             'sequence_match': self.sequence_match,
-            'confidence': self.confidence
+            'confidence': self.confidence,
+            'pathogenicity_score': self.pathogenicity_score,
+            'pathogenicity_tier': self.pathogenicity_tier,
+            'pathogenicity_method': self.pathogenicity_method,
+            'model_confidence': self.model_confidence,
+            'evidence_summary': self.evidence_summary,
         }
 
 
@@ -289,7 +304,10 @@ class MutationAnalyzer:
         for variant in variants:
             gene_info = self.DISEASE_GENES.get(variant.gene, {})
             penetrance = gene_info.get('penetrance', 0.5)
-            confidence = variant.confidence
+            confidence = max(
+                variant.confidence,
+                variant.pathogenicity_score if variant.pathogenicity_score is not None else 0.0,
+            )
             
             # Contribution increases with penetrance and confidence
             risk_contribution = penetrance * confidence * 40  # Scale to 0-40
@@ -799,18 +817,24 @@ class GenomeAnalysisEngine:
     Supports caching for performance optimization.
     """
     
-    def __init__(self, cache_manager=None):
+    def __init__(self, cache_manager=None, variant_therapy_engine=None):
         self.mutation_analyzer = MutationAnalyzer()
         self.biomarker_detector = BiomarkerDetector()
         self.disease_mapper = DiseaseAssociationMapper()
         self.recommendation_engine = PersonalizedRecommendationEngine()
         self.cache_manager = cache_manager  # Optional cache manager for persistent storage
+        self.variant_therapy_engine = variant_therapy_engine
+        if self.variant_therapy_engine is None and VariantTherapyEngine is not None:
+            try:
+                self.variant_therapy_engine = VariantTherapyEngine()
+            except Exception:
+                self.variant_therapy_engine = None
     
     def _generate_sequence_hash(self, sequence: str) -> str:
         """Generate a hash of the sequence for caching purposes"""
         return hashlib.md5(sequence.upper().encode()).hexdigest()
     
-    def analyze_genome(self, sequence: str, user_metadata: Optional[Dict] = None) -> Dict:
+    def analyze_genome(self, sequence: str, user_metadata: Optional[Dict] = None, annotated_variants: Optional[List[Dict]] = None) -> Dict:
         """
         Comprehensive genome analysis pipeline with caching support.
         
@@ -842,6 +866,18 @@ class GenomeAnalysisEngine:
         disease_associations = self.disease_mapper.map_disease_associations(
             variants, biomarkers, user_metadata
         )
+
+        variant_prioritization = None
+        if annotated_variants:
+            scored_variants = self._score_annotated_variants(annotated_variants)
+            variant_prioritization = {
+                'scored_variants': scored_variants,
+                'total_variants': len(scored_variants),
+                'high_confidence_variants': len([
+                    row for row in scored_variants
+                    if float(row.get('pathogenicity_score', 0.0) or 0.0) >= 0.75
+                ]),
+            }
         
         # Step 4: Generate recommendations
         recommendations = self.recommendation_engine.generate_recommendations(
@@ -870,6 +906,7 @@ class GenomeAnalysisEngine:
                 'high_confidence': len([a for a in disease_associations if a.confidence == ConfidenceLevel.VERY_HIGH]),
                 'moderate_confidence': len([a for a in disease_associations if a.confidence == ConfidenceLevel.HIGH])
             },
+            'variant_prioritization': variant_prioritization,
             'recommendations': recommendations,
             'analysis_metadata': {
                 'user_age': user_metadata.get('age'),
@@ -888,6 +925,25 @@ class GenomeAnalysisEngine:
                 pass
         
         return results
+
+    def _score_annotated_variants(self, annotated_variants: List[Dict]) -> List[Dict]:
+        """Score annotated variant payloads when a prioritizer is available."""
+        if not annotated_variants:
+            return []
+
+        if self.variant_therapy_engine is None:
+            return [dict(variant) for variant in annotated_variants]
+
+        try:
+            return self.variant_therapy_engine.score_variant_pathogenicity(
+                [dict(variant) for variant in annotated_variants],
+                use_prioritization=True,
+            )
+        except Exception:
+            return self.variant_therapy_engine.score_variant_pathogenicity(
+                [dict(variant) for variant in annotated_variants],
+                use_prioritization=False,
+            )
     
     def _calculate_gc_content(self, sequence: str) -> float:
         """Calculate GC content percentage"""

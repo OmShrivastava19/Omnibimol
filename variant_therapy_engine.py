@@ -7,6 +7,7 @@ import csv
 import io
 import json
 import math
+import os
 import re
 import warnings
 from collections import defaultdict
@@ -35,15 +36,36 @@ class VariantTherapyEngine:
 
     DISCLAIMER = "For research use only. Not for clinical diagnosis/treatment decisions."
 
-    def __init__(self, api_client: Optional[Any] = None, cache_manager: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        api_client: Optional[Any] = None,
+        cache_manager: Optional[Any] = None,
+        prioritizer: Optional[Any] = None,
+        prioritizer_cache_path: Optional[str] = None,
+        enable_prioritizer_download: Optional[bool] = None,
+    ) -> None:
         self.api_client = api_client
         self.cache = cache_manager
         
         # Initialize variant prioritizer (research-backed scoring)
         self._prioritizer = None
-        if VARIANT_PRIORITIZER_AVAILABLE:
+        if prioritizer is not None:
+            self._prioritizer = prioritizer
+        elif VARIANT_PRIORITIZER_AVAILABLE:
             try:
-                self._prioritizer = VariantPrioritizer(enable_remote_download=False)
+                cache_path = prioritizer_cache_path or os.getenv(
+                    "OMNIBIMOL_VARIANT_PRIORITY_CACHE",
+                    "./cache/hf_artifacts",
+                )
+                if enable_prioritizer_download is None:
+                    enable_prioritizer_download = os.getenv(
+                        "OMNIBIMOL_VARIANT_PRIORITY_ENABLE_REMOTE_DOWNLOAD",
+                        "true",
+                    ).strip().lower() in {"1", "true", "yes", "on"}
+                self._prioritizer = VariantPrioritizer(
+                    cache_path=cache_path,
+                    enable_remote_download=enable_prioritizer_download,
+                )
             except Exception as e:
                 warnings.warn(f"Could not initialize VariantPrioritizer: {e}")
 
@@ -233,6 +255,8 @@ class VariantTherapyEngine:
             zygosity_factor = self._avg([self._zygosity_factor(r.get("genotype", "")) for r in rows], default=0.5)
             confidence_factor = self._avg([self._confidence_to_numeric(r.get("confidence", "Low")) for r in rows], default=0.4)
             qual_penalty = self._avg([self._quality_penalty(r) for r in rows], default=0.0)
+            mean_pathogenicity = self._avg([float(r.get("pathogenicity_score", r.get("impact_score", 0.0))) for r in rows], default=0.0)
+            mean_model_confidence = self._avg([self._confidence_to_numeric(str(r.get("model_confidence", r.get("confidence", "Low")))) for r in rows], default=0.35)
             
             raw_score = 100.0 * (
                 0.35 * burden
@@ -266,6 +290,8 @@ class VariantTherapyEngine:
                 "variant_count": len(rows),
                 "burden": round(burden, 4),
                 "severity": round(severity, 4),
+                "mean_pathogenicity_score": round(mean_pathogenicity, 4),
+                "mean_model_confidence": round(mean_model_confidence, 4),
                 "zygosity_factor": round(zygosity_factor, 4),
                 "confidence_factor": round(confidence_factor, 4),
                 "uncertainty_penalty": round(uncertainty_penalty, 2),
@@ -278,6 +304,8 @@ class VariantTherapyEngine:
                         "impact_score": d.get("impact_score"),
                         "pathogenicity_score": d.get("pathogenicity_score"),
                         "pathogenicity_tier": d.get("pathogenicity_tier"),
+                        "model_confidence": d.get("model_confidence"),
+                        "evidence_summary": d.get("evidence_summary"),
                         "confidence": d.get("confidence"),
                         "pathogenicity_method": d.get("pathogenicity_method", "heuristic"),
                     }
@@ -445,11 +473,26 @@ class VariantTherapyEngine:
     ) -> Dict[str, Any]:
         """Build transparent explainability payload with drivers, risks, and next tests."""
         top_pathways = pathway_impact.get("pathways", [])[:3]
+        top_variant_drivers: List[Dict[str, Any]] = []
+        for gene_payload in list(gene_impact.get("genes", {}).values())[:5]:
+            top_variant_drivers.extend(gene_payload.get("top_driving_variants", [])[:3])
         payload: Dict[str, Any] = {
             "global": {
                 "disclaimer": self.DISCLAIMER,
                 "ingestion_stats": parsing_stats,
                 "top_pathways": top_pathways,
+                "pathogenicity_context": {
+                    "top_driving_variants": top_variant_drivers[:10],
+                    "top_gene_pathogenicity": [
+                        {
+                            "gene": gene_payload.get("gene"),
+                            "mean_pathogenicity_score": gene_payload.get("mean_pathogenicity_score"),
+                            "mean_model_confidence": gene_payload.get("mean_model_confidence"),
+                            "score": gene_payload.get("score"),
+                        }
+                        for gene_payload in list(gene_impact.get("genes", {}).values())[:5]
+                    ],
+                },
             },
             "therapy_options": [],
         }
@@ -473,6 +516,13 @@ class VariantTherapyEngine:
                     "confidence": cand.get("ranking_confidence"),
                     "top_3_drivers": drivers[:3],
                     "top_3_risks": risks[:3],
+                    "pathogenicity_support": [
+                        {
+                            "gene": gene_payload.get("gene"),
+                            "top_variant": (gene_payload.get("top_driving_variants") or [{}])[0],
+                        }
+                        for gene_payload in list(gene_impact.get("genes", {}).values())[:3]
+                    ],
                     "required_next_validation_tests": validations,
                 }
             )
@@ -514,7 +564,8 @@ class VariantTherapyEngine:
         # Include pathogenicity score columns if available
         variant_cols = [
             "variant_key", "gene", "predicted_effect_class", "impact_score",
-            "confidence", "variant_type", "consequence", "genotype",
+            "confidence", "model_confidence", "pathogenicity_score", "pathogenicity_tier",
+            "pathogenicity_method", "evidence_summary", "variant_type", "consequence", "genotype",
             "qual", "filter",
         ]
         # Check for pathogenicity fields in first variant
@@ -523,6 +574,7 @@ class VariantTherapyEngine:
             variant_cols = [
                 "variant_key", "gene", "predicted_effect_class", "impact_score",
                 "pathogenicity_score", "pathogenicity_tier", "pathogenicity_method",
+                "model_confidence", "evidence_summary",
                 "confidence", "variant_type", "consequence", "genotype",
                 "qual", "filter",
             ]
@@ -662,7 +714,13 @@ class VariantTherapyEngine:
         return 0.5
 
     def _confidence_to_numeric(self, label: str) -> float:
-        return {"High": 0.9, "Med": 0.65, "Low": 0.35}.get(label, 0.35)
+        normalized = str(label or "").strip().lower()
+        return {
+            "high": 0.9,
+            "med": 0.65,
+            "medium": 0.65,
+            "low": 0.35,
+        }.get(normalized, 0.35)
 
     def _quality_penalty(self, variant: Dict[str, Any]) -> float:
         qual = self._safe_float(variant.get("qual"), 20.0)
@@ -907,26 +965,29 @@ class VariantTherapyEngine:
         if not use_prioritization or self._prioritizer is None:
             # Fallback: use existing impact scores linearly scaled to [0, 1]
             for variant in annotated_variants:
-                variant["pathogenicity_score"] = variant.get("impact_score", 0.0)
-                variant["pathogenicity_tier"] = self._assign_tier_from_score(
-                    variant["pathogenicity_score"]
-                )
+                score = self._clamp01(float(variant.get("impact_score", 0.0)))
+                variant["pathogenicity_score"] = score
+                variant["pathogenicity_tier"] = self._assign_tier_from_score(score)
                 variant["pathogenicity_method"] = "heuristic_fallback"
-                variant["confidence_label"] = variant.get("confidence", "Low")
+                confidence_label = str(variant.get("confidence", "Low")).title()
+                variant["model_confidence"] = confidence_label
+                variant["evidence_summary"] = "Heuristic fallback derived from impact_score because the prioritizer was unavailable or disabled."
+                variant["confidence_label"] = confidence_label
             return annotated_variants
         
         # Prepare features for prioritizer
         variant_features = []
         for variant in annotated_variants:
-            features = self._extract_prioritizer_features(variant)
-            variant_features.append((variant, features))
+            bundle = self._build_prioritizer_feature_bundle(variant)
+            variant_features.append((variant, bundle))
         
         # Batch score using prioritizer
-        features_list = [f for _, f in variant_features]
+        features_list = [bundle["features"] for _, bundle in variant_features]
         try:
-            predictions = self._prioritizer.batch_predict(
-                features_list, feature_type="auto"
-            )
+            predictions = [
+                self._prioritizer.predict_pathogenicity(bundle["features"], feature_type=bundle["feature_type"])
+                for _, bundle in variant_features
+            ]
         except Exception as e:
             warnings.warn(f"Pathogenicity prediction failed: {e}")
             # Fallback to heuristic
@@ -935,21 +996,81 @@ class VariantTherapyEngine:
             )
         
         # Merge predictions back into variants
-        for (variant, _), prediction in zip(variant_features, predictions):
-            variant["pathogenicity_score"] = prediction.get("score")
-            variant["pathogenicity_tier"] = prediction.get("tier")
-            variant["pathogenicity_method"] = prediction.get("model_used", "unknown")
-            variant["confidence_label"] = prediction.get("confidence_label", "low")
+        for (variant, bundle), prediction in zip(variant_features, predictions):
+            score = prediction.get("score")
+            if score is None:
+                score = self._clamp01(float(variant.get("impact_score", 0.0)))
+                tier = self._assign_tier_from_score(score)
+                method = "heuristic_fallback"
+                confidence_label = str(variant.get("confidence", "Low")).title()
+                fallback_reason = prediction.get("fallback_reason") or "models_unavailable"
+            else:
+                tier = prediction.get("tier")
+                method = prediction.get("model_used", "unknown")
+                confidence_label = str(prediction.get("confidence_label", "low")).title()
+                fallback_reason = prediction.get("fallback_reason")
+
+            variant["pathogenicity_score"] = self._clamp01(float(score))
+            variant["pathogenicity_tier"] = tier or self._assign_tier_from_score(variant["pathogenicity_score"])
+            variant["pathogenicity_method"] = method
+            variant["model_confidence"] = confidence_label
+            variant["evidence_summary"] = self._build_pathogenicity_evidence_summary(variant, prediction, bundle)
+            variant["confidence_label"] = confidence_label
             variant["pathogenicity_evidence"] = prediction.get(
                 "evidence_features_used", []
             )
             variant["pathogenicity_metadata"] = prediction.get("metadata", {})
             
             # Track fallback reason if applicable
-            if prediction.get("fallback_reason"):
-                variant["pathogenicity_fallback_reason"] = prediction["fallback_reason"]
+            if fallback_reason:
+                variant["pathogenicity_fallback_reason"] = fallback_reason
         
         return annotated_variants
+
+    def _build_prioritizer_feature_bundle(self, variant: Dict[str, Any]) -> Dict[str, Any]:
+        features = self._extract_prioritizer_features(variant)
+        if self._prioritizer is None:
+            return {"features": features, "feature_type": "minimal", "validation": {}}
+
+        precomputed_validation = self._prioritizer.validate_features(features, "precomputed")
+        protein_validation = self._prioritizer.validate_features(features, "protein")
+        if precomputed_validation["valid"]:
+            feature_type = "precomputed"
+        elif protein_validation["valid"]:
+            feature_type = "protein"
+        else:
+            feature_type = "minimal"
+        return {
+            "features": features,
+            "feature_type": feature_type,
+            "validation": {
+                "precomputed": precomputed_validation,
+                "protein": protein_validation,
+            },
+        }
+
+    def _build_pathogenicity_evidence_summary(
+        self,
+        variant: Dict[str, Any],
+        prediction: Dict[str, Any],
+        bundle: Dict[str, Any],
+    ) -> str:
+        model_used = prediction.get("model_used") or "heuristic_fallback"
+        feature_type = bundle.get("feature_type", "minimal")
+        used = prediction.get("evidence_features_used", [])
+        missing = prediction.get("missing_features", [])
+        pieces = [
+            f"{model_used} scored a {feature_type} variant",
+            f"{len(used)} features used",
+        ]
+        if missing:
+            pieces.append(f"{len(missing)} features imputed or unavailable")
+        if variant.get("consequence"):
+            pieces.append(f"consequence={variant.get('consequence')}")
+        fallback_reason = prediction.get("fallback_reason")
+        if fallback_reason:
+            pieces.append(f"fallback={fallback_reason}")
+        return "; ".join(pieces)
 
     def _extract_prioritizer_features(self, variant: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -963,32 +1084,33 @@ class VariantTherapyEngine:
         # Precomputed missense features (if available from external sources)
         # These would typically come from annotation databases
         info = variant.get("info", {})
+        consequence = str(variant.get("consequence", "")).lower()
+
+        def _set_numeric_feature(source_keys: List[str], target_key: str) -> None:
+            for source_key in source_keys:
+                if source_key in info:
+                    try:
+                        features[target_key] = float(info[source_key])
+                        return
+                    except (ValueError, TypeError):
+                        return
+
+        _set_numeric_feature(["gpn_msa_score"], "gpn_msa_score")
         
         # CADD score
-        if "CADD" in info:
-            try:
-                features["cadd_raw"] = float(info["CADD"])
-                features["cadd_phred"] = float(info["CADD"])  # Simplified
-            except (ValueError, TypeError):
-                pass
+        _set_numeric_feature(["CADD", "cadd_raw"], "cadd_raw")
+        if "cadd_raw" in features:
+            features["cadd_phred"] = features["cadd_raw"]
         
         # PhyloP (if available)
-        if "phyloP" in info:
-            try:
-                val = float(info["phyloP"])
-                features["phyloP100way_vertebrate"] = val
-                features["phyloP241way_mammalian"] = val
-            except (ValueError, TypeError):
-                pass
+        _set_numeric_feature(["phyloP", "phyloP100way_vertebrate"], "phyloP100way_vertebrate")
+        if "phyloP100way_vertebrate" in features:
+            features["phyloP241way_mammalian"] = features["phyloP100way_vertebrate"]
         
         # PhastCons (if available)
-        if "phastCons" in info:
-            try:
-                val = float(info["phastCons"])
-                features["phastCons100way_vertebrate"] = val
-                features["phastCons241way_mammalian"] = val
-            except (ValueError, TypeError):
-                pass
+        _set_numeric_feature(["phastCons", "phastCons100way_vertebrate"], "phastCons100way_vertebrate")
+        if "phastCons100way_vertebrate" in features:
+            features["phastCons241way_mammalian"] = features["phastCons100way_vertebrate"]
         
         # GERP++ (if available as proxy for conservation)
         if "GERP" in info:
@@ -998,19 +1120,17 @@ class VariantTherapyEngine:
                 pass
         
         # ESM-1b embedding stats (placeholder - would come from actual embedding)
-        # In practice, these would be computed from the protein sequence
-        features["esm1b_embedding_mean"] = 0.0
-        features["esm1b_embedding_max"] = 0.0
-        features["esm1b_embedding_norm"] = 0.0
+        _set_numeric_feature(["esm1b_embedding_mean"], "esm1b_embedding_mean")
+        _set_numeric_feature(["esm1b_embedding_max"], "esm1b_embedding_max")
+        _set_numeric_feature(["esm1b_embedding_norm"], "esm1b_embedding_norm")
         
         # NT score (nucleotide diversity proxy)
-        features["nt_score"] = 0.0
+        _set_numeric_feature(["nt_score", "NT"], "nt_score")
         
         # HyenaDNA embedding (placeholder)
-        features["hyena_dna_embedding_mean"] = 0.0
+        _set_numeric_feature(["hyena_dna_embedding_mean"], "hyena_dna_embedding_mean")
         
         # Protein-level / AA-change features (more commonly available)
-        consequence = variant.get("consequence", "").lower()
         impact_score = variant.get("impact_score", 0.0)
         
         # AA position in protein

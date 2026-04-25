@@ -2171,6 +2171,65 @@ class ProteinAPIClient:
                 },
             }
 
+    def get_chemprot_health(self) -> Dict:
+        """Fetch the ChemProt service health snapshot from the backend."""
+        return self._request_backend_json("GET", "/api/v1/chemprot/health", timeout=20.0)
+
+    def get_protein_localization_health(self) -> Dict:
+        """Fetch the protein localization service health snapshot from the backend."""
+        return self._request_backend_json("GET", "/api/v1/protein-localization/health", timeout=20.0)
+
+    def predict_protein_localization(
+        self,
+        *,
+        sequence: str,
+        confidence_threshold: float | None = None,
+        timeout: float = 120.0,
+    ) -> Dict:
+        """Submit a protein localization prediction request to the backend."""
+        payload: Dict[str, Any] = {"sequence": sequence}
+        if confidence_threshold is not None:
+            payload["confidence_threshold"] = confidence_threshold
+        metadata = self._request_backend_json_with_metadata(
+            "POST",
+            "/api/v1/protein-localization/predict",
+            json_body=payload,
+            timeout=timeout,
+        )
+        body = metadata.get("body", {})
+        if not isinstance(body, dict):
+            body = {"result": body}
+
+        headers = metadata.get("headers", {}) if isinstance(metadata.get("headers"), dict) else {}
+        request_id = headers.get("x-request-id") or headers.get("X-Request-Id")
+        response = dict(body)
+        response["_client_meta"] = {
+            "request_id": request_id,
+            "http_status": metadata.get("status_code"),
+        }
+        return response
+
+    def score_chemprot_interaction(self, *, payload: Dict, timeout: float = 120.0) -> Dict:
+        """Submit a ChemProt interaction scoring request to the backend."""
+        metadata = self._request_backend_json_with_metadata(
+            "POST",
+            "/api/v1/chemprot/score",
+            json_body=payload,
+            timeout=timeout,
+        )
+        body = metadata.get("body", {})
+        if not isinstance(body, dict):
+            body = {"result": body}
+
+        headers = metadata.get("headers", {}) if isinstance(metadata.get("headers"), dict) else {}
+        request_id = headers.get("x-request-id") or headers.get("X-Request-Id")
+        response = dict(body)
+        response["_client_meta"] = {
+            "request_id": request_id,
+            "http_status": metadata.get("status_code"),
+        }
+        return response
+
     def normalize_docking_result(self, docking_result: Dict, *, fallback_reason: str | None = None) -> Dict:
         normalized = dict(docking_result or {})
         normalized.setdefault("available", True)
