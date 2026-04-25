@@ -55,6 +55,17 @@ def create_app() -> FastAPI:
         response.headers["x-request-id"] = request_id
         return response
 
+    @app.get("/")
+    def root() -> dict[str, str]:
+        """Root endpoint for platform probes and service discovery."""
+        return {
+            "service": settings.app_name,
+            "status": "ok",
+            "health": f"{settings.api_prefix}/healthz",
+            "ready": f"{settings.api_prefix}/readyz",
+            "academic_models": f"{settings.api_prefix}/academic-models/models",
+        }
+
     app.include_router(health_router, prefix=settings.api_prefix)
     app.include_router(auth_router, prefix=settings.api_prefix)
     app.include_router(projects_router, prefix=settings.api_prefix)

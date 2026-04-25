@@ -10,6 +10,7 @@ import re
 import html
 import hashlib
 import sys
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +131,27 @@ class ProteinAPIClient:
         self.uniprot_base = "https://rest.uniprot.org"
         self.hpa_base = "https://www.proteinatlas.org/api"
         # self.backend_api_url = (backend_api_url or os.getenv("BACKEND_API_URL", "http://localhost:8000")).rstrip("/")
-        self.backend_api_url = (backend_api_url or os.getenv("BACKEND_API_URL", "https://omshrivastava-omnibimol.hf.space/")).rstrip("/")
+        raw_backend_url = backend_api_url or os.getenv("BACKEND_API_URL", "https://omshrivastava-omnibimol.hf.space/")
+        self.backend_api_url = self._normalize_backend_api_url(raw_backend_url)
+
+    @staticmethod
+    def _normalize_backend_api_url(url: str) -> str:
+        """Normalize backend URL and translate HF Space page URLs to runtime domains."""
+        normalized = (url or "").strip().rstrip("/")
+        parsed = urlparse(normalized)
+        host = (parsed.netloc or "").lower()
+
+        if host == "huggingface.co":
+            path_parts = [part for part in parsed.path.strip("/").split("/") if part]
+            if len(path_parts) >= 3 and path_parts[0] == "spaces":
+                owner = path_parts[1].strip().lower()
+                space = path_parts[2].strip().lower()
+                if owner and space:
+                    rewritten = f"https://{owner}-{space}.hf.space"
+                    logger.info("Normalized BACKEND_API_URL from huggingface.co/spaces to hf.space runtime domain")
+                    return rewritten
+
+        return normalized
         
     async def search_uniprot(self, protein_name: str, max_results: int = 5) -> List[Dict]:
         """
@@ -1795,9 +1816,20 @@ class ProteinAPIClient:
         try:
             from backend.auth.streamlit_integration import build_backend_auth_headers
 
-            return build_backend_auth_headers(dict(st.session_state))
+            headers = build_backend_auth_headers(dict(st.session_state))
         except Exception:
-            return {}
+            headers = {}
+
+        if "Authorization" not in headers and self.backend_api_url.endswith(".hf.space"):
+            hf_token = (
+                os.getenv("HUGGINGFACE_TOKEN")
+                or os.getenv("HF_TOKEN")
+                or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+            )
+            if hf_token:
+                headers["Authorization"] = f"Bearer {hf_token}"
+
+        return headers
 
     def _real_docking_dependency_message(self) -> str:
         return (

@@ -92,3 +92,18 @@ def test_predict_academic_model_retries_once_on_timeout(monkeypatch) -> None:
     assert out["status"] == "success"
     assert out["provenance"]["request_id"] == "req-timeout"
     assert calls["count"] == 2
+
+
+def test_backend_url_normalizes_huggingface_spaces_runtime_domain() -> None:
+    client = ProteinAPIClient(
+        _DummyCache(),
+        backend_api_url="https://huggingface.co/spaces/omshrivastava/Omnibimol",
+    )
+    assert client.backend_api_url == "https://omshrivastava-omnibimol.hf.space"
+
+
+def test_backend_headers_include_hf_token_for_hf_space(monkeypatch) -> None:
+    monkeypatch.setenv("HUGGINGFACE_TOKEN", "hf_test_token")
+    client = ProteinAPIClient(_DummyCache(), backend_api_url="https://omshrivastava-omnibimol.hf.space")
+    headers = client._build_backend_headers()
+    assert headers["Authorization"] == "Bearer hf_test_token"

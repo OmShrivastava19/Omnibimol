@@ -27,3 +27,14 @@ def test_request_id_header_echoed() -> None:
     response = client.get("/api/v1/healthz", headers={"x-request-id": "req-123"})
     assert response.status_code == 200
     assert response.headers["x-request-id"] == "req-123"
+
+
+def test_root_returns_probe_metadata() -> None:
+    client = TestClient(create_app())
+    response = client.get("/")
+    payload = response.json()
+    assert response.status_code == 200
+    assert payload["status"] == "ok"
+    assert payload["health"] == "/api/v1/healthz"
+    assert payload["ready"] == "/api/v1/readyz"
+    assert payload["academic_models"] == "/api/v1/academic-models/models"
