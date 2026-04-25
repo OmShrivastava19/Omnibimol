@@ -2993,6 +2993,10 @@ class ProteinAPIClient:
             
             # Predict for all molecules
             predictions = predictor.predict_batch(smiles_list, molecule_names)
+
+            model_metadata = None
+            if predictions:
+                model_metadata = predictions[0].get("prediction", {}).get("model_metadata")
             
             # Rank and recommend
             recommendations = predictor.recommend_top_candidates(predictions, n=min(10, len(smiles_list)))
@@ -3001,6 +3005,7 @@ class ProteinAPIClient:
                 "available": True,
                 "predictions": predictions,
                 "ranked_molecules": recommendations.get("top_candidates", []),
+                "model_metadata": model_metadata,
                 "statistics": {
                     "total_molecules": recommendations.get("total_molecules", 0),
                     "valid_molecules": recommendations.get("valid_molecules", 0),

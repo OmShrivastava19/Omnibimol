@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from fastapi import APIRouter
 
 from backend.core.config import get_settings
+from backend.services.chemprot import get_chemprot_service
 
 router = APIRouter(tags=["health"])
 
@@ -27,5 +28,6 @@ def readyz() -> dict[str, object]:
         "redis_configured": bool(settings.redis_url),
         "docking_enabled": settings.docking_enabled,
         "docking_engine": settings.docking_engine,
+        "chemprot": get_chemprot_service().health_snapshot(),
         "timestamp_utc": datetime.now(UTC).isoformat(),
     }

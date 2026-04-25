@@ -1,9 +1,10 @@
+# mypy: enable-error-code=var-annotated
 """Portfolio management engine for biotech multi-project operations."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, TypedDict
 import csv
 import io
 import json
@@ -60,7 +61,7 @@ class PortfolioEngine:
         },
     }
 
-    def __init__(self, db_path: str = "omnibimol_portfolio.db", drift_config: Optional[Dict[str, float]] = None):
+    def __init__(self, db_path: str = "omnibimol_portfolio.db", drift_config: Optional[Dict[str, float]] = None) -> None:
         self.db_path = db_path
         self.drift_config = dict(self.DEFAULT_DRIFT_CONFIG)
         if drift_config:
@@ -223,7 +224,7 @@ class PortfolioEngine:
                 row,
             )
             conn.commit()
-        self._log_activity("portfolio", row["id"], "created", row, owner)
+        self._log_activity("portfolio", str(row["id"]), "created", row, owner)
         return row
 
     def list_portfolios(self) -> List[Dict[str, Any]]:
@@ -271,7 +272,7 @@ class PortfolioEngine:
                 row,
             )
             conn.commit()
-        self._log_activity("project", row["id"], "created", row, owner)
+        self._log_activity("project", str(row["id"]), "created", row, owner)
         return row
 
     def list_projects(self, portfolio_id: str) -> List[Dict[str, Any]]:
@@ -321,7 +322,7 @@ class PortfolioEngine:
             )
             conn.commit()
         self._invalidate_project_cache(project_id)
-        self._log_activity("target_candidate", row["id"], "created", row, owner)
+        self._log_activity("target_candidate", str(row["id"]), "created", row, owner)
         return row
 
     def list_target_candidates(self, project_id: str) -> List[Dict[str, Any]]:
@@ -383,7 +384,7 @@ class PortfolioEngine:
             conn.commit()
         project_id = self._project_id_for_candidate(target_candidate_id)
         self._invalidate_project_cache(project_id)
-        self._log_activity("evidence_snapshot", row["id"], "created", row, reviewer)
+        self._log_activity("evidence_snapshot", str(row["id"]), "created", row, reviewer)
         drift = self._detect_drift(target_candidate_id)
         return {"snapshot": row, "drift": drift}
 
@@ -561,7 +562,7 @@ class PortfolioEngine:
                 row,
             )
             conn.commit()
-        self._log_activity("milestone", row["id"], "created", row, owner)
+        self._log_activity("milestone", str(row["id"]), "created", row, owner)
         return row
 
     def update_milestone_status(self, milestone_id: str, status: str, actor: str = "") -> Dict[str, Any]:
@@ -670,7 +671,7 @@ class PortfolioEngine:
                 ),
             )
             conn.commit()
-        self._log_activity("decision_snapshot", snapshot["id"], "created", snapshot, "")
+        self._log_activity("decision_snapshot", str(snapshot["id"]), "created", snapshot, "")
         return snapshot
 
     def get_project_dashboard_data(self, project_id: str) -> Dict[str, Any]:
@@ -1231,7 +1232,7 @@ class PortfolioEngine:
             return json.dumps(value, sort_keys=True)
         return "" if value is None else str(value)
 
-    def _try_date(self, value: Any) -> Optional[datetime.date]:
+    def _try_date(self, value: Any) -> Optional[date]:
         if not value:
             return None
         for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S"):

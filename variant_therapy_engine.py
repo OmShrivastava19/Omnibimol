@@ -8,11 +8,18 @@ import io
 import json
 import math
 import re
+import warnings
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from api_client import get_drug_metadata, get_manual_drug_database
+try:
+    from variant_prioritizer import VariantPrioritizer
+    VARIANT_PRIORITIZER_AVAILABLE = True
+except ImportError:
+    VARIANT_PRIORITIZER_AVAILABLE = False
+    VariantPrioritizer = None
 
 
 class VariantTherapyEngine:
@@ -31,6 +38,14 @@ class VariantTherapyEngine:
     def __init__(self, api_client: Optional[Any] = None, cache_manager: Optional[Any] = None) -> None:
         self.api_client = api_client
         self.cache = cache_manager
+        
+        # Initialize variant prioritizer (research-backed scoring)
+        self._prioritizer = None
+        if VARIANT_PRIORITIZER_AVAILABLE:
+            try:
+                self._prioritizer = VariantPrioritizer(enable_remote_download=False)
+            except Exception as e:
+                warnings.warn(f"Could not initialize VariantPrioritizer: {e}")
 
     def parse_vcf(self, vcf_text: str) -> Dict[str, Any]:
         """Parse VCF text into structured records with warnings and ingestion stats."""
@@ -204,15 +219,21 @@ class VariantTherapyEngine:
         for variant in annotated_variants:
             gene = str(variant.get("gene", "UNKNOWN")).strip() or "UNKNOWN"
             per_gene[gene].append(variant)
-
+        
         gene_impact: Dict[str, Any] = {}
         for gene, rows in per_gene.items():
             burden = min(1.0, len(rows) / 5.0)
-            severity = self._avg([float(r.get("impact_score", 0.0)) for r in rows], default=0.0)
+            
+            # Use pathogenicity score if available, otherwise fall back to impact_score
+            # Pathogenicity scores are from 0-1, impact_scores are also 0-1
+            severity = self._avg([
+                float(r.get("pathogenicity_score", r.get("impact_score", 0.0))) for r in rows
+            ], default=0.0)
+            
             zygosity_factor = self._avg([self._zygosity_factor(r.get("genotype", "")) for r in rows], default=0.5)
             confidence_factor = self._avg([self._confidence_to_numeric(r.get("confidence", "Low")) for r in rows], default=0.4)
             qual_penalty = self._avg([self._quality_penalty(r) for r in rows], default=0.0)
-
+            
             raw_score = 100.0 * (
                 0.35 * burden
                 + 0.35 * severity
@@ -221,8 +242,25 @@ class VariantTherapyEngine:
             )
             uncertainty_penalty = min(20.0, (1.0 - confidence_factor) * 12.0 + qual_penalty * 8.0)
             normalized = self._clamp(raw_score - uncertainty_penalty)
-
-            top_drivers = sorted(rows, key=lambda r: float(r.get("impact_score", 0.0)), reverse=True)[:3]
+            
+            # Determine which variants are top drivers using pathogenicity score first
+            sorted_rows = sorted(
+                rows,
+                key=lambda r: (
+                    float(r.get("pathogenicity_score", 0.0) or 0.0),
+                    float(r.get("impact_score", 0.0)),
+                ),
+                reverse=True,
+            )
+            top_drivers = sorted_rows[:3]
+            
+            # Calculate tier distribution
+            tier_counts = {1: 0, 2: 0, 3: 0}
+            for r in rows:
+                tier = r.get("pathogenicity_tier") or 3
+                if tier in tier_counts:
+                    tier_counts[tier] += 1
+            
             gene_impact[gene] = {
                 "gene": gene,
                 "variant_count": len(rows),
@@ -232,17 +270,21 @@ class VariantTherapyEngine:
                 "confidence_factor": round(confidence_factor, 4),
                 "uncertainty_penalty": round(uncertainty_penalty, 2),
                 "score": round(normalized, 2),
+                "tier_distribution": tier_counts,
                 "top_driving_variants": [
                     {
                         "variant_key": d.get("variant_key"),
                         "effect": d.get("predicted_effect_class"),
                         "impact_score": d.get("impact_score"),
+                        "pathogenicity_score": d.get("pathogenicity_score"),
+                        "pathogenicity_tier": d.get("pathogenicity_tier"),
                         "confidence": d.get("confidence"),
+                        "pathogenicity_method": d.get("pathogenicity_method", "heuristic"),
                     }
                     for d in top_drivers
                 ],
             }
-
+        
         return {
             "genes": dict(
                 sorted(
@@ -469,21 +511,23 @@ class VariantTherapyEngine:
             f"**{self.DISCLAIMER}**",
         ]
 
-        variants_csv = self._to_csv(
-            annotated_variants,
-            [
-                "variant_key",
-                "gene",
-                "predicted_effect_class",
-                "impact_score",
-                "confidence",
-                "variant_type",
-                "consequence",
-                "genotype",
-                "qual",
-                "filter",
-            ],
-        )
+        # Include pathogenicity score columns if available
+        variant_cols = [
+            "variant_key", "gene", "predicted_effect_class", "impact_score",
+            "confidence", "variant_type", "consequence", "genotype",
+            "qual", "filter",
+        ]
+        # Check for pathogenicity fields in first variant
+        if annotated_variants and any(k in annotated_variants[0] for k in ["pathogenicity_score", "pathogenicity_tier", "pathogenicity_method"]):
+            # Insert pathogenicity columns after impact_score
+            variant_cols = [
+                "variant_key", "gene", "predicted_effect_class", "impact_score",
+                "pathogenicity_score", "pathogenicity_tier", "pathogenicity_method",
+                "confidence", "variant_type", "consequence", "genotype",
+                "qual", "filter",
+            ]
+
+        variants_csv = self._to_csv(annotated_variants, variant_cols)
         candidates_csv = self._to_csv(
             ranked_candidates,
             [
@@ -834,3 +878,263 @@ class VariantTherapyEngine:
     @staticmethod
     def _clamp(value: float, lower: float = 0.0, upper: float = 100.0) -> float:
         return max(lower, min(upper, float(value)))
+
+    def score_variant_pathogenicity(
+        self,
+        annotated_variants: List[Dict[str, Any]],
+        use_prioritization: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """
+        Enhance annotated variants with research-backed pathogenicity scoring.
+        
+        Uses the VariantPrioritizer model stack (XGBoost/RF/LR) trained on
+        missense variant features from GPN-MSA, CADD, phyloP, ESM-1b, etc.
+        
+        Scientific foundations:
+        - Frazer et al. 2021 (ESM-1b embeddings for variant effect prediction)
+        - Cheng et al. 2023 (AlphaMissense / precomputed conservation features)
+        - Notin et al. 2022 (Tranception-style protein-level modeling)
+        - Landrum et al. 2018 (ClinVar ground truth for labels)
+        
+        Args:
+            annotated_variants: List of annotated variant dictionaries from
+                               annotate_variant_effects()
+            use_prioritization: Whether to apply research-backed scoring
+        
+        Returns:
+            List of variants with added pathogenicity_score, tier, and metadata
+        """
+        if not use_prioritization or self._prioritizer is None:
+            # Fallback: use existing impact scores linearly scaled to [0, 1]
+            for variant in annotated_variants:
+                variant["pathogenicity_score"] = variant.get("impact_score", 0.0)
+                variant["pathogenicity_tier"] = self._assign_tier_from_score(
+                    variant["pathogenicity_score"]
+                )
+                variant["pathogenicity_method"] = "heuristic_fallback"
+                variant["confidence_label"] = variant.get("confidence", "Low")
+            return annotated_variants
+        
+        # Prepare features for prioritizer
+        variant_features = []
+        for variant in annotated_variants:
+            features = self._extract_prioritizer_features(variant)
+            variant_features.append((variant, features))
+        
+        # Batch score using prioritizer
+        features_list = [f for _, f in variant_features]
+        try:
+            predictions = self._prioritizer.batch_predict(
+                features_list, feature_type="auto"
+            )
+        except Exception as e:
+            warnings.warn(f"Pathogenicity prediction failed: {e}")
+            # Fallback to heuristic
+            return self.score_variant_pathogenicity(
+                annotated_variants, use_prioritization=False
+            )
+        
+        # Merge predictions back into variants
+        for (variant, _), prediction in zip(variant_features, predictions):
+            variant["pathogenicity_score"] = prediction.get("score")
+            variant["pathogenicity_tier"] = prediction.get("tier")
+            variant["pathogenicity_method"] = prediction.get("model_used", "unknown")
+            variant["confidence_label"] = prediction.get("confidence_label", "low")
+            variant["pathogenicity_evidence"] = prediction.get(
+                "evidence_features_used", []
+            )
+            variant["pathogenicity_metadata"] = prediction.get("metadata", {})
+            
+            # Track fallback reason if applicable
+            if prediction.get("fallback_reason"):
+                variant["pathogenicity_fallback_reason"] = prediction["fallback_reason"]
+        
+        return annotated_variants
+
+    def _extract_prioritizer_features(self, variant: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract features for the variant prioritizer from annotated variant data.
+        
+        Attempts to provide precomputed features first, then falls back to
+        protein-level features.
+        """
+        features = {}
+        
+        # Precomputed missense features (if available from external sources)
+        # These would typically come from annotation databases
+        info = variant.get("info", {})
+        
+        # CADD score
+        if "CADD" in info:
+            try:
+                features["cadd_raw"] = float(info["CADD"])
+                features["cadd_phred"] = float(info["CADD"])  # Simplified
+            except (ValueError, TypeError):
+                pass
+        
+        # PhyloP (if available)
+        if "phyloP" in info:
+            try:
+                val = float(info["phyloP"])
+                features["phyloP100way_vertebrate"] = val
+                features["phyloP241way_mammalian"] = val
+            except (ValueError, TypeError):
+                pass
+        
+        # PhastCons (if available)
+        if "phastCons" in info:
+            try:
+                val = float(info["phastCons"])
+                features["phastCons100way_vertebrate"] = val
+                features["phastCons241way_mammalian"] = val
+            except (ValueError, TypeError):
+                pass
+        
+        # GERP++ (if available as proxy for conservation)
+        if "GERP" in info:
+            try:
+                features["gerp_score"] = float(info["GERP"])
+            except (ValueError, TypeError):
+                pass
+        
+        # ESM-1b embedding stats (placeholder - would come from actual embedding)
+        # In practice, these would be computed from the protein sequence
+        features["esm1b_embedding_mean"] = 0.0
+        features["esm1b_embedding_max"] = 0.0
+        features["esm1b_embedding_norm"] = 0.0
+        
+        # NT score (nucleotide diversity proxy)
+        features["nt_score"] = 0.0
+        
+        # HyenaDNA embedding (placeholder)
+        features["hyena_dna_embedding_mean"] = 0.0
+        
+        # Protein-level / AA-change features (more commonly available)
+        consequence = variant.get("consequence", "").lower()
+        impact_score = variant.get("impact_score", 0.0)
+        
+        # AA position in protein
+        protein_pos = 0
+        if variant.get("protein"):
+            # Extract position from protein notation like p.Arg150His
+            import re
+            match = re.search(r'p\.\D*(\d+)', variant["protein"])
+            if match:
+                protein_pos = int(match.group(1))
+        features["aa_position"] = float(protein_pos)
+        
+        # Change type encoding
+        consequence_map = {
+            "missense": 1.0,
+            "frameshift": 0.9,
+            "stop_gained": 0.95,
+            "splice": 0.85,
+            "inframe": 0.7,
+            "synonymous": 0.1,
+            "utr": 0.2,
+            "intron": 0.3,
+        }
+        features["aa_change_type"] = max(
+            [consequence_map.get(c, 0.0) for c in consequence.split(",") if c]
+            + [0.0]
+        )
+        
+        # Domain score (based on impact)
+        features["domain_score"] = impact_score
+        
+        # Conservation proxy (use phyloP if available, else impact-based)
+        features["conservation_score"] = features.get("phyloP100way_vertebrate", impact_score)
+        
+        # BLOSUM62 score approximation
+        ref = variant.get("ref", "")
+        alt = variant.get("alt", "")
+        features["blosum62_score"] = self._blosum62_score(ref, alt)
+        
+        # Grantham distance (chemical difference between amino acids)
+        features["grantham_distance"] = self._grantham_distance(ref, alt)
+        
+        # SIFT score (if available)
+        if "SIFT" in info:
+            try:
+                sift_val = float(info["SIFT"])
+                # SIFT scores: 0=tolerated, 1=deleterious; invert for consistency
+                features["sift_score"] = 1.0 - min(1.0, max(0.0, sift_val))
+            except (ValueError, TypeError):
+                features["sift_score"] = impact_score
+        else:
+            features["sift_score"] = impact_score
+        
+        # PolyPhen score (if available)
+        if "PolyPhen" in info:
+            try:
+                polyphen_val = float(info["PolyPhen"])
+                features["polyphen_score"] = polyphen_val
+            except (ValueError, TypeError):
+                features["polyphen_score"] = impact_score
+        else:
+            features["polyphen_score"] = impact_score
+        
+        return features
+
+    def _blosum62_score(self, aa1: str, aa2: str) -> float:
+        """Calculate normalized BLOSUM62 score between two amino acids."""
+        # Simplified BLOSUM62 matrix (key: aa1+aa2, value: score)
+        blosum62 = {
+            ("A", "A"): 4, ("A", "R"): -1, ("A", "N"): -2, ("A", "D"): -2, ("A", "C"): 0,
+            ("A", "Q"): -1, ("A", "E"): -1, ("A", "G"): 0, ("A", "H"): -2, ("A", "I"): -1,
+            ("A", "L"): -1, ("A", "K"): -1, ("A", "M"): -1, ("A", "F"): -2, ("A", "P"): -1,
+            ("A", "S"): 1, ("A", "T"): 0, ("A", "W"): -3, ("A", "Y"): -2, ("A", "V"): 0,
+            ("R", "R"): 5, ("R", "K"): 2, ("R", "N"): 0, ("R", "D"): -2, ("R", "C"): -3,
+            ("R", "Q"): 1, ("R", "E"): 0, ("R", "G"): -2, ("R", "H"): 0, ("R", "I"): -3,
+            ("R", "L"): -2, ("R", "M"): -1, ("R", "F"): -3, ("R", "P"): -2, ("R", "S"): -1,
+            ("S", "S"): 4,
+        }
+        
+        if not aa1 or not aa2 or aa1 == aa2:
+            return 1.0
+        
+        # Normalize: BLOSUM62 range is roughly -4 to 11; normalize to [0, 1]
+        # Same amino acid = 1.0, very different = 0.0
+        key = (aa1.upper(), aa2.upper())
+        rev_key = (aa2.upper(), aa1.upper())
+        
+        score = blosum62.get(key, blosum62.get(rev_key, -1))
+        # Normalize: (score - min) / (max - min) = (score + 4) / 15
+        normalized = max(0.0, min(1.0, (score + 4.0) / 11.0))
+        return normalized
+
+    def _grantham_distance(self, aa1: str, aa2: str) -> float:
+        """Calculate Grantham chemical distance between amino acids."""
+        # Simplified Grantham distances (smaller = more similar)
+        # Scale to [0, 1] where 1.0 = identical, 0.0 = very different
+        if not aa1 or not aa2 or aa1.upper() == aa2.upper():
+            return 1.0
+        
+        # Approximate Grantham distance (typical range: 0-215)
+        # Conservative estimate: polar to non-polar ≈ 100
+        distance_map = {
+            ("V", "I"): 12, ("V", "L"): 14, ("V", "M"): 22,  # Hydrophobic cluster
+            ("S", "T"): 10, ("S", "N"): 12, ("T", "S"): 10,  # Polar similar
+            ("K", "R"): 12, ("D", "E"): 10,  # Charged similar
+            ("F", "Y"): 10, ("F", "W"): 18,  # Aromatic
+        }
+        
+        key = (aa1.upper(), aa2.upper())
+        rev_key = (aa2.upper(), aa1.upper())
+        distance = distance_map.get(key, distance_map.get(rev_key, 60))
+        
+        # Normalize: 1.0 (identical) to 0.0 (max distance ~215)
+        normalized = max(0.0, min(1.0, 1.0 - (distance / 215.0)))
+        return normalized
+
+    def _assign_tier_from_score(self, score: Optional[float]) -> Optional[int]:
+        """Assign tier (1-3) from pathogenicity score."""
+        if score is None:
+            return None
+        if score >= 0.9:
+            return 1
+        if score >= 0.7:
+            return 2
+        if score >= 0.5:
+            return 3
+        return 3  # Below 0.5 is still Tier 3

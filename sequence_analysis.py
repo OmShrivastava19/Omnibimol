@@ -1,3 +1,4 @@
+# mypy: enable-error-code=var-annotated
 """
 Sequence Analysis Suite - Comprehensive computational analysis of biological sequences
 Supports DNA, RNA, and protein sequences with multiple analysis tools.
@@ -5,7 +6,7 @@ Supports DNA, RNA, and protein sequences with multiple analysis tools.
 
 import re
 import io
-from typing import List, Dict, Tuple, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 from dataclasses import dataclass
 from collections import Counter, defaultdict
 import numpy as np
@@ -21,6 +22,31 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
+class AlignmentStats(TypedDict):
+    alignment_length: int
+    num_sequences: int
+    conserved_positions: int
+    conservation_percentage: float
+    gap_positions: int
+    gap_percentage: float
+
+
+class TreeMetadata(TypedDict):
+    method: str
+    num_taxa: int
+    tree_length: float
+    newick_format: str
+
+
+class MotifAnnotation(TypedDict):
+    motif: str
+    start: int
+    end: int
+    length: int
+    conservation: float
+    sequences: list[str]
+
+
 @dataclass
 class Sequence:
     """Represents a biological sequence with metadata"""
@@ -29,7 +55,7 @@ class Sequence:
     description: str = ""
     sequence_type: str = "unknown"  # 'dna', 'rna', 'protein'
     
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Auto-detect sequence type if not specified"""
         if self.sequence_type == "unknown":
             self.sequence_type = self._detect_sequence_type()
@@ -67,7 +93,7 @@ class FASTAParser:
     """Parse and validate FASTA format sequences"""
     
     @staticmethod
-    def parse(file_content: str) -> List[Sequence]:
+    def parse(file_content: str) -> list[Sequence]:
         """Parse FASTA content from string"""
         sequences = []
         try:
@@ -90,7 +116,7 @@ class FASTAParser:
         return sequences
     
     @staticmethod
-    def validate(sequences: List[Sequence]) -> Tuple[bool, List[str]]:
+    def validate(sequences: list[Sequence]) -> tuple[bool, list[str]]:
         """Validate sequences and return (is_valid, error_messages)"""
         errors = []
         
@@ -128,7 +154,7 @@ class FASTAParser:
 class MultipleSequenceAligner:
     """Perform Multiple Sequence Alignment using various algorithms"""
     
-    def __init__(self, method: str = "clustalw"):
+    def __init__(self, method: str = "clustalw") -> None:
         """
         Initialize aligner
         Methods: 'clustalw', 'muscle', 'mafft', 'simple'
@@ -141,7 +167,7 @@ class MultipleSequenceAligner:
         self.aligner.open_gap_score = -0.5
         self.aligner.extend_gap_score = -0.1
     
-    def align(self, sequences: List[Sequence]) -> Tuple[MultipleSeqAlignment, Dict]:
+    def align(self, sequences: list[Sequence]) -> tuple[MultipleSeqAlignment, AlignmentStats]:
         """
         Perform multiple sequence alignment
         Returns (alignment, metadata)
@@ -164,7 +190,7 @@ class MultipleSequenceAligner:
         
         return alignment, metadata
     
-    def _progressive_align(self, seq_records: List[SeqRecord]) -> MultipleSeqAlignment:
+    def _progressive_align(self, seq_records: list[SeqRecord]) -> MultipleSeqAlignment:
         """Progressive alignment algorithm"""
         if len(seq_records) == 1:
             return MultipleSeqAlignment(seq_records)
@@ -196,10 +222,17 @@ class MultipleSequenceAligner:
         
         return MultipleSeqAlignment(aligned)
     
-    def _calculate_alignment_stats(self, alignment: MultipleSeqAlignment) -> Dict:
+    def _calculate_alignment_stats(self, alignment: MultipleSeqAlignment) -> AlignmentStats:
         """Calculate alignment statistics"""
         if not alignment:
-            return {}
+            return {
+                "alignment_length": 0,
+                "num_sequences": 0,
+                "conserved_positions": 0,
+                "conservation_percentage": 0.0,
+                "gap_positions": 0,
+                "gap_percentage": 0.0,
+            }
         
         length = alignment.get_alignment_length()
         num_seqs = len(alignment)
@@ -217,7 +250,7 @@ class MultipleSequenceAligner:
             if '-' in column:
                 gaps += 1
         
-        return {
+        stats: AlignmentStats = {
             "alignment_length": length,
             "num_sequences": num_seqs,
             "conserved_positions": conserved,
@@ -225,12 +258,13 @@ class MultipleSequenceAligner:
             "gap_positions": gaps,
             "gap_percentage": (gaps / length * 100) if length > 0 else 0
         }
+        return stats
 
 
 class PhylogeneticTreeBuilder:
     """Construct phylogenetic trees from aligned sequences"""
     
-    def __init__(self, method: str = "neighbor_joining"):
+    def __init__(self, method: str = "neighbor_joining") -> None:
         """
         Initialize tree builder
         Methods: 'neighbor_joining', 'upgma'
@@ -238,7 +272,7 @@ class PhylogeneticTreeBuilder:
         self.method = method.lower()
         self.calculator = DistanceCalculator('identity')  # For protein, use 'blosum62'
     
-    def build_tree(self, alignment: MultipleSeqAlignment) -> Tuple[str, Dict]:
+    def build_tree(self, alignment: MultipleSeqAlignment) -> tuple[str, TreeMetadata]:
         """
         Build phylogenetic tree
         Returns (newick_string, metadata)
@@ -268,7 +302,7 @@ class PhylogeneticTreeBuilder:
         newick_string = handle.getvalue().strip()
         
         # Calculate tree statistics
-        metadata = {
+        metadata: TreeMetadata = {
             "method": self.method,
             "num_taxa": len(alignment),
             "tree_length": sum(tree.depths().values()),
@@ -277,7 +311,7 @@ class PhylogeneticTreeBuilder:
         
         return newick_string, metadata
     
-    def _simple_distance_matrix(self, alignment: MultipleSeqAlignment):
+    def _simple_distance_matrix(self, alignment: MultipleSeqAlignment) -> Any:
         """Simple distance matrix calculation"""
         from Bio.Phylo.TreeConstruction import DistanceMatrix
         num_seqs = len(alignment)
@@ -306,7 +340,7 @@ class PhylogeneticTreeBuilder:
 class DomainIdentifier:
     """Identify functional domains in protein sequences"""
     
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize domain identifier"""
         # Common protein domains patterns (simplified)
         # In production, would use Pfam HMMs or InterPro
@@ -317,7 +351,7 @@ class DomainIdentifier:
             "EF-hand": [r"D.{3}D.{3}[ILV].{6}[DE].{6}Y"],
         }
     
-    def identify_domains(self, sequences: List[Sequence], alignment: Optional[MultipleSeqAlignment] = None) -> Dict[str, List[Dict]]:
+    def identify_domains(self, sequences: list[Sequence], alignment: Optional[MultipleSeqAlignment] = None) -> dict[str, list[dict[str, Any]]]:
         """
         Identify domains in sequences
         Returns dict mapping sequence_id to list of domain annotations
@@ -351,14 +385,14 @@ class DomainIdentifier:
         
         return results
     
-    def _remove_overlaps(self, domains: List[Dict]) -> List[Dict]:
+    def _remove_overlaps(self, domains: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Remove overlapping domain annotations"""
         if not domains:
             return []
         
         # Sort by start position
         sorted_domains = sorted(domains, key=lambda x: x["start"])
-        non_overlapping = [sorted_domains[0]]
+        non_overlapping: list[dict[str, Any]] = [sorted_domains[0]]
         
         for domain in sorted_domains[1:]:
             last = non_overlapping[-1]
@@ -375,12 +409,12 @@ class DomainIdentifier:
 class MotifFinder:
     """Find conserved motifs in sequences"""
     
-    def __init__(self, min_length: int = 4, max_length: int = 20):
+    def __init__(self, min_length: int = 4, max_length: int = 20) -> None:
         """Initialize motif finder"""
         self.min_length = min_length
         self.max_length = max_length
     
-    def find_motifs(self, sequences: List[Sequence], alignment: Optional[MultipleSeqAlignment] = None) -> Dict:
+    def find_motifs(self, sequences: list[Sequence], alignment: Optional[MultipleSeqAlignment] = None) -> dict[str, Any]:
         """
         Find conserved motifs
         Returns dict with motifs and their positions
@@ -390,9 +424,9 @@ class MotifFinder:
         else:
             return self._find_motifs_in_sequences(sequences)
     
-    def _find_motifs_in_alignment(self, alignment: MultipleSeqAlignment) -> Dict:
+    def _find_motifs_in_alignment(self, alignment: MultipleSeqAlignment) -> dict[str, Any]:
         """Find motifs in aligned sequences"""
-        motifs = []
+        motifs: list[dict[str, Any]] = []
         length = alignment.get_alignment_length()
         
         # Look for conserved regions
@@ -429,13 +463,13 @@ class MotifFinder:
             "method": "alignment_based"
         }
     
-    def _find_motifs_in_sequences(self, sequences: List[Sequence]) -> Dict:
+    def _find_motifs_in_sequences(self, sequences: list[Sequence]) -> dict[str, Any]:
         """Find motifs using k-mer frequency analysis"""
         if len(sequences) < 2:
             return {"motifs": [], "num_motifs": 0, "method": "kmer_frequency"}
         
         # Count k-mers across all sequences
-        kmer_counts = defaultdict(list)
+        kmer_counts: defaultdict[str, list[Tuple[str, int]]] = defaultdict(list)
         
         for k in range(self.min_length, self.max_length + 1):
             for seq in sequences:
@@ -445,7 +479,7 @@ class MotifFinder:
                     kmer_counts[kmer].append((seq.id, i + 1))
         
         # Find k-mers present in multiple sequences
-        motifs = []
+        motifs: list[dict[str, Any]] = []
         for kmer, positions in kmer_counts.items():
             unique_seqs = set(seq_id for seq_id, _ in positions)
             if len(unique_seqs) >= max(2, len(sequences) * 0.5):  # Present in at least 50% of sequences
@@ -466,14 +500,14 @@ class MotifFinder:
             "method": "kmer_frequency"
         }
     
-    def _deduplicate_motifs(self, motifs: List[Dict]) -> List[Dict]:
+    def _deduplicate_motifs(self, motifs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Remove duplicate and overlapping motifs"""
         if not motifs:
             return []
         
         # Sort by length (longer first) and conservation
         sorted_motifs = sorted(motifs, key=lambda x: (x["length"], x.get("conservation", 0)), reverse=True)
-        unique = []
+        unique: list[dict[str, Any]] = []
         
         for motif in sorted_motifs:
             # Check if overlaps with existing motifs
@@ -492,14 +526,14 @@ class MotifFinder:
 class ConservationScorer:
     """Calculate conservation scores for aligned sequences"""
     
-    def __init__(self, method: str = "shannon_entropy"):
+    def __init__(self, method: str = "shannon_entropy") -> None:
         """
         Initialize conservation scorer
         Methods: 'shannon_entropy', 'simple_frequency'
         """
         self.method = method.lower()
     
-    def calculate_conservation(self, alignment: MultipleSeqAlignment) -> Dict:
+    def calculate_conservation(self, alignment: MultipleSeqAlignment) -> dict[str, Any]:
         """
         Calculate conservation scores for each position
         Returns dict with position-wise scores and statistics
@@ -510,8 +544,8 @@ class ConservationScorer:
         length = alignment.get_alignment_length()
         num_seqs = len(alignment)
         
-        scores = []
-        positions = []
+        scores: list[float] = []
+        positions: list[dict[str, Any]] = []
         
         for i in range(length):
             column = alignment[:, i]
@@ -536,7 +570,7 @@ class ConservationScorer:
         # Calculate statistics
         scores_array = np.array(scores)
         
-        return {
+        results: dict[str, Any] = {
             "scores": positions,
             "mean_conservation": float(np.mean(scores_array)),
             "std_conservation": float(np.std(scores_array)),
@@ -545,6 +579,7 @@ class ConservationScorer:
             "highly_conserved_positions": [i + 1 for i, s in enumerate(scores) if s > np.percentile(scores_array, 90)],
             "method": self.method
         }
+        return results
     
     def _shannon_entropy(self, residues: List[str]) -> float:
         """Calculate Shannon entropy (lower = more conserved)"""
@@ -595,12 +630,12 @@ class SequenceAnalysisSuite:
     
     def analyze(self, fasta_content: str, run_alignment: bool = True, 
                 run_phylogeny: bool = True, run_domains: bool = True,
-                run_motifs: bool = True, run_conservation: bool = True) -> Dict:
+                run_motifs: bool = True, run_conservation: bool = True) -> Dict[str, Any]:
         """
         Run complete analysis pipeline
         Returns comprehensive analysis results
         """
-        results = {
+        results: Dict[str, Any] = {
             "input_sequences": [],
             "alignment": None,
             "phylogenetic_tree": None,

@@ -9,6 +9,7 @@ from fastapi import FastAPI, Request, Response
 from backend.api.routes.audit import router as audit_router
 from backend.api.routes.academic_models import router as academic_models_router
 from backend.api.routes.auth import router as auth_router
+from backend.api.routes.chemprot import router as chemprot_router
 from backend.api.routes.health import router as health_router
 from backend.api.routes.jobs import router as jobs_router
 from backend.api.routes.multiomics import router as multiomics_router
@@ -71,6 +72,7 @@ def create_app() -> FastAPI:
     app.include_router(projects_router, prefix=settings.api_prefix)
     app.include_router(jobs_router, prefix=settings.api_prefix)
     app.include_router(multiomics_router, prefix=settings.api_prefix)
+    app.include_router(chemprot_router, prefix=settings.api_prefix)
     app.include_router(academic_models_router, prefix=settings.api_prefix)
     app.include_router(audit_router, prefix=settings.api_prefix)
     app.include_router(reliability_router, prefix=settings.api_prefix)

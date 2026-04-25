@@ -5,15 +5,17 @@ Predicts binding affinity and binding likelihood for drug molecules (SMILES form
 
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 import re
 import warnings
 import logging
+import os
 from pathlib import Path
 import joblib
 warnings.filterwarnings('ignore')
 
 logger = logging.getLogger(__name__)
+HF_MODEL_ID = "omshrivastava/omnibimol-binding-affinity-chemberta"
 
 try:
     from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
@@ -33,6 +35,21 @@ except ImportError:
     Chem = None
     Descriptors = None
     rdMolDescriptors = None
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    torch = None
+    TORCH_AVAILABLE = False
+
+try:
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    AutoModelForSequenceClassification = None
+    AutoTokenizer = None
+    TRANSFORMERS_AVAILABLE = False
 
 
 class SMILESValidator:
@@ -385,6 +402,95 @@ class MolecularDescriptorCalculator:
         
         return violations
 
+
+class HFChemBERTaBindingPredictor:
+    """Loads and runs HF ChemBERTa pKd inference for SMILES batches."""
+
+    def __init__(self, model_id: str = HF_MODEL_ID, batch_size: int = 32):
+        self.model_id = model_id
+        self.batch_size = max(1, batch_size)
+        self.device = "cpu"
+        self.tokenizer = None
+        self.model = None
+        self.is_loaded = False
+        self.load_error: Optional[str] = None
+        self.local_files_only = os.getenv("OMNIBIMOL_HF_LOCAL_ONLY", "0") == "1"
+
+    def _ensure_loaded(self) -> bool:
+        if self.is_loaded:
+            return True
+
+        if not TRANSFORMERS_AVAILABLE or not TORCH_AVAILABLE:
+            self.load_error = "transformers/torch not available"
+            return False
+
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.model_id,
+                local_files_only=self.local_files_only,
+            )
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                self.model_id,
+                local_files_only=self.local_files_only,
+            )
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.model.to(self.device)
+            self.model.eval()
+            self.is_loaded = True
+            self.load_error = None
+            logger.info("Loaded HF binding model %s on %s", self.model_id, self.device)
+            return True
+        except Exception as exc:
+            self.load_error = str(exc)
+            logger.warning(
+                "Unable to load HF binding model %s. Falling back to local predictor. Error: %s",
+                self.model_id,
+                exc,
+            )
+            return False
+
+    def predict_batch(self, smiles_batch: List[str]) -> Optional[List[float]]:
+        if not smiles_batch:
+            return []
+        if not self._ensure_loaded():
+            return None
+
+        try:
+            predictions: List[float] = []
+            for i in range(0, len(smiles_batch), self.batch_size):
+                batch = smiles_batch[i : i + self.batch_size]
+                inputs = self.tokenizer(
+                    batch,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                inputs = {k: v.to(self.device) for k, v in inputs.items()}
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                logits = outputs.logits
+                if logits.dim() == 1:
+                    batch_preds = logits.detach().cpu().numpy().tolist()
+                else:
+                    batch_preds = logits[:, 0].detach().cpu().numpy().tolist()
+                predictions.extend(float(x) for x in batch_preds)
+            return predictions
+        except Exception as exc:
+            logger.warning(
+                "HF batch inference failed. Falling back to local predictor. Error: %s",
+                exc,
+            )
+            return None
+
+    def metadata(self) -> Dict[str, Any]:
+        return {
+            "model_id": self.model_id,
+            "source": "huggingface",
+            "device": self.device,
+            "loaded": self.is_loaded,
+            "load_error": self.load_error,
+        }
+
 class BindingAffinityPredictor:
     """ML-based binding affinity predictor — now loads REAL trained model"""
     
@@ -394,6 +500,8 @@ class BindingAffinityPredictor:
         self.scaler = None
         self.is_trained = False
         self.model_dir = Path(__file__).resolve().parent / "models"
+        hf_batch_size = int(os.getenv("OMNIBIMOL_HF_BATCH_SIZE", "32"))
+        self.hf_predictor = HFChemBERTaBindingPredictor(batch_size=hf_batch_size)
         self._load_trained_model()
 
     def _artifact_path(self, filename: str) -> Path:
@@ -448,7 +556,28 @@ class BindingAffinityPredictor:
             "binding_likelihood": float(probability * 100),
             "binding_probability": float(probability),
             "prediction_method": "Rule-based fallback",
-            "confidence": "low"
+            "confidence": "low",
+            "model_metadata": {
+                "source": "local_fallback",
+                "reason": "heuristic_rule_based",
+            },
+        }
+
+    @staticmethod
+    def _probability_from_affinity(affinity: float) -> float:
+        # Logistic calibration around pAffinity 6.0 keeps probabilities smooth and bounded.
+        return float(1.0 / (1.0 + np.exp(-(affinity - 6.0))))
+
+    def _hf_prediction_from_affinity(self, affinity: float) -> Dict:
+        probability = self._probability_from_affinity(affinity)
+        return {
+            "binding_affinity": float(affinity),
+            "binding_affinity_units": "pAffinity (-log10(M))",
+            "binding_likelihood": float(probability * 100.0),
+            "binding_probability": float(probability),
+            "prediction_method": "HF ChemBERTa (SMILES->pKd)",
+            "confidence": "high",
+            "model_metadata": self.hf_predictor.metadata(),
         }
     
     def _load_trained_model(self):
@@ -515,11 +644,37 @@ class BindingAffinityPredictor:
                 "binding_likelihood": float(binding_prob * 100),
                 "binding_probability": float(binding_prob),
                 "prediction_method": "ML (Random Forest — real ChEMBL data)",
-                "confidence": "high"
+                "confidence": "high",
+                "model_metadata": {
+                    "source": "local_ml",
+                    "model_family": "random_forest",
+                },
             }
         except Exception as e:
             logger.warning("ML prediction error. Falling back to rule-based prediction. Error: %s", e)
             return self._rule_based_prediction(descriptors)
+
+    def predict_smiles_batch(
+        self,
+        smiles_batch: List[str],
+        descriptors_batch: Optional[List[Dict]] = None,
+    ) -> List[Dict]:
+        """Primary fast path: HF SMILES->pKd. Fallback: local descriptor predictor."""
+        descriptors_batch = descriptors_batch or []
+
+        hf_affinities = self.hf_predictor.predict_batch(smiles_batch)
+        if hf_affinities is not None and len(hf_affinities) == len(smiles_batch):
+            return [self._hf_prediction_from_affinity(value) for value in hf_affinities]
+
+        fallback_predictions: List[Dict] = []
+        for idx, _smiles in enumerate(smiles_batch):
+            descriptors = descriptors_batch[idx] if idx < len(descriptors_batch) else {}
+            fallback_predictions.append(self.predict(descriptors))
+        return fallback_predictions
+
+    def predict_smiles(self, smiles: str, descriptors: Optional[Dict] = None) -> Dict:
+        batch_predictions = self.predict_smiles_batch([smiles], [descriptors or {}])
+        return batch_predictions[0] if batch_predictions else self._rule_based_prediction(descriptors or {})
 
 
 class LigandBindingPredictor:
@@ -541,52 +696,7 @@ class LigandBindingPredictor:
         Returns:
             Dictionary with prediction results
         """
-        result = {
-            "molecule_name": molecule_name or "Unknown",
-            "smiles": smiles,
-            "is_valid": False,
-            "error": None,
-            "descriptors": {},
-            "prediction": {},
-            "lipinski_violations": 0
-        }
-        
-        # Validate SMILES
-        is_valid, error = self.validator.is_valid_smiles(smiles)
-        result["is_valid"] = is_valid
-        result["error"] = error
-        
-        if not is_valid:
-            return result
-        
-        # Preprocess
-        preprocessed = self.validator.preprocess_smiles(smiles)
-        result["canonical_smiles"] = preprocessed.get("canonical_smiles")
-        
-        # Calculate descriptors
-        try:
-            descriptors = self.descriptor_calc.calculate_descriptors(smiles)
-            result["descriptors"] = descriptors
-            
-            # Verify descriptors were calculated (not all zeros)
-            if descriptors.get("molecular_weight", 0) == 0 and descriptors.get("num_atoms", 0) == 0:
-                # Descriptors failed, try fallback directly
-                descriptors = self.descriptor_calc._calculate_basic_descriptors(smiles)
-                result["descriptors"] = descriptors
-        except Exception as e:
-            # If calculation fails, use fallback
-            print(f"Warning: Descriptor calculation failed, using fallback: {e}")
-            descriptors = self.descriptor_calc._calculate_basic_descriptors(smiles)
-            result["descriptors"] = descriptors
-        
-        # Calculate Lipinski violations
-        result["lipinski_violations"] = self.descriptor_calc.calculate_lipinski_violations(descriptors)
-        
-        # Predict binding
-        prediction = self.affinity_predictor.predict(descriptors)
-        result["prediction"] = prediction
-        
-        return result
+        return self.predict_batch([smiles], [molecule_name])[0]
     
     def predict_batch(self, smiles_list: List[str], molecule_names: List[str] = None) -> List[Dict]:
         """
@@ -601,12 +711,63 @@ class LigandBindingPredictor:
         """
         if molecule_names is None:
             molecule_names = [None] * len(smiles_list)
-        
-        results = []
-        for smiles, name in zip(smiles_list, molecule_names):
-            result = self.predict_single(smiles, name)
+
+        if len(molecule_names) < len(smiles_list):
+            molecule_names = molecule_names + [None] * (len(smiles_list) - len(molecule_names))
+
+        results: List[Dict] = []
+        valid_smiles: List[str] = []
+        valid_descriptors: List[Dict] = []
+        valid_indices: List[int] = []
+
+        for idx, (smiles, name) in enumerate(zip(smiles_list, molecule_names)):
+            result = {
+                "molecule_name": name or "Unknown",
+                "smiles": smiles,
+                "is_valid": False,
+                "error": None,
+                "descriptors": {},
+                "prediction": {},
+                "lipinski_violations": 0,
+            }
+
+            is_valid, error = self.validator.is_valid_smiles(smiles)
+            result["is_valid"] = is_valid
+            result["error"] = error
+
+            if not is_valid:
+                results.append(result)
+                continue
+
+            preprocessed = self.validator.preprocess_smiles(smiles)
+            canonical_smiles = preprocessed.get("canonical_smiles") or smiles.strip()
+            result["canonical_smiles"] = canonical_smiles
+
+            try:
+                descriptors = self.descriptor_calc.calculate_descriptors(canonical_smiles)
+                if descriptors.get("molecular_weight", 0) == 0 and descriptors.get("num_atoms", 0) == 0:
+                    descriptors = self.descriptor_calc._calculate_basic_descriptors(canonical_smiles)
+            except Exception as exc:
+                logger.warning(
+                    "Descriptor calculation failed for SMILES '%s'. Falling back to basic descriptors. Error: %s",
+                    canonical_smiles,
+                    exc,
+                )
+                descriptors = self.descriptor_calc._calculate_basic_descriptors(canonical_smiles)
+
+            result["descriptors"] = descriptors
+            result["lipinski_violations"] = self.descriptor_calc.calculate_lipinski_violations(descriptors)
+
             results.append(result)
-        
+            valid_indices.append(idx)
+            valid_smiles.append(canonical_smiles)
+            valid_descriptors.append(descriptors)
+
+        if valid_smiles:
+            predictions = self.affinity_predictor.predict_smiles_batch(valid_smiles, valid_descriptors)
+            for idx, prediction in zip(valid_indices, predictions):
+                results[idx]["prediction"] = prediction
+
         return results
     
     def rank_molecules(self, predictions: List[Dict], top_n: int = 10) -> List[Dict]:

@@ -39,6 +39,10 @@ class TargetPrioritizationEngine:
         ComponentConfig("trials", "Clinical trial evidence"),
     )
 
+    def __init__(self, *, chemprot_enabled: bool = False, chemprot_weight: float = 0.10):
+        self.chemprot_enabled = chemprot_enabled
+        self.chemprot_weight = chemprot_weight
+
     def compute_component_scores(self, input_data: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         """Compute all component scores with details and risk flags."""
 
@@ -50,6 +54,12 @@ class TargetPrioritizationEngine:
             "ligandability": self._score_ligandability(input_data.get("ligandability_data")),
             "trials": self._score_trials(input_data.get("trial_data")),
         }
+        if self.chemprot_enabled:
+            chemprot_component = self._score_chemprot(
+                input_data.get("chemprot_data") or input_data.get("interaction_data")
+            )
+            if chemprot_component is not None:
+                component_scores["interaction"] = chemprot_component
         return component_scores
 
     def compute_composite_score(
@@ -123,7 +133,10 @@ class TargetPrioritizationEngine:
         results: List[Dict[str, Any]] = []
         for idx, payload in enumerate(target_payloads):
             component_scores = self.compute_component_scores(payload)
-            composite = self.compute_composite_score(component_scores, weights=weights)
+            resolved_weights = dict(weights or self.DEFAULT_WEIGHTS)
+            if self.chemprot_enabled and component_scores.get("interaction", {}).get("available") is True:
+                resolved_weights["interaction"] = self.chemprot_weight
+            composite = self.compute_composite_score(component_scores, weights=resolved_weights)
             merged = {
                 "target_id": payload.get("target_id") or payload.get("uniprot_id") or payload.get("gene_name") or f"target_{idx}",
                 "input_data": payload,
@@ -155,6 +168,22 @@ class TargetPrioritizationEngine:
                     "available": bool(comp_raw.get("available", False)),
                     "score": round(float(comp_raw.get("score", 0.0)), 2),
                     "weight": round(float(contribution.get("weight", 0.0)), 4),
+                    "weighted_contribution": round(float(contribution.get("weighted_contribution", 0.0)), 2),
+                    "notes": comp_raw.get("notes", []),
+                }
+            )
+
+        for extra_key, comp_raw in component_scores.items():
+            if extra_key in {comp.key for comp in self.COMPONENTS}:
+                continue
+            contribution = contributions.get(extra_key, {})
+            breakdown.append(
+                {
+                    "component": extra_key,
+                    "label": "ChemProt interaction" if extra_key == "interaction" else extra_key.replace("_", " ").title(),
+                    "available": bool(comp_raw.get("available", False)),
+                    "score": round(float(comp_raw.get("score", 0.0)), 2),
+                    "weight": round(float(contribution.get("weight", self.chemprot_weight if extra_key == "interaction" else 0.0)), 4),
                     "weighted_contribution": round(float(contribution.get("weighted_contribution", 0.0)), 2),
                     "notes": comp_raw.get("notes", []),
                 }
@@ -468,9 +497,11 @@ class TargetPrioritizationEngine:
         base = dict(self.DEFAULT_WEIGHTS)
         if not weights:
             return base
-        for key in base:
-            if key in weights and self._as_float(weights[key]) is not None:
-                base[key] = max(0.0, float(weights[key]))
+        for key, value in weights.items():
+            numeric_value = self._as_float(value)
+            if numeric_value is None or numeric_value < 0.0:
+                continue
+            base[key] = numeric_value
         total = sum(base.values())
         if total <= 0:
             return dict(self.DEFAULT_WEIGHTS)
@@ -524,6 +555,8 @@ class TargetPrioritizationEngine:
             tips.append("Add confirmed ligand bioactivity or experimental docking/assay evidence.")
         if "trials" in missing_components:
             tips.append("Link target to trial records with phase and status metadata.")
+        if "interaction" in missing_components:
+            tips.append("Attach ChemProt PubMed evidence to support the target ranking.")
         if not tips:
             low_components = sorted(
                 [
@@ -566,6 +599,40 @@ class TargetPrioritizationEngine:
             "source_quality": 0.0,
             "notes": notes,
             "risk_flags": [f"Missing {key} evidence"],
+        }
+
+    def _score_chemprot(self, chemprot_data: Optional[Dict[str, Any]]) -> Dict[str, Any] | None:
+        if not self.chemprot_enabled or not chemprot_data:
+            return None
+
+        available = bool(chemprot_data.get("ranked_targets") or chemprot_data.get("evidence"))
+        if not available:
+            return None
+
+        final_score = self._as_float(chemprot_data.get("final_score"), 0.0)
+        interaction_probability = self._as_float(chemprot_data.get("interaction_probability"), final_score)
+        evidence = chemprot_data.get("evidence", []) or []
+        reranker_used = bool(chemprot_data.get("reranker_used"))
+
+        score = final_score * 100.0 if final_score <= 1.0 else final_score
+        source_quality = 0.85 if reranker_used else 0.7
+        notes = [
+            f"ChemProt interaction probability={interaction_probability * 100.0:.1f}%",
+            f"Evidence count={len(evidence)}",
+            f"Reranker used={'yes' if reranker_used else 'no'}",
+        ]
+        risk_flags = []
+        if not evidence:
+            risk_flags.append("No supporting PubMed evidence supplied")
+        if not reranker_used:
+            risk_flags.append("ChemProt ensemble reranker unavailable")
+
+        return {
+            "available": True,
+            "score": round(self._clamp(score), 2),
+            "source_quality": source_quality,
+            "notes": notes,
+            "risk_flags": risk_flags,
         }
 
     @staticmethod

@@ -24,7 +24,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install -r requirements-backend.txt
+          pip install pip-audit
           pip install ruff mypy pytest pytest-cov
+
+      - name: Audit Dependencies
+        run: pip-audit --desc
 
       - name: Install Playwright Browsers
         run: python -m playwright install --with-deps chromium

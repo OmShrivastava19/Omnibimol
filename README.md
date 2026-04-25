@@ -196,6 +196,12 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
+Install pinned versions:
+
+```bash
+pip install -r requirements.lock
+```
+
 ## Run the App
 
 ```bash

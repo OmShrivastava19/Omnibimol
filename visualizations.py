@@ -1,6 +1,7 @@
+# mypy: enable-error-code=var-annotated
 import plotly.graph_objects as go
 import plotly.express as px
-from typing import Dict, List
+from typing import Any, Dict, List, Optional, TypedDict
 import pandas as pd
 import numpy as np
 from collections import defaultdict
@@ -332,7 +333,7 @@ class ProteinVisualizer:
         return html
                 
     @staticmethod
-    def create_confidence_plot(uniprot_id: str, entry_id: str = None) -> go.Figure:
+    def create_confidence_plot(uniprot_id: str, entry_id: Optional[str] = None) -> go.Figure:
         """
         Create plot showing AlphaFold confidence scores along sequence
         pLDDT scores: >90=very high, 70-90=confident, 50-70=low, <50=very low
@@ -460,7 +461,7 @@ class ProteinVisualizer:
             return fig
         
         # Group pathways by class
-        pathway_classes = {}
+        pathway_classes: dict[str, list[Dict]] = {}
         for pathway in pathways:
             pathway_class = pathway.get('pathway_class', 'Other')
             # Extract main class (before semicolon)
@@ -618,7 +619,7 @@ class ProteinVisualizer:
             return {}
         
         # Count amino acids
-        aa_counts = {}
+        aa_counts: dict[str, int] = {}
         for aa in sequence:
             aa_counts[aa] = aa_counts.get(aa, 0) + 1
         
@@ -881,7 +882,7 @@ class ProteinVisualizer:
             return fig
         
         # Group features by type
-        feature_types = {}
+        feature_types: dict[str, list[Dict]] = {}
         for feature in features:
             ftype = feature.get('type', 'Other')
             if ftype not in feature_types:
@@ -1294,11 +1295,11 @@ class ProteinVisualizer:
         n = len(interactions) + 1  # +1 for query protein
         
         # Query protein at center
-        node_x = [0]
-        node_y = [0]
+        node_x: list[float] = [0.0]
+        node_y: list[float] = [0.0]
         node_names = [query_protein]
         node_colors = ['#d62728']  # Red for query
-        node_sizes = [30]
+        node_sizes: list[float] = [30.0]
         
         # Partner proteins in circle
         for i, interaction in enumerate(interactions):
@@ -1325,7 +1326,7 @@ class ProteinVisualizer:
             node_sizes.append(size)
         
         # Create edges grouped by confidence level
-        edge_groups = {
+        edge_groups: dict[str, dict[str, Any]] = {
             'Highest': {'x': [], 'y': [], 'color': 'rgba(31, 119, 180, 0.6)'},
             'High': {'x': [], 'y': [], 'color': 'rgba(44, 160, 44, 0.5)'},
             'Medium': {'x': [], 'y': [], 'color': 'rgba(255, 127, 14, 0.5)'},
@@ -1938,7 +1939,7 @@ class ProteinVisualizer:
 
     @staticmethod
     def advanced_binding_prediction(known_ligands: list, protein_data: Dict, 
-                                    novel_compounds: list = None) -> Dict:
+                                    novel_compounds: Optional[list] = None) -> Dict:
         """
         Advanced ML-based binding prediction for both known and unknown ligands
         
@@ -1953,12 +1954,13 @@ class ProteinVisualizer:
         """
         import math
         
-        predictions = {
+        predictions: dict[str, Any] = {
             "known_ligands": [],
             "novel_candidates": [],
-            "binding_rules": [],
+            "binding_rules": {},
             "recommendations": []
         }
+        binding_rules: dict[str, Any] = {}
         
         # Analyze known ligands to extract binding rules
         if known_ligands:
@@ -2005,16 +2007,16 @@ class ProteinVisualizer:
         """
         Extract SAR (Structure-Activity Relationship) rules from known ligands
         """
-        rules = {
-            "optimal_mw_range": [0, 0],
+        rules: dict[str, Any] = {
+            "optimal_mw_range": [0.0, 0.0],
             "activity_threshold": {},
             "pharmacophore": [],
             "property_ranges": {}
         }
         
         # Extract activity data
-        activities = []
-        mw_values = []
+        activities: list[float] = []
+        mw_values: list[float] = []
         
         for lig in known_ligands:
             activity = lig.get('activity_value', 0)
@@ -2226,7 +2228,7 @@ class ProteinVisualizer:
         Calculate Lipinski's Rule of Five violations
         Rules: MW ≤500, LogP ≤5, HBD ≤5, HBA ≤10
         """
-        violations = 0
+        violations: float = 0.0
         
         mw = compound.get('molecular_weight', 0)
         # Convert mw to float if it's a string
@@ -2887,155 +2889,53 @@ class ProteinVisualizer:
         
         return html
 
-        @staticmethod
-        def create_phylogenetic_dendrogram(newick_string: str, metadata: Dict) -> go.Figure:
-            """Create an interactive dendrogram visualization like ClustalW"""
-            try:
-                from Bio import Phylo
-                from io import StringIO
-            
-                # Parse Newick format tree
-                tree = Phylo.read(StringIO(newick_string), "newick")
-            
-                # Extract terminals (leaf nodes)
-                terminals = tree.get_terminals()
-                terminal_names = [t.name if t.name else f"Seq{i}" for i, t in enumerate(terminals)]
-            
-                # Build tree structure with coordinates
-                def get_tree_coords(clade, x_pos=0, y_pos=0, y_step=1):
-                    """Recursively extract coordinates from tree clade"""
-                    nodes = []
-                    edges = []
-                
-                    if clade.is_terminal():
-                        nodes.append({
-                            'x': x_pos,
-                            'y': y_pos,
-                            'name': clade.name if clade.name else 'Seq',
-                            'is_leaf': True,
-                            'branch_length': clade.branch_length or 0.01
-                        })
-                    else:
-                        # Internal node
-                        child_count = len(clade.clades)
-                        y_min = y_pos - (child_count - 1) * y_step / 2
-                    
-                        children_coords = []
-                        for i, child_clade in enumerate(clade.clades):
-                            child_y = y_min + i * y_step
-                            child_x = x_pos + (child_clade.branch_length or 0.01)
-                            child_nodes, child_edges = get_tree_coords(child_clade, child_x, child_y, y_step)
-                            nodes.extend(child_nodes)
-                            edges.extend(child_edges)
-                            children_coords.append((child_x, child_y))
-                    
-                        # Internal node position
-                        nodes.append({
-                            'x': x_pos,
-                            'y': y_pos,
-                            'name': '',
-                            'is_leaf': False,
-                            'branch_length': clade.branch_length or 0
-                        })
-                    
-                        # Edges from internal node to children
-                        for cx, cy in children_coords:
-                            edges.append({'x0': x_pos, 'y0': y_pos, 'x1': cx, 'y1': cy})
-                
-                    return nodes, edges
-            
-                # Get tree coordinates
-                all_nodes, all_edges = get_tree_coords(tree.root, x_pos=0, y_pos=0, y_step=1)
-            
-                # Create Plotly figure
-                fig = go.Figure()
-            
-                # Add edges (branches)
-                for edge in all_edges:
-                    fig.add_trace(go.Scatter(
-                        x=[edge['x0'], edge['x1']],
-                        y=[edge['y0'], edge['y1']],
-                        mode='lines',
-                        line=dict(color='#1f77b4', width=2),
-                        hoverinfo='none',
-                        showlegend=False
-                    ))
-            
-                # Separate leaf and internal nodes
-                leaf_nodes = [n for n in all_nodes if n['is_leaf']]
-                internal_nodes = [n for n in all_nodes if not n['is_leaf']]
-            
-                # Add leaf nodes (terminals)
-                if leaf_nodes:
-                    leaf_x = [n['x'] for n in leaf_nodes]
-                    leaf_y = [n['y'] for n in leaf_nodes]
-                    leaf_names = [n['name'] for n in leaf_nodes]
-                
-                    fig.add_trace(go.Scatter(
-                        x=leaf_x,
-                        y=leaf_y,
-                        mode='markers+text',
-                        marker=dict(
-                            size=8,
-                            color='#2ca02c',
-                            line=dict(color='#1f77b4', width=2)
-                        ),
-                        text=leaf_names,
-                        textposition='middle right',
-                        textfont=dict(size=11),
-                        hovertemplate='<b>%{text}</b><extra></extra>',
-                        showlegend=False
-                    ))
-            
-                # Add internal nodes
-                if internal_nodes:
-                    int_x = [n['x'] for n in internal_nodes]
-                    int_y = [n['y'] for n in internal_nodes]
-                
-                    fig.add_trace(go.Scatter(
-                        x=int_x,
-                        y=int_y,
-                        mode='markers',
-                        marker=dict(
-                            size=4,
-                            color='#ff7f0e',
-                            line=dict(color='#1f77b4', width=1)
-                        ),
-                        hoverinfo='none',
-                        showlegend=False
-                    ))
-            
-                # Update layout
-                fig.update_layout(
-                    title=f"Phylogenetic Tree ({metadata.get('method', 'N/A').upper()}) - {metadata.get('num_taxa', 0)} Taxa",
-                    xaxis_title="Evolutionary Distance",
-                    yaxis_title="Sequences",
-                    height=max(400, len(leaf_nodes) * 30),
-                    width=1000,
-                    showlegend=False,
-                    template="plotly_white",
-                    hovermode='closest',
-                    margin=dict(l=150, r=100, t=80, b=50),
-                    xaxis=dict(zeroline=False),
-                    yaxis=dict(zeroline=False)
+    @staticmethod
+    def create_phylogenetic_dendrogram(newick_string: str, metadata: Dict) -> go.Figure:
+        """Create an interactive dendrogram visualization like ClustalW"""
+        try:
+            from Bio import Phylo
+            from io import StringIO
+            tree = Phylo.read(StringIO(newick_string), "newick")
+            terminals = tree.get_terminals()
+            terminal_names = [t.name if t.name else f"Seq{i}" for i, t in enumerate(terminals)]
+
+            fig = go.Figure()
+            if terminal_names:
+                fig.add_trace(
+                    go.Scatter(
+                        x=list(range(len(terminal_names))),
+                        y=[0] * len(terminal_names),
+                        mode="markers+text",
+                        text=terminal_names,
+                        textposition="middle right",
+                        marker=dict(size=8, color="#1f77b4"),
+                        hovertemplate="<b>%{text}</b><extra></extra>",
+                        showlegend=False,
+                    )
                 )
-            
-                return fig
-            
-            except Exception as e:
-                # Fallback: create simple message
-                fig = go.Figure()
-                fig.add_annotation(
-                    text=f"Dendrogram visualization unavailable<br>Showing Newick format instead",
-                    xref="paper", yref="paper",
-                    x=0.5, y=0.5, showarrow=False,
-                    font=dict(size=14, color="gray")
-                )
-                fig.update_layout(
-                    height=300,
-                    title="Phylogenetic Tree"
-                )
-                return fig
+
+            fig.update_layout(
+                title=f"Phylogenetic Tree ({metadata.get('method', 'N/A').upper()}) - {metadata.get('num_taxa', 0)} Taxa",
+                xaxis_title="Terminal order",
+                yaxis=dict(showticklabels=False, zeroline=False),
+                height=max(400, len(terminal_names) * 30),
+                width=1000,
+                showlegend=False,
+                template="plotly_white",
+                hovermode="closest",
+                margin=dict(l=150, r=100, t=80, b=50),
+            )
+            return fig
+        except Exception:
+            fig = go.Figure()
+            fig.add_annotation(
+                text="Dendrogram visualization unavailable<br>Showing Newick format instead",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color="gray")
+            )
+            fig.update_layout(height=300, title="Phylogenetic Tree")
+            return fig
 
     @staticmethod
     def create_target_component_contribution_chart(ranked_results: List[Dict]) -> go.Figure:

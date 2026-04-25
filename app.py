@@ -1,3 +1,4 @@
+# mypy: enable-error-code=var-annotated
 # app.py - Streamlit protein analysis application
 import streamlit as st
 import streamlit.components.v1 as components
@@ -5,7 +6,7 @@ import asyncio
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 import os
 import time
 from datetime import datetime
@@ -22,9 +23,46 @@ from xml.etree import ElementTree as ET
 import html as html_lib
 import sys
 import urllib.parse
-from cache_manager import *
-from visualizations import *
-from api_client import *
+import logging
+
+# Frontend error handling with structured logging
+from frontend_errors import (
+    OmniBiMolError,
+    DataValidationError,
+    ExternalServiceError,
+    StructurePredictionError,
+    DockingError,
+    AnalysisError,
+    DatabaseError,
+    create_log_context,
+)
+
+# Configure structured logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Cache management: persistent SQLite caching and Streamlit native cache operations
+from cache_manager import (
+    CacheManager,
+    clear_app_cache,
+    cached_search_uniprot,
+    cached_fetch_all_data,
+    cached_fetch_uniprot_data,
+    cached_run_blast_search,
+    cached_fetch_embl_sequence,
+    cached_run_needle_alignment,
+    cached_fetch_similar_compounds,
+    cached_fetch_pubchem_structure,
+    cached_fetch_kegg_pathways,
+    cached_predict_ligand_binding,
+)
+# Protein visualization: interactive Plotly charts for protein analysis
+from visualizations import ProteinVisualizer
+# Protein API client: UniProt, HPA, and related external API integrations
+from api_client import ProteinAPIClient, get_drug_metadata
 from drug_repurposing_engine import DrugRepurposingEngine
 from sequence_analysis import SequenceAnalysisSuite, FASTAParser
 from genome_analysis_engine import GenomeAnalysisEngine
@@ -48,6 +86,19 @@ except ImportError:
 
 
 _NCT_PATTERN = re.compile(r"\bNCT\d{8}\b", re.IGNORECASE)
+
+
+class OmniBiMolContextPayload(TypedDict):
+    target_profile: Dict[str, Any]
+    structure_data: Any
+    pathway_data: Any
+    ppi_data: Any
+    ligand_binding_data: Any
+    docking_data: Any
+    repurposing_data: Any
+    genome_risk_data: Any
+    pubmed_evidence: list[Any]
+    clinical_trials_evidence: list[Any]
 
 OMNIBIMOL_REQUIRED_CONTEXT_KEYS = [
     "target_profile",
@@ -176,7 +227,7 @@ OMNIBIMOL_RESEARCH_COPILOT_SYSTEM_PROMPT = textwrap.dedent("""
 """).strip()
 
 
-def get_missing_omnibimol_context(context_payload: Optional[Dict]) -> List[str]:
+def get_missing_omnibimol_context(context_payload: Optional[Dict[str, Any]]) -> List[str]:
     """Return context keys missing from the OmniBiMol copilot input contract."""
     payload = context_payload or {}
     missing_keys: List[str] = []
@@ -225,7 +276,7 @@ def _infer_omnibimol_mode(user_query: str) -> str:
     return "druggable_why"
 
 
-def _build_omnibimol_context_payload(data: Dict, uniprot_data: Dict) -> Dict:
+def _build_omnibimol_context_payload(data: Dict[str, Any], uniprot_data: Dict[str, Any]) -> OmniBiMolContextPayload:
     literature = data.get("literature", {})
     return {
         "target_profile": {
@@ -248,7 +299,7 @@ def _build_omnibimol_context_payload(data: Dict, uniprot_data: Dict) -> Dict:
     }
 
 
-def _generate_omnibimol_copilot_response(user_query: str, context_payload: Dict) -> str:
+def _generate_omnibimol_copilot_response(user_query: str, context_payload: Dict[str, Any]) -> str:
     mode = _infer_omnibimol_mode(user_query)
     missing_context = get_missing_omnibimol_context(context_payload)
 
@@ -450,7 +501,7 @@ def _normalize_nct_id(value: Optional[str]) -> Optional[str]:
     return None
 
 
-def _extract_nct_id(trial: Dict) -> Optional[str]:
+def _extract_nct_id(trial: Dict[str, Any]) -> Optional[str]:
     for key in ("nct_id", "trial_id", "nctId", "nct", "id", "nct_number"):
         nct_id = _normalize_nct_id(trial.get(key))
         if nct_id:
@@ -481,14 +532,14 @@ def _get_docking_mode_value() -> str:
 
 def _run_shared_docking(
     *,
-    protein_prep: Dict,
-    selected_ligand: Dict,
+    protein_prep: Dict[str, Any],
+    selected_ligand: Dict[str, Any],
     ligand_name: str,
     protein_length: int,
     exhaustiveness: int,
     num_modes: int,
     energy_range: int,
-) -> Dict:
+) -> Dict[str, Any]:
     return st.session_state.api_client.run_docking_workflow(
         protein_prep=protein_prep,
         ligand_data=selected_ligand,
@@ -503,7 +554,7 @@ def _run_shared_docking(
     )
 
 
-def _refresh_real_docking_result_if_needed(result: Dict) -> Dict:
+def _refresh_real_docking_result_if_needed(result: Dict[str, Any]) -> Dict[str, Any]:
     if not result or result.get("simulated"):
         return result
 
@@ -592,7 +643,7 @@ def _format_status(status: Optional[str]) -> str:
     return str(status).replace("_", " ").title()
 
 
-def render_kegg_interactive_pathway(first_result: Dict, kegg_protein_id: Optional[str] = None):
+def render_kegg_interactive_pathway(first_result: Dict[str, Any], kegg_protein_id: Optional[str] = None) -> None:
     """
     Render an interactive KEGG pathway map using the official PNG image + KGML overlay.
     
@@ -1460,10 +1511,31 @@ def main():
                                 st.session_state.current_uniprot_id,
                                 st.session_state.api_client
                             )
-                        except Exception as e:
+                        except ExternalServiceError as e:
+                            logger.warning(
+                                f"BLAST service error: {e.internal_message}",
+                                extra=create_log_context(
+                                    "blast_search",
+                                    protein_id=st.session_state.current_uniprot_id,
+                                    **e.log_details
+                                )
+                            )
                             blast_results = {
                                 "available": False,
-                                "error": f"BLAST search error: {str(e)}"
+                                "error": "🔍 BLAST search is temporarily unavailable. This is often due to NCBI service load. Please try again in a few moments."
+                            }
+                        except Exception as e:
+                            logger.exception(
+                                "Unexpected error during BLAST search",
+                                extra=create_log_context(
+                                    "blast_search",
+                                    protein_id=st.session_state.current_uniprot_id,
+                                    error_type=type(e).__name__
+                                )
+                            )
+                            blast_results = {
+                                "available": False,
+                                "error": "❌ An unexpected error occurred during BLAST search. Please contact support if this persists."
                             }
                         
                         elapsed = time.time() - start_time
@@ -1893,20 +1965,55 @@ def main():
                     pdb_file_content = None
                     try:
                         pdb_url = pdb_structures[0]['pdb_url']
-                        response = requests.get(pdb_url)
-                        if response.status_code == 200:
-                            pdb_file_content = response.text
-                        else:
-                            pdb_file_content = f"Could not fetch PDB file. Status code: {response.status_code}"
-                    except Exception as e:
-                        pdb_file_content = f"Error fetching PDB file: {str(e)}"
+                        try:
+                            response = requests.get(pdb_url, timeout=10)
+                            if response.status_code == 200:
+                                pdb_file_content = response.text
+                            else:
+                                raise ExternalServiceError(
+                                    user_message="Could not retrieve PDB file. Please try again.",
+                                    internal_message=f"PDB server returned status {response.status_code}",
+                                    log_details={"pdb_url": pdb_url, "status_code": response.status_code}
+                                )
+                        except requests.Timeout:
+                            logger.warning(
+                                "PDB file download timeout",
+                                extra=create_log_context("pdb_download", pdb_id=pdb_structures[0]['pdb_id'])
+                            )
+                            raise ExternalServiceError(
+                                user_message="PDB file download took too long. Please try again.",
+                                internal_message="PDB server request timeout",
+                                log_details={"pdb_url": pdb_url, "timeout": 10}
+                            )
+                        except ExternalServiceError:
+                            raise
+                        except Exception as e:
+                            logger.exception(
+                                "Unexpected error downloading PDB file",
+                                extra=create_log_context(
+                                    "pdb_download",
+                                    pdb_id=pdb_structures[0].get('pdb_id'),
+                                    error_type=type(e).__name__
+                                )
+                            )
+                            pdb_file_content = "❌ Error fetching PDB file. Please try again or contact support."
 
-                    st.download_button(
-                        "📥 Download PDB File",
-                        data=pdb_file_content,
-                        file_name=f"{pdb_structures[0]['pdb_id']}.pdb",
-                        mime="text/plain"
-                    )
+                        st.download_button(
+                            "📥 Download PDB File",
+                            data=pdb_file_content,
+                            file_name=f"{pdb_structures[0]['pdb_id']}.pdb",
+                            mime="text/plain"
+                        )
+                    except Exception:
+                        # Outer exception handler for unexpected errors
+                        pdb_file_content = "❌ Error fetching PDB file. Please try again or contact support."
+                        st.download_button(
+                            "📥 Download PDB File",
+                            data=pdb_file_content,
+                            file_name="structure.pdb",
+                            mime="text/plain",
+                            disabled=True
+                        )
                 
                 tab_index += 1
             
@@ -3050,6 +3157,51 @@ def main():
                 ligand_name = st.session_state.get('ligand_binding_compound_name', 'Unknown')
             
             if selected_ligand:
+                quick_smiles = str(selected_ligand.get("smiles", "") or "").strip()
+                quick_name = ligand_name or selected_ligand.get("name", "Unknown")
+
+                st.markdown("#### Quick Affinity Estimate (SMILES -> pKd)")
+                if not quick_smiles:
+                    st.info("No SMILES available for quick affinity estimate.")
+                else:
+                    if st.button("⚡ Estimate Affinity", key="ligand_binding_quick_estimate"):
+                        with st.spinner("Running fast binding-affinity prediction..."):
+                            quick_prediction = cached_predict_ligand_binding(
+                                (quick_smiles,),
+                                (quick_name,),
+                                st.session_state.api_client,
+                            )
+                            quick_prediction["_input_smiles"] = quick_smiles
+                            st.session_state.ligand_binding_quick_prediction = quick_prediction
+
+                    quick_prediction = st.session_state.get("ligand_binding_quick_prediction")
+                    if (
+                        quick_prediction
+                        and quick_prediction.get("_input_smiles") == quick_smiles
+                        and quick_prediction.get("available")
+                        and quick_prediction.get("predictions")
+                    ):
+                        quick_item = quick_prediction["predictions"][0]
+                        if quick_item.get("is_valid"):
+                            quick_result = quick_item.get("prediction", {})
+                            col1, col2, col3 = st.columns(3)
+                            with col1:
+                                st.metric("Predicted pAffinity", f"{quick_result.get('binding_affinity', 0.0):.2f}")
+                            with col2:
+                                st.metric("Binding Probability", f"{quick_result.get('binding_probability', 0.0):.2%}")
+                            with col3:
+                                st.metric("Method", quick_result.get("prediction_method", "N/A"))
+
+                            model_metadata = quick_result.get("model_metadata") or quick_prediction.get("model_metadata")
+                            if model_metadata:
+                                model_id = model_metadata.get("model_id", "local")
+                                source = model_metadata.get("source", "unknown")
+                                st.caption(f"Model source: {source} | model_id: {model_id}")
+                        else:
+                            st.warning(quick_item.get("error") or "Invalid SMILES for quick estimate.")
+                    elif quick_prediction and not quick_prediction.get("available"):
+                        st.warning(quick_prediction.get("error", "Quick estimate unavailable."))
+
                 st.divider()
                 
                 # Docking parameters
@@ -3517,7 +3669,7 @@ def main():
 # SEQUENCE ANALYSIS PAGE FUNCTIONS
 # =============================================================================
 
-def render_sequence_analysis_page():
+def render_sequence_analysis_page() -> None:
     """Render the main sequence analysis page"""
     
     st.header("🧬 Sequence Analysis Suite")
@@ -3586,12 +3738,39 @@ def render_sequence_analysis_page():
                     )
                     st.session_state.sequence_analysis_results = results
                     if results.get("errors"):
-                        st.warning("Analysis completed with some errors. Check the results section for details.")
+                        st.warning("⚠️ Analysis completed with some errors. Check the results section for details.")
                     else:
                         st.success("✅ Analysis completed successfully!")
+                except ExternalServiceError as e:
+                    logger.warning(
+                        f"External service unavailable during sequence analysis: {e.internal_message}",
+                        extra=create_log_context(
+                            "sequence_analysis",
+                            file_name=uploaded_file.name if uploaded_file else "text_input",
+                            **e.log_details
+                        )
+                    )
+                    st.error(f"⚠️ {e.user_message}")
+                except AnalysisError as e:
+                    logger.info(
+                        f"Sequence analysis error: {e.internal_message}",
+                        extra=create_log_context(
+                            "sequence_analysis",
+                            file_name=uploaded_file.name if uploaded_file else "text_input",
+                            **e.log_details
+                        )
+                    )
+                    st.error(f"❌ {e.user_message}")
                 except Exception as e:
-                    st.error(f"❌ Analysis failed: {str(e)}")
-                    st.exception(e)
+                    logger.exception(
+                        "Unexpected error during sequence analysis",
+                        extra=create_log_context(
+                            "sequence_analysis",
+                            file_name=uploaded_file.name if uploaded_file else "text_input",
+                            error_type=type(e).__name__
+                        )
+                    )
+                    st.error("❌ Analysis failed. Please check your input and try again, or contact support.")
         
         # Display results
         if 'sequence_analysis_results' in st.session_state:
@@ -3644,7 +3823,7 @@ ATGCGATCGATCGATCGATCG
         """, language="text")
 
 
-def _render_protein_predictor(protein_fasta_content: str):
+def _render_protein_predictor(protein_fasta_content: str) -> None:
     """
     Render protein predictor with molecular docking capability.
     Uses FASTA input as the protein source for docking.
@@ -3671,8 +3850,19 @@ def _render_protein_predictor(protein_fasta_content: str):
         
         st.markdown(f"**Protein:** {protein_name} ({len(protein_sequence)} aa)")
         
+    except DataValidationError as e:
+        logger.info(
+            f"FASTA validation error: {e.internal_message}",
+            extra=create_log_context("fasta_parsing", **e.log_details)
+        )
+        st.error(f"⚠️ {e.user_message}")
+        return
     except Exception as e:
-        st.error(f"❌ Error parsing FASTA: {str(e)}")
+        logger.exception(
+            "Unexpected error parsing FASTA",
+            extra=create_log_context("fasta_parsing", error_type=type(e).__name__)
+        )
+        st.error("❌ Could not parse FASTA file. Please check the format and try again, or contact support.")
         return
     
     # ------------------------------------------------------------------
@@ -3955,7 +4145,7 @@ REMARK  99  THIS IS A MOCK STRUCTURE FOR DEMONSTRATION PURPOSES
     return pdb_content
 
 
-def display_analysis_results(results: Dict, analyzer: SequenceAnalysisSuite):
+def display_analysis_results(results: Dict[str, Any], analyzer: SequenceAnalysisSuite) -> None:
     """Display comprehensive analysis results"""
     
     st.divider()
@@ -4174,8 +4364,19 @@ def _render_protein_predictor(fasta_content: str) -> None:
     # Parse sequences with existing FASTA parser
     try:
         sequences = FASTAParser.parse(fasta_content)
+    except DataValidationError as e:
+        logger.info(
+            f"FASTA validation error in protein predictor: {e.internal_message}",
+            extra=create_log_context("protein_predictor_fasta_parse", **e.log_details)
+        )
+        st.warning(f"⚠️ {e.user_message}")
+        return
     except Exception as e:
-        st.warning(f"Unable to parse FASTA for Protein Predictor: {str(e)}")
+        logger.exception(
+            "Unexpected error parsing FASTA in protein predictor",
+            extra=create_log_context("protein_predictor_fasta_parse", error_type=type(e).__name__)
+        )
+        st.warning("⚠️ Could not parse the FASTA sequence. Please check the format.")
         return
 
     protein_seqs = [s for s in sequences if s.sequence_type == "protein"]
@@ -4287,9 +4488,28 @@ def _render_protein_predictor(fasta_content: str) -> None:
                         progress_container.empty()
                         status_container.empty()
                         
+                    except ExternalServiceError as e:
+                        progress_container.empty()
+                        logger.warning(
+                            f"NCBI search service error: {e.internal_message}",
+                            extra=create_log_context(
+                                "ncbi_search",
+                                sequence_length=len(selected_seq),
+                                **e.log_details
+                            )
+                        )
+                        st.error(f"⚠️ {e.user_message}")
                     except Exception as e:
                         progress_container.empty()
-                        st.error(f"❌ NCBI search failed: {str(e)}")
+                        logger.exception(
+                            "Unexpected error during NCBI search",
+                            extra=create_log_context(
+                                "ncbi_search",
+                                sequence_length=len(selected_seq),
+                                error_type=type(e).__name__
+                            )
+                        )
+                        st.error("❌ NCBI search failed. This is often due to temporary service issues. Please try again in a few moments.")
             else:
                 st.error("API client not available in session state; cannot contact NCBI.")
 
@@ -4576,8 +4796,15 @@ def _render_protein_predictor(fasta_content: str) -> None:
                         )
                         st.components.v1.html(viewer_html, height=650, scrolling=False)
                     except Exception as e:
-                        st.error(f"⚠️ Error creating 3D visualization: {str(e)}")
-                        st.info("💡 Try predicting the structure again in the previous tab.")
+                        logger.exception(
+                            "Error creating 3D visualization",
+                            extra=create_log_context(
+                                "docking_3d_visualization",
+                                error_type=type(e).__name__
+                            )
+                        )
+                        st.error("⚠️ Could not render 3D visualization. Try predicting the structure again.")
+                        st.info("💡 Make sure the protein structure prediction completed successfully in the previous tab.")
                 else:
                     st.warning("⚠️ Protein structure data is incomplete.")
                     st.info("💡 Please predict the protein structure in the **Protein Structure Prediction** tab first.")
@@ -5572,8 +5799,16 @@ def render_fda_clinical_trials(drug_name, report_data=None):
                     )
                 finally:
                     loop.close()
+        except ExternalServiceError as e:
+            logger.warning(
+                f"ClinicalTrials.gov fetch error: {e.internal_message}",
+                extra=create_log_context("clinical_trials_fetch", drug_name=drug_name, **e.log_details)
+            )
         except Exception as e:
-            print(f"ClinicalTrials.gov fetch error: {str(e)}", file=sys.stderr)
+            logger.exception(
+                f"Unexpected error fetching clinical trials for {drug_name}",
+                extra=create_log_context("clinical_trials_fetch", drug_name=drug_name, error_type=type(e).__name__)
+            )
     else:
         st.warning("API client not available; cannot fetch ClinicalTrials.gov data.")
 
@@ -5588,9 +5823,9 @@ def render_fda_clinical_trials(drug_name, report_data=None):
         valid_trials.append(trial)
 
     if invalid_trials:
-        print(
-            f"ClinicalTrials.gov: filtered {len(invalid_trials)} invalid entries for {drug_name}",
-            file=sys.stderr,
+        logger.debug(
+            f"ClinicalTrials.gov: filtered {len(invalid_trials)} invalid entries",
+            extra=create_log_context("clinical_trials_fetch", drug_name=drug_name, filtered_count=len(invalid_trials))
         )
         st.caption("Some trial entries were excluded due to missing or invalid NCT IDs.")
 
@@ -5972,15 +6207,25 @@ def _generate_repurposing_report_data(drug_name, api_client=None):
                     'primary_outcome': trial.get('primary_outcome', 'N/A'),
                     'url': trial.get('url', '')
                 })
+        except ExternalServiceError as e:
+            logger.warning(
+                f"Clinical trials fetch service error: {e.internal_message}",
+                extra=create_log_context("clinical_trials_fetch_report", drug_name=drug_name, **e.log_details)
+            )
+            st.warning(f"⚠️ Could not fetch clinical trials for {drug_name}. The service may be temporarily unavailable.")
+            report_data['clinical_trials'] = []
         except Exception as e:
-            st.warning(f"⚠️ Could not fetch clinical trials for {drug_name}: {str(e)}")
+            logger.exception(
+                f"Unexpected error fetching clinical trials for report",
+                extra=create_log_context("clinical_trials_fetch_report", drug_name=drug_name, error_type=type(e).__name__)
+            )
+            st.warning(f"⚠️ Could not fetch clinical trials for {drug_name}. Please try again later.")
             report_data['clinical_trials'] = []
     
     # ========== GENERATE DYNAMIC APPROVED DRUGS SECTION ==========
     # Create a generic approved drug entry based on the searched drug name
     
     # Fetch drug metadata (DrugBank ID, PubChem ID, status) from database/ChEMBL
-    from api_client import get_drug_metadata
     drug_metadata = get_drug_metadata(drug_name)
     
     # Determine confidence score based on data availability
@@ -7659,10 +7904,17 @@ def render_variant_to_therapy_page():
 
             progress.progress(40, text="Annotating variant effects...")
             annotated = engine.annotate_variant_effects(filtered)
-            progress.progress(55, text="Aggregating gene impact...")
-            gene_impact = engine.aggregate_gene_impact(annotated)
-
-            progress.progress(70, text="Scoring pathway impact...")
+             progress.progress(55, text="Aggregating gene impact...")
+             gene_impact = engine.aggregate_gene_impact(annotated)
+ 
+             progress.progress(62, text="Computing research-backed pathogenicity scores...")
+             try:
+                 annotated = engine.score_variant_pathogenicity(annotated, use_prioritization=True)
+             except Exception as e:
+                 st.warning(f"Pathogenicity scoring failed: {e}. Using heuristic scores.")
+                 annotated = engine.score_variant_pathogenicity(annotated, use_prioritization=False)
+ 
+             progress.progress(70, text="Scoring pathway impact...")
             pathway_map = {"pathways": []}
             for gene in list(gene_impact.get("genes", {}).keys())[:10]:
                 try:
@@ -7762,10 +8014,26 @@ def render_variant_to_therapy_page():
     ]
     variant_df = pd.DataFrame(filtered_variants)
     if not variant_df.empty:
-        show_cols = [c for c in ["variant_key", "gene", "predicted_effect_class", "impact_score", "confidence", "variant_type", "consequence", "genotype", "qual", "filter"] if c in variant_df.columns]
-        st.dataframe(variant_df[show_cols].sort_values(by=["impact_score", "gene"], ascending=[False, True]), width="stretch", hide_index=True)
-        st.plotly_chart(ProteinVisualizer.create_variant_impact_distribution_chart(filtered_variants), width="stretch")
-        st.download_button("📥 Download variant effects CSV", report_bundle["variants_csv"], file_name="variant_effects.csv", mime="text/csv")
+
+        # Add pathogenicity columns
+        pathogenicity_cols = []
+        if 'pathogenicity_score' in variant_df.columns:
+            pathogenicity_cols.append('pathogenicity_score')
+        if 'pathogenicity_tier' in variant_df.columns:
+            pathogenicity_cols.append('pathogenicity_tier')
+        show_cols = [c for c in ['variant_key','gene','predicted_effect_class','impact_score'] + pathogenicity_cols + ['confidence','variant_type','consequence','genotype','qual','filter'] if c in variant_df.columns]
+        st.dataframe(variant_df[show_cols].sort_values(by=['impact_score','gene'],ascending=[False,True]),width='stretch',hide_index=True)
+        if pathogenicity_cols:
+            tier_counts={1:0,2:0,3:0}
+            for v in filtered_variants:
+                tier=v.get('pathogenicity_tier')
+                if tier in tier_counts: tier_counts[tier]+=1
+            c1,c2,c3=st.columns(3)
+            c1.metric('Tier 1',tier_counts[1])
+            c2.metric('Tier 2',tier_counts[2])
+            c3.metric('Tier 3',tier_counts[3])
+        st.plotly_chart(ProteinVisualizer.create_variant_impact_distribution_chart(filtered_variants),width='stretch')
+        st.download_button('Download variant effects CSV',report_bundle['variants_csv'],file_name='variant_effects.csv',mime='text/csv')
     else:
         st.info("No variants match the current filters.")
 

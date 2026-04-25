@@ -50,6 +50,18 @@ class Settings(BaseSettings):
     multiomics_genomics_weight: float = Field(default=0.35, ge=0.0, le=1.0)
     multiomics_proteomics_weight: float = Field(default=0.20, ge=0.0, le=1.0)
 
+    chemprot_enabled: bool = Field(default=True)
+    chemprot_target_prioritization_enabled: bool = Field(default=False)
+    chemprot_adapter_repo_id: str = Field(default="omshrivastava/omnibimol-chemprot-lora")
+    chemprot_base_model_id: str = Field(default="microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext")
+    chemprot_base_model_revision: str = Field(default="main")
+    chemprot_adapter_revision: str = Field(default="main")
+    chemprot_max_length: int = Field(default=256, ge=32, le=1024)
+    chemprot_batch_size: int = Field(default=4, ge=1, le=32)
+    chemprot_enable_ensemble: bool = Field(default=True)
+    chemprot_timeout_sec: int = Field(default=30, ge=5, le=120)
+    chemprot_local_files_only: bool = Field(default=False)
+
     backend_api_url: str = Field(default="http://localhost:8000")
 
     @property
